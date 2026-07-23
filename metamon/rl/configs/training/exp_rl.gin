@@ -1,0 +1,29 @@
+import amago.agent
+
+agent.Agent.reward_multiplier = 10.
+agent.MultiTaskAgent.reward_multiplier = 10.
+
+agent.Agent.tau = .004
+agent.MultiTaskAgent.tau = .004
+
+agent.Agent.num_actions_for_value_in_critic_loss = 1
+agent.MultiTaskAgent.num_actions_for_value_in_critic_loss = 3
+
+agent.Agent.num_actions_for_value_in_actor_loss = 1
+agent.MultiTaskAgent.num_actions_for_value_in_actor_loss = 3
+
+agent.Agent.online_coeff = 0.0
+agent.MultiTaskAgent.online_coeff = 0.0
+agent.Agent.offline_coeff = 1.0
+agent.MultiTaskAgent.offline_coeff = 1.0
+agent.exp_filter.clip_weights_high = 100
+agent.exp_filter.beta = 1.0 # this is the most sensitive hparam. consider increasing...
+agent.Agent.fbc_filter_func = @agent.exp_filter
+agent.MultiTaskAgent.fbc_filter_func = @agent.exp_filter
+
+MetamonAMAGOExperiment.l2_coeff = 1e-4
+MetamonAMAGOExperiment.learning_rate = 1.5e-4
+MetamonAMAGOExperiment.grad_clip = 1.5
+agent.Agent.critic_loss_weight = 10.
+agent.MultiTaskAgent.critic_loss_weight = 10.
+MetamonAMAGOExperiment.lr_warmup_steps = 1000

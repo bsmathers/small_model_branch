@@ -1,0 +1,12 @@
+
+GRUModel.turn_embedding_Cls = @TransformerTurnEmbedding
+GRUModel.rnn_layers = 2
+GRUModel.rnn_d_hidden = 256
+GRUModel.rnn_dropout = .05
+GRUModel.token_embedding_dim = 64
+TransformerTurnEmbedding.numerical_tokens = 6
+TransformerTurnEmbedding.scratch_tokens = 4
+TransformerTurnEmbedding.d_model = 96
+TransformerTurnEmbedding.n_heads = 6
+TransformerTurnEmbedding.n_layers = 3
+TransformerTurnEmbedding.dropout = .05

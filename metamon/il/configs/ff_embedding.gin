@@ -1,0 +1,8 @@
+GRUModel.turn_embedding_Cls = @FFTurnEmbedding
+GRUModel.rnn_layers = 1
+GRUModel.rnn_d_hidden = 256
+GRUModel.rnn_dropout = .05
+GRUModel.token_embedding_dim = 64
+FFTurnEmbedding.d_hidden = 512
+FFTurnEmbedding.d_emb = 400
+FFTurnEmbedding.dropout = .05
