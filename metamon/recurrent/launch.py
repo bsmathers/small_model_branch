@@ -134,6 +134,8 @@ class Launcher:
             if override:
                 raw[name] = os.path.abspath(override)
                 continue
+            if float(self.mix.get(name, 0)) <= 0:
+                continue  # a source with no weight in the mix is not downloaded
             dest = os.path.join(self.work, "raw", name)
             marker = os.path.join(dest, ".done")
             if not os.path.exists(marker):
@@ -272,8 +274,8 @@ class Launcher:
         if not os.path.exists(os.path.join(self.work, "tables", "species_ids.json")):
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
         self.prefetch()
-        raw = self.fetch_data()
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
+        raw = self.fetch_data()
         for name in SOURCES:
             if float(self.mix.get(name, 0)) > 0:
                 self.prepare(name, raw[name], a.games)
