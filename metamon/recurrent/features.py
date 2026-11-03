@@ -302,6 +302,28 @@ def action_slot_map(state, ordered_party: Sequence) -> np.ndarray:
     return mapping
 
 
+def label_slot_map(label_state, ordered_party: Sequence) -> np.ndarray:
+    """Where the labels of the original parser's action space land in this model's slots.
+
+    Exeggcute's outputs (blend, judge, legal) are indexed by ITS state's actions: move j of that state's active, then its alive
+    reserves in sorted species order. The model's slots follow the corrected state (canonical_own). The two states describe the
+    same decision, so the action is matched by identity, a move by name and a reserve by species; an action the corrected party
+    lacks (a guessed move that differs between the two parsers) gets -1 and its label mass is reported as lost.
+    """
+    from metamon.interface import move_name, pokemon_name
+
+    mapping = np.full(N_ACTIONS, -1, dtype=np.int64)
+    active_moves = [move_name(m.name) for m in ordered_party[0].moves[:N_MOVES]]
+    for j, m in enumerate(label_state.player_active_pokemon.moves[:N_MOVES]):
+        if move_name(m.name) in active_moves:
+            mapping[j] = active_moves.index(move_name(m.name))
+    reserves = [pokemon_name(p.name) for p in ordered_party[1:]]
+    for k, p in enumerate(sorted(label_state.available_switches, key=lambda p: pokemon_name(p.name))):
+        if 4 + k < N_ACTIONS and pokemon_name(p.name) in reserves:
+            mapping[4 + k] = 4 + reserves.index(pokemon_name(p.name))
+    return mapping
+
+
 def encode_observer(
     state,
     own_party: Sequence,

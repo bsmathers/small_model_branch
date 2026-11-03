@@ -72,6 +72,27 @@ self-hit can land on the foe's Substitute and then no damage line names it (the 
 ends Bide / charge / Thrash / the trap); a cure of bad poison is printed as `psn` (Haze); a last usable move that is disabled
 means Struggle.
 
+## Two parsers, one trajectory
+
+Exeggcute was trained on the ORIGINAL (upstream) parser's output, bugs included (PP of 64 where Gen 1 has 61, boosts and
+Reflect that outlive a fainted Pokemon, shifted action labels). So each trajectory stores both:
+
+| key | parser | used by |
+|---|---|---|
+| `legacy_states[t]`, `legacy_actions[t]` | original | Exeggcute only (blend and judge labels, its previous-action input) |
+| `states[t]`, `actions[t]`, `extras[t]` | corrected | the distilled model: its features, played action, decision kind |
+
+`tools/legacy_parse.py` runs the original parser: upstream's `forward.py`, `backward.py` and `replay_state.py` (the only parser
+files we changed) are kept verbatim in `legacy_parser/` and an import hook points the three module names at them for that
+process, so everything else is shared code. On 276 trajectories it reproduces the output of an untouched upstream checkout
+exactly (275 byte-identical; the 276th is a game whose two players share a username, which the legacy run skips).
+`merge_legacy.py` folds it into the corrected files and moves any game whose two parsers disagree on length (or without a
+legacy twin) to `<traj>_rejected/`. `label.py` reads only the legacy pair; labels from it are bit-identical to labelling the
+upstream parser's own files. `build.py` maps the labels, which are indexed by the legacy state's actions, onto the corrected
+state's slots by identity (a move by name, a reserve by species: `features.label_slot_map`); label mass on an action the
+corrected state lacks counts as lost and the decision is excluded from the policy loss. The launcher runs `parse`, `legacy`,
+`merge`, `label`, `build` in that order.
+
 ## Parser version
 
 `metamon.recurrent.parse.PARSER_VERSION` is stamped into each work folder by the launcher; a folder made by another version is

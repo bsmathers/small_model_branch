@@ -18,7 +18,7 @@ import lz4.frame
 import numpy as np
 
 from metamon import interface
-from metamon.recurrent.features import CANT_REASONS, KINDS, STATUS_IDS, Encoded, LastTurn, action_slot_map, canonical_own, encode_observer
+from metamon.recurrent.features import CANT_REASONS, KINDS, STATUS_IDS, Encoded, LastTurn, action_slot_map, canonical_own, encode_observer, label_slot_map
 from metamon.recurrent.tables import Tables
 
 
@@ -28,6 +28,8 @@ def load_trajectory(path: str) -> dict:
         data = json.loads(f.read())
     if "extras" not in data:
         raise ValueError(f"{os.path.basename(path)} has no extras: parse the raw log with metamon.recurrent.parse")
+    if "legacy_states" not in data:
+        raise ValueError(f"{os.path.basename(path)} has no legacy_states: run metamon.recurrent.merge_legacy (see its docstring)")
     return data
 
 
@@ -85,7 +87,8 @@ class Decision:
     action_reason: Optional[str]  # why there was no action, when the index is -1
     forced_switch: bool
     win: float  # the observer's result: 1.0 win, 0.5 tie, 0.0 loss
-    slot_map: np.ndarray  # Metamon action index -> this model's policy slot (-1: not a legal option)
+    slot_map: np.ndarray  # Metamon action index (corrected state) -> this model's policy slot (-1: not a legal option)
+    label_slots: np.ndarray  # the same for the labels, which are indexed by the ORIGINAL parser's state (Exeggcute's)
     own_status: str  # the observer's active Pokemon's status when it decides ("slp", "frz", ...)
     lock_shape: Optional[str]  # the lock on the observer's active Pokemon: "full", "semi" or None (see lock_shape)
     disabled_move: Optional[str]  # the move Disable took away from the observer's active Pokemon
@@ -161,6 +164,7 @@ def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
             next_action=e["next_player_action"],
             win=win,
             slot_map=action_slot_map(state, ordered_party),
+            label_slots=label_slot_map(interface.UniversalState.from_dict(copy.deepcopy(traj["legacy_states"][t])), ordered_party),
             **decision_facts(states, actions, extras, t),
         )
         prev = s

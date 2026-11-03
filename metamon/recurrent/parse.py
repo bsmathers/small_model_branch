@@ -85,7 +85,7 @@ def _pokemon_dict(pokemon) -> Optional[dict]:
 
 # Bumped whenever the parser's output (states, actions, extras) or the features built from it change; the launcher refuses to
 # reuse a work folder made by another version, because its trajectories, labels and built data would be stale.
-PARSER_VERSION = "2-trap-probability-effects-field39"
+PARSER_VERSION = "3-trap-probability-effects-field39-legacy-pair"
 
 # Gen 1 trap duration is hidden: 2, 3, 4 or 5 uses with weights 3:3:1:1 (eighths). After k uses the victim is
 # still trapped at the next decision exactly when the total exceeds k, so P(trapped | k) is the share of

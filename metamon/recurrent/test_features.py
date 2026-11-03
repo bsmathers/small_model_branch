@@ -242,6 +242,24 @@ def test_trap_probability_table_and_effect_flags():
     assert _trap_probability(None) == 0.0
 
 
+def test_label_slots_follow_the_original_states_actions_by_identity():
+    from metamon.recurrent.features import label_slot_map
+
+    # corrected party: active snorlax (moves bodyslam, tackle), reserves chansey, tauros (sorted by name)
+    party = [_mon("snorlax", active=True, moves=("bodyslam", "tackle")), _mon("chansey"), _mon("tauros")]
+    # the original parser's state for the same decision: same active moves, but its reserves are tauros and zapdos
+    legacy_active = _mon("snorlax", active=True, moves=("bodyslam", "tackle"))
+    legacy = _state(legacy_active, _mon("chansey"))
+    legacy.available_switches = [_mon("tauros"), _mon("zapdos")]
+    m = label_slot_map(legacy, party)
+    assert list(m[:4]) == [0, 1, -1, -1]  # the two moves keep their place, the empty slots map nowhere
+    assert m[4] == 4 + 1  # legacy reserve 0 (sorted: tauros, zapdos) is tauros: the second corrected reserve
+    assert m[5] == -1  # zapdos is not in the corrected party: its label mass is reported as lost
+    # a move the original state lists but the corrected one lacks (a different guess for an unrevealed move)
+    legacy.player_active_pokemon = _mon("snorlax", active=True, moves=("bodyslam", "earthquake"))
+    assert list(label_slot_map(legacy, party)[:2]) == [0, -1]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:

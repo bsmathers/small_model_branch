@@ -193,8 +193,15 @@ class Launcher:
         stage = f"parse_{name}"
         cmds = [[self.py, "-m", "metamon.recurrent.parse", raw_dir, traj, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
         self.run_parallel(stage, cmds, [self.env(HF_HUB_OFFLINE=1)] * procs, lambda: f"{self.count_files(traj, '.lz4')} trajectories")
+
+        # the original parser's states and actions, which Exeggcute reads (it was trained on them), folded into each trajectory
+        legacy = os.path.join(src, "legacy")
+        cmds = [[self.py, os.path.join("tools", "legacy_parse.py"), raw_dir, legacy, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
+        self.run_parallel(f"legacy_{name}", cmds, [self.env(HF_HUB_OFFLINE=1)] * procs, lambda: f"{self.count_files(legacy, '.lz4')} legacy trajectories")
+        cmds = [[self.py, "-m", "metamon.recurrent.merge_legacy", traj, legacy, "--shard", f"{i}/{procs}"] for i in range(procs)]
+        self.run_parallel(f"merge_{name}", cmds, [self.env(HF_HUB_OFFLINE=1)] * procs)
         n_traj = self.count_files(traj, ".lz4")
-        self.log(f"{name}: parsed {n_traj} trajectories")
+        self.log(f"{name}: parsed {n_traj} trajectories (games the two parsers disagree on are in {traj}_rejected)")
 
         # label, a few processes per GPU (each is mostly Python overhead around small batches)
         gpus = max(1, len(self.gpus))
@@ -250,7 +257,7 @@ class Launcher:
         full_games = {n: a.games for n in SOURCES}
         scale_games = sum(full_games.values()) / max(1, sum(w for w, _ in self.counts.values()))
         parts = []
-        for stage in ("parse", "label", "build"):
+        for stage in ("parse", "legacy", "merge", "label", "build"):
             t = sum(v for k, v in self.timings.items() if k.startswith(stage + "_"))
             parts.append((stage, t * scale_games))
         smoke_steps = a.steps

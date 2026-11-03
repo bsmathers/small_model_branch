@@ -126,7 +126,7 @@ def build_game(args) -> tuple[str, int] | tuple[str, str]:
         for t, d in enumerate(decisions):
             for k in mapped:
                 src = labels[k][t].astype(np.float64)
-                for a, slot in enumerate(d.slot_map):
+                for a, slot in enumerate(d.label_slots):  # (labels follow the legacy state's actions)
                     if slot >= 0:
                         mapped[k][t, slot] = src[a]
                     elif src[a] > 1e-6:

@@ -164,7 +164,8 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     n_actions = action_space.gym_space.n
     lanes = len(trajectories)
     spaces = [copy.deepcopy(spec.observation_space) for _ in range(lanes)]
-    states = [[UniversalState.from_dict(copy.deepcopy(s)) for s in t["states"]] for t in trajectories]
+    # Exeggcute reads what the ORIGINAL parser produced (it was trained on that); see merge_legacy.py
+    states = [[UniversalState.from_dict(copy.deepcopy(s)) for s in t["legacy_states"]] for t in trajectories]
     lengths = [len(s) - 1 for s in states]  # a decision per state but the last
     horizon = max(lengths)
     for sp in spaces:
@@ -230,7 +231,7 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
         # the next step's RL2 input: reward of this transition, action actually played in the replay
         for i in range(lanes):
             if t < lengths[i]:
-                a = trajectories[i]["actions"][t]
+                a = trajectories[i]["legacy_actions"][t]
                 prev_action[i] = 0.0
                 if a >= 0:
                     prev_action[i, action_space.action_to_agent_output(states[i][t], UniversalAction(action_idx=a))] = 1.0
@@ -264,7 +265,7 @@ def main() -> None:
     recorder = Recorder(policy)
 
     # longest games first inside each batch group keeps the lockstep padding small
-    lengths = {f: len(load_trajectory(f)["states"]) for f in files}
+    lengths = {f: len(load_trajectory(f)["legacy_states"]) for f in files}
     files.sort(key=lambda f: lengths[f])
     done = 0
     start = time.time()

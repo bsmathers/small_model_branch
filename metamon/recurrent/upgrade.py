@@ -189,6 +189,8 @@ def upgrade_file(path: str, out_dir: str) -> bool:
     if "extras" in data:
         return False  # already in the new format
     data["extras"] = derive_extras(data["states"], data["actions"])
+    # the official files ARE the original parser's output (what Exeggcute was trained on)
+    data["legacy_states"], data["legacy_actions"] = data["states"], data["actions"]
     name = os.path.basename(path)
     if not name.endswith(("_WIN.json.lz4", "_LOSS.json.lz4", "_TIE.json.lz4")):
         # no result in the name: read it from the final state
