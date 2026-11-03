@@ -1,0 +1,31 @@
+# Recurrent policy/value model for Gen 1 OU
+
+A 1.31M-parameter recurrent transformer distilled from the Exeggcute ensemble (its proposer blend) with
+a win-probability head. Spec: `pkmn-search/docs/model_spec.md` (kept in the search repo).
+
+## Launch
+
+```
+git clone git@github.com:bsmathers/small_model_branch.git && cd small_model_branch
+./launch.sh --smoke     # a few minutes; prints stage timings and a projection for the full run
+./launch.sh             # the full run (resumes if stopped: run the same command again)
+```
+
+`launch.sh` installs the requirements (`pip install -e .` plus a CUDA build of torch if none is present),
+then `metamon.recurrent.launch` downloads the data from `bsmathers/raw_replays` and Exeggcute's checkpoints and
+usage statistics, parses both points of view of every game, labels them with Exeggcute, builds the
+training games and trains. Options: `--games` per source (default 30000), `--mix human=0.5 --mix strong=0.5`,
+`--steps` (20000), `--batch` (auto: the largest that fits in GPU memory), `--precision auto` (bf16 on Ampere
+or newer, fp16 before that, fp32 on CPU), `--work DIR`. Output: `WORK/run/weights_<step>.pt`; progress in
+`WORK/run/log.txt` and `WORK/logs/`.
+
+## Choosing a machine
+
+- The model is tiny; a training step is 96 sequential small steps, limited by kernel-launch latency rather than
+  compute. A big accelerator (A100, H100) is wasted. Any Ampere or newer card works (RTX 30xx/40xx, A-series,
+  L4): bf16 needs compute capability 8.0 or higher. 12 GB of VRAM is enough to start; 24 GB allows a larger
+  batch and more labelling processes.
+- Parsing and labelling are CPU-bound (Python), so take a host with 16 or more vCPUs, 64 GB RAM and a fast
+  disk. About 50 GB of disk covers the default sample (about 80 KB per game for trajectories, labels and built
+  data, 2.5 GB of checkpoints, 4 GB of raw logs).
+- Run `--smoke` first on the rented machine: it measures every stage and prints the projected hours.

@@ -123,6 +123,68 @@ def lr_at(step: int, args) -> float:
     return args.lr * (args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * min(frac, 1.0))))
 
 
+def synthetic_batch(batch: int, size: int, device) -> dict:
+    """A full-size random batch with every key the loss reads, for measuring memory and speed."""
+    g = torch.Generator(device="cpu").manual_seed(0)
+    out = {}
+    for k in ID_KEYS:
+        shape = {"own_species": (6,), "own_status": (6,), "own_moves": (6, 4), "opp_species": (6,), "opp_status": (6,), "opp_moves": (6, 4)}.get(k, (1,))
+        out[f"ids_{k}"] = torch.randint(0, 8, (batch, size, *shape), generator=g)
+    for k, width in (("own", (6, 10)), ("opp", (6, 7)), ("last", (34,)), ("field", (31,))):
+        out[f"floats_{k}"] = torch.rand(batch, size, *width, generator=g)
+    out["legal"] = torch.ones(batch, size, 9)
+    out["blend"] = torch.full((batch, size, 9), 1 / 9)
+    out["judge"] = torch.full((batch, size, 9), 1 / 9)
+    out["win"] = torch.randint(0, 2, (batch,), generator=g).float()
+    out["policy_ok"] = torch.ones(batch, size, dtype=torch.bool)
+    out["scored"] = torch.ones(batch, size, dtype=torch.bool)
+    return {k: v.to(device) for k, v in out.items()}
+
+
+def probe_batch(model, args, device, candidates=(256, 192, 128, 96, 64, 48, 32), headroom: float = 0.85) -> int:
+    """The largest candidate batch whose training steps fit in GPU memory (peak below `headroom` of the
+    total), measured on a copy of the model with random data. CPU runs use a small fixed batch."""
+    import copy
+
+    if device.type != "cuda":
+        return 32
+    total = torch.cuda.get_device_properties(device).total_memory
+    size = args.chunk + args.burn_in
+    for b in candidates:
+        probe = copy.deepcopy(model)
+        opt = torch.optim.AdamW(probe.parameters(), lr=1e-4)
+        scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16")
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        try:
+            batch = synthetic_batch(b, size, device)
+            start = None
+            for i in range(4):
+                if i == 1:
+                    torch.cuda.synchronize(device)
+                    start = time.time()
+                with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
+                    out = run_batch(probe, batch, args)
+                loss = masked_mean(out["kl"], torch.ones_like(out["kl"])) + masked_mean(out["bce"], torch.ones_like(out["bce"]))
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            torch.cuda.synchronize(device)
+            rate = 3 / (time.time() - start)
+            peak = torch.cuda.max_memory_allocated(device)
+        except torch.cuda.OutOfMemoryError:
+            del probe, opt
+            torch.cuda.empty_cache()
+            continue
+        del probe, opt, batch
+        torch.cuda.empty_cache()
+        print(f"probe: batch {b} peak {peak / 2**30:.1f} of {total / 2**30:.1f} GiB, {rate:.2f} steps/s", flush=True)
+        if peak <= headroom * total:
+            return b
+    return candidates[-1]
+
+
 def parse_sources(items: list[str], validation: bool, fraction: int):
     sources = []
     for item in items:
@@ -137,7 +199,7 @@ def main() -> None:
     ap.add_argument("out")
     ap.add_argument("--source", action="append", required=True, help="name=directory:weight")
     ap.add_argument("--steps", type=int, default=100_000)
-    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--batch", default="128", help="a number, or auto to take the largest that fits in GPU memory")
     ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--burn-in", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -177,6 +239,13 @@ def main() -> None:
     log(f"sources {' '.join(f'{s.name}:{len(s.paths)}games/{int(s.lengths.sum())}decisions/weight{s.weight}' for s in train_sources)}")
     log(f"validation {' '.join(f'{s.name}:{len(s.paths)}games' for s in val_sources)}")
 
+    model = PolicyValueModel().to(device)
+    log(f"model {count_parameters(model):,} parameters")
+    if str(args.batch) == "auto":
+        args.batch = probe_batch(model, args, device)
+        log(f"batch size {args.batch} (measured)")
+    args.batch = int(args.batch)
+
     train_loader = DataLoader(
         Windows(train_sources, args.burn_in, args.chunk, args.seed), batch_size=args.batch, num_workers=args.workers,
         collate_fn=collate, pin_memory=device.type == "cuda", persistent_workers=args.workers > 0, prefetch_factor=4 if args.workers else None,
@@ -184,9 +253,6 @@ def main() -> None:
     val_loader = DataLoader(
         Windows(val_sources, args.burn_in, args.chunk, endless=False), batch_size=args.batch, num_workers=min(args.workers, 4), collate_fn=collate,
     )
-
-    model = PolicyValueModel().to(device)
-    log(f"model {count_parameters(model):,} parameters")
     if args.compile:
         model.step = torch.compile(model.step)
     decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "role" not in n]
