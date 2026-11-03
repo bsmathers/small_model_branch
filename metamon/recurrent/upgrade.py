@@ -164,8 +164,11 @@ def derive_extras(states: list[dict], actions: list[int]) -> list[dict]:
                 "opponent_cant": cant["opponent"],
                 "next_player_action": NO_ACTION,
                 "action_reason": None,
-                "player_trapped": trapped["player"],
-                "opponent_trapped": trapped["opponent"],
+                # the trap length is hidden and the age of a derived trap unknown: 0.5 stands for "probably trapped"
+                "player_trapped": 0.5 if trapped["player"] else 0.0,
+                "opponent_trapped": 0.5 if trapped["opponent"] else 0.0,
+                "player_effects": [],  # (not recoverable from the official states)
+                "opponent_effects": [],
                 "player_conditions_all": conds(state["player_conditions"]),
                 "opponent_conditions_all": conds(state["opponent_conditions"]),
                 "player_team": list(copy.deepcopy(own_seen).values()),

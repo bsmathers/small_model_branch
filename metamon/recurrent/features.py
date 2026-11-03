@@ -16,6 +16,8 @@ DVs and maximum stat experience, the same assumptions as the Zig engine's damage
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -40,7 +42,8 @@ CANT_REASONS = (
     "fainted", "wokeup", "opponent_fainted", "confusion", "game_ended",
 )
 LAST_SIDE_WIDTH = len(KINDS) + 1 + 1 + len(CANT_REASONS)  # kind, hp change, fainted, cant reason
-FIELD_WIDTH = 31  # ... + trapped (2) + derived-extras flag (1)
+EFFECTS = ("substitute", "confusion", "leechseed", "focusenergy")  # volatile effects the model sees, per side
+FIELD_WIDTH = 39  # damage 8, speed 2, turn 8, party 2, forced 2, screens 6, trapped 2, effects 8, derived-extras flag 1
 # Screens. The parsed data keeps side conditions as "noconditions" and records Reflect and the
 # other screens as a Pokemon's effect, so both places are read.
 SCREENS = ("reflect", "lightscreen", "mist")
@@ -150,7 +153,7 @@ def _damage_fraction(attacker, defender, move, tables: Tables, attacker_stats, d
     return min(1.0, damage / max(1.0, defender_stats["hp"]))
 
 
-def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: float, opp_hp: float, max_hp=None) -> float:
+def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: float, opp_hp: float, max_hp=None, estimate=None) -> float:
     """What Counter used by `user` ("player" or "opponent") would do now, as a fraction of the target's max HP.
 
     Gen 1 Counter (data/mods/gen1/moves.ts) deals twice the battle's lastDamage, the damage of the last move
@@ -168,8 +171,6 @@ def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: 
     if not extras or not extras.get("last_damage"):
         return 0.0
     damage, last_move = extras["last_damage"], extras.get("last_move") or {}
-    if damage["kind"] == "unknown":
-        return 0.0  # taken by a Substitute: the engine tracks the uncapped amount, which the log does not show
     target = "opponent" if user == "player" else "player"
     moved = last_move.get(target)
     if not moved or moved not in tables.moves:
@@ -179,6 +180,19 @@ def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: 
         return 0.0
     if (extras.get("counter_selected") or {}).get(target) and extras.get(f"{target}_cant") is None:
         return 0.0  # its last move selection was Counter (it did not select anything new that failed to run): the test fails
+    if damage["kind"] == "unknown":
+        # taken by a Substitute: the engine tracks the uncapped amount, which the log does not show. `estimate(side, move)`
+        # (the damage calculator's average roll, as a fraction of the max HP of the side that took it) stands in for it
+        if estimate is None:
+            return 0.0
+        hitter = "opponent" if damage["side"] == "player" else "player"
+        hit_move = last_move.get(hitter)
+        if not hit_move or hit_move not in tables.moves:
+            return 0.0
+        taken = estimate(damage["side"], hit_move)
+        victim_hp = own_hp if damage["side"] == "player" else opp_hp
+        target_hp = opp_hp if user == "player" else own_hp
+        return min(1.0, 2.0 * taken * victim_hp / max(1.0, target_hp))
     # the damage in HP: a share of the max HP of the Pokemon that lost it (or healed, for a drain)
     try:
         victim_hp = max_hp(damage["side"], damage["name"]) if max_hp else _stat_of(tables.base_stats(damage["name"])["hp"], hp=True)
@@ -193,7 +207,14 @@ def _move_damage(user: str, attacker, defender, move, tables: Tables, attacker_s
     not a function of the two Pokemon's stats handled as the engine does."""
     key = "".join(c for c in move.name.lower() if c.isalnum())
     if key == "counter":
-        return counter_fraction(user, extras, tables, own_hp, opp_hp)
+        def estimate(victim_side: str, move_name: str) -> float:
+            # the average Gen 1 roll (217..255 of 255) of the move that hit the Substitute, as a share of the victim's HP
+            hit = SimpleNamespace(name=move_name)
+            if victim_side == user:  # the foe hit us
+                return 0.93 * _damage_fraction(defender, attacker, hit, tables, defender_stats, attacker_stats)
+            return 0.93 * _damage_fraction(attacker, defender, hit, tables, attacker_stats, defender_stats)
+
+        return counter_fraction(user, extras, tables, own_hp, opp_hp, estimate=estimate)
     if key == "superfang":  # half of the target's current HP, at least 1 (ignores type immunity)
         hp = defender_stats["hp"]
         return max(1.0, float(int(defender.hp_pct * hp) // 2)) / max(1.0, hp) if defender.hp_pct > 0 else 0.0
@@ -394,7 +415,12 @@ def encode_observer(
     # 1 when the extras were derived from the official parsed states (upgrade.py) instead of the raw log:
     # the cannot-act reasons and trapped flags are then partly unknown
     derived = np.array([float((extras or {}).get("derived", False))], dtype=np.float32)
-    field_floats = np.concatenate([damage, speed, _turn_bucket(turn), party, forced, screens, trapped, derived])
+    # volatile effects of the two active Pokemon (the parser's full list; the official state keeps only one)
+    effects = np.array(
+        [float(fx in set((extras or {}).get(key) or ())) for key in ("player_effects", "opponent_effects") for fx in EFFECTS],
+        dtype=np.float32,
+    )
+    field_floats = np.concatenate([damage, speed, _turn_bucket(turn), party, forced, screens, trapped, effects, derived])
     assert field_floats.shape == (FIELD_WIDTH,)
 
     return Encoded(

@@ -209,7 +209,7 @@ def synthetic_batch(batch: int, size: int, device) -> dict:
     for k in ID_KEYS:
         shape = {"own_species": (6,), "own_status": (6,), "own_moves": (6, 4), "opp_species": (6,), "opp_status": (6,), "opp_moves": (6, 4)}.get(k, (1,))
         out[f"ids_{k}"] = torch.randint(0, 8, (batch, size, *shape), generator=g)
-    for k, width in (("own", (6, 10)), ("opp", (6, 7)), ("last", (34,)), ("field", (31,))):
+    for k, width in (("own", (6, 10)), ("opp", (6, 7)), ("last", (34,)), ("field", (39,))):
         out[f"floats_{k}"] = torch.rand(batch, size, *width, generator=g)
     out["legal"] = torch.ones(batch, size, 9)
     out["blend"] = torch.full((batch, size, 9), 1 / 9)

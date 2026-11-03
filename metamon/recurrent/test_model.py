@@ -17,12 +17,12 @@ def fake_batch(b=3, t=7, seed=0):
         ids[f"last_{who}_species"] = r(cfg.n_species, b, t, 1)
         ids[f"last_{who}_status"] = r(8, b, t, 1)
     n = lambda *s: torch.randn(*s, generator=g)
-    floats = {"own": n(b, t, 6, 10), "opp": n(b, t, 6, 7), "last": n(b, t, 34), "field": n(b, t, 31)}
+    floats = {"own": n(b, t, 6, 10), "opp": n(b, t, 6, 7), "last": n(b, t, 34), "field": n(b, t, 39)}
     return ids, floats
 
 
 def test_parameter_count():
-    assert count_parameters(PolicyValueModel()) == 1_310_506 + 192  # the spec's total plus the 31st field input
+    assert count_parameters(PolicyValueModel()) == 1_310_698 + 192 * 8  # field 31 wide plus 8 effect inputs
 
 
 def test_shapes_and_burn_in():

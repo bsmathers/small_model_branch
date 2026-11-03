@@ -119,6 +119,10 @@ def lock_shape(lock: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _norm(name: str) -> str:
+    return "".join(c for c in name.lower() if c.isalnum())
+
+
 def decision_facts(states: list[dict], actions: list[int], extras: list[dict], t: int) -> dict:
     """What decides the kind of decision t (see build.decision_kind), derived from the trajectory alone."""
     s, e = states[t], extras[t]
@@ -130,7 +134,12 @@ def decision_facts(states: list[dict], actions: list[int], extras: list[dict], t
         lock_shape=lock_shape(e.get("player_lock")),
         disabled_move=(e.get("player_lock") or {}).get("disabled"),
         # every move has run out of PP: the engine offers Struggle only, and switching stays allowed
-        struggling=bool(s["player_active_pokemon"]["moves"]) and all(m["current_pp"] == 0 for m in s["player_active_pokemon"]["moves"]),
+        # (a disabled move does not count as usable: the last move with PP can be the disabled one)
+        struggling=bool(s["player_active_pokemon"]["moves"])
+        and all(
+            m["current_pp"] == 0 or _norm(m["name"]) == _norm((e.get("player_lock") or {}).get("disabled") or "")
+            for m in s["player_active_pokemon"]["moves"]
+        ),
     )
 
 

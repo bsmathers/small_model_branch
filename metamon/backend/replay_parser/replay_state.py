@@ -191,6 +191,7 @@ class Pokemon:
         self.lock_move: Optional[str] = None
         self.lock_age: int = 0
         self.trapped_age: int = 0
+        self.trap_refreshed: bool = False  # a trap move landed on it during the current turn
         self.disabled_move: Optional[str] = None
 
         # pokedex lookup
@@ -293,6 +294,7 @@ class Pokemon:
         self.lock_move = None
         self.lock_age = 0
         self.trapped_age = 0
+        self.trap_refreshed = False
         self.disabled_move = None
 
     def on_end_of_turn(self):

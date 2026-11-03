@@ -762,7 +762,9 @@ class SimProtocol:
             pokemon.status = status
             if status in (PEStatus.SLP, PEStatus.FRZ):
                 self._note_no_action(args[0], args[1].lower())  # lost the turn if it had not acted
-        elif pokemon.status == status:
+        elif pokemon.status == status or (
+            status == PEStatus.PSN and pokemon.status == PEStatus.TOX
+        ):  # (Gen 1 prints a cure of bad poison as plain psn)
             pokemon.status = Nothing.NO_STATUS
             if status == PEStatus.SLP and any("[msg]" in a for a in args):
                 self._note_no_action(args[0], "wokeup")  # waking up costs the turn in Gen 1
@@ -1220,6 +1222,19 @@ class SimProtocol:
         turn = self.curr_turn
         if not data or turn is None:
             return
+        # making a Substitute costs a quarter of the HP as a direct (unlogged-by-the-engine) damage: the -damage line right
+        # after |-start|..|Substitute is not a hit and leaves lastDamage alone
+        made_sub = getattr(self, "_sub_made_by", None)
+        self._sub_made_by = None
+        if name == "-start" and len(data) > 1 and data[1].split(":")[-1].strip() == "Substitute":
+            self._sub_made_by = data[0]
+            return
+        if name == "-damage" and made_sub == data[0] and not any(t.startswith("[from]") for t in data[2:]):
+            return
+        if name == "-end" and len(data) > 1 and data[1] == "Substitute":
+            # broken by a hit: the engine's lastDamage is the uncapped damage, which the log does not show
+            turn.last_damage = {"kind": "unknown", "side": data[0][:2], "name": self._plain(data[0].split(":")[-1]), "pct": 0.0}
+            return
         if name == "move" and len(data) >= 2:
             called = any(t.startswith("[from]") and self._plain(t[len("[from]"):]) not in (self._plain(data[1]), "lockedmove") for t in data[2:])
             selected_counter = self._plain(data[1]) == "counter" and not called
@@ -1300,8 +1315,32 @@ class SimProtocol:
         """Gen 1 locks that the engine puts on a Pokemon, followed from the public log, with the engine's own
         rules for when they end (data/mods/gen1 in Pokemon Showdown). Which of them leave a choice open
         (switching, or fighting) is decided in recurrent.records.lock_shape."""
+        pending = getattr(self, "_pending_confusion", None)
+        if pending is not None:
+            # A confused Pokemon's check printed |-activate|..|confusion. If it moves, is stopped by paralysis, or the
+            # self-hit damage is printed, that settles it. Anything else next means it hurt itself and the damage went
+            # to the foe's Substitute (a Gen 1 quirk), so no -damage line ever names it.
+            self_activate = name == "-activate" and bool(data) and data[0] == pending and len(data) > 1 and data[1] == "confusion"
+            # any later line about the same Pokemon (its move, a Bide activation, the self-hit damage, a status...) settles it
+            own_event = bool(data) and data[0] == pending and not self_activate
+            if not own_event and not self_activate:
+                hurt = self._lock_pokemon(pending)
+                if hurt is not None:
+                    self._break_locks(hurt, pending)
+                    self._note_no_action(pending, "confusion")
+            if own_event or not self_activate:
+                self._pending_confusion = None
         if name in ("turn", "upkeep"):
             self._pending_lock = None
+            if name == "turn":
+                # a trap that did not land this turn is over: the victim keeps it only until the end of the turn it was
+                # last re-applied (the engine's partiallytrapped lasts 2 turns and is renewed by every landed use)
+                for team in (self.curr_turn.active_pokemon_1, self.curr_turn.active_pokemon_2):
+                    p = team[0]
+                    if p is not None:
+                        if p.trapped_age and not p.trap_refreshed:
+                            p.trapped_age = 0
+                        p.trap_refreshed = False
             return
         if name in ("-immune", "-miss", "-fail", "-notarget"):
             self._revoke_pending_lock()
@@ -1360,6 +1399,7 @@ class SimProtocol:
                 self._pending_lock = (pokemon, before, (victim, victim.trapped_age) if victim is not None else None)
                 if victim is not None:
                     victim.trapped_age = pokemon.lock_age
+                    victim.trap_refreshed = True
                     if victim.lock == "recharge":
                         victim.lock = None  # a trapping move that lands cancels the victim's pending recharge
             elif pokemon.lock == "trap_user":
@@ -1382,9 +1422,13 @@ class SimProtocol:
                 self._break_locks(pokemon, ident)
         elif name == "-prepare":
             pokemon.lock, pokemon.lock_move = "charge", data[1] if len(data) > 1 else None
+        elif name == "-activate" and len(data) > 1 and data[1] == "confusion":
+            self._pending_confusion = ident
         elif name in ("-start", "-end") and len(data) > 1:
             effect = data[1].split(":")[-1].strip()
-            if effect == "Bide":
+            if name == "-end" and any("[partiallytrapped]" in t for t in data[2:]):
+                pokemon.trapped_age = 0  # a Substitute made while trapped frees the Pokemon (Gen 1)
+            elif effect == "Bide":
                 if name == "-start":
                     pokemon.lock = "bide"
                 elif pokemon.lock == "bide":

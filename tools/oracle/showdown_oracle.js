@@ -156,6 +156,21 @@ async function playBattle(index) {
 				}
 			}
 		}
+		if (process.env.SUB_MODE) {
+			// Substitute everywhere, with the moves it interacts with: status that it blocks, trapping, Counter, Leech Seed...
+			const subMoves = ['Substitute', 'Substitute', 'Confuse Ray', 'Supersonic', 'Toxic', 'Poison Powder', 'Stun Spore', 'Thunder Wave',
+				'Leech Seed', 'Wrap', 'Bind', 'Fire Spin', 'Clamp', 'Counter', 'Swords Dance', 'Growl', 'Screech', 'Reflect', 'Light Screen',
+				'Mist', 'Focus Energy', 'Hypnosis', 'Seismic Toss', 'Night Shade', 'Super Fang', 'Double-Edge', 'Body Slam', 'Hyper Beam',
+				'Drain Punch', 'Mega Drain', 'Absorb', 'Dream Eater', 'Rest', 'Recover', 'Haze', 'Disable', 'Explosion', 'Self-Destruct', 'Thrash'];
+			for (const set of sets) {
+				const unique = ['Substitute'];
+				while (unique.length < 4) {
+					const m = rng() < 0.75 ? subMoves[Math.floor(rng() * subMoves.length)] : set.moves[Math.floor(rng() * set.moves.length)];
+					if (!unique.includes(m)) unique.push(m);
+				}
+				set.moves = unique;
+			}
+		}
 		if (process.env.LOCK_MODE) {
 			for (const set of sets) {
 				for (let j = 0; j < set.moves.length; j++) {

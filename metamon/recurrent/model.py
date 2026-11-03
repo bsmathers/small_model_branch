@@ -12,7 +12,7 @@ Training runs a sequence by stepping the recurrence over time. Everything that d
 Input batch (all tensors [B, T, ...]; the feature encoder produces one step of this):
     ids    own_species [6], own_status [6], own_moves [6,4], opp_species [6], opp_status [6],
            opp_moves [6,4], last_{own,opp}_{move,species,status} [1]       (int64)
-    floats own [6,10], opp [6,7], last [34], field [31]                    (float32)
+    floats own [6,10], opp [6,7], last [34], field [39]                    (float32)
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class Config:
     own_width: int = 94
     opp_width: int = 91
     last_width: int = 106
-    field_width: int = 31
+    field_width: int = 39
     n_actions: int = 9
 
 

@@ -28,7 +28,7 @@ the exact request Showdown sent, the hidden engine state, and the answer of Coun
 offers, the lock shape of the request, Counter):
 
 ```
-node tools/oracle/showdown_oracle.js SHOWDOWN_DIR TEAMS_DIR ORACLE_DIR 300 [FIRST_SEED]   # LOCK_MODE=1 / COUNTER_MODE=1 stress locks / Counter
+node tools/oracle/showdown_oracle.js SHOWDOWN_DIR TEAMS_DIR ORACLE_DIR 300 [FIRST_SEED]   # LOCK_MODE=1 / COUNTER_MODE=1 / SUB_MODE=1 stress locks / Counter / Substitute
 python -m metamon.recurrent.parse ORACLE_LOGS TRAJ_DIR                                     # the *.log files in a folder of their own
 python -m metamon.recurrent.check_oracle ORACLE_DIR TRAJ_DIR
 ```
@@ -53,6 +53,29 @@ whether Counter works in 98.9%, and it catches 99.2% of the real successes; the 
 99.6%. The misses are information the log does not contain: a paralyzed foe that had selected Counter, and an overkill (the
 engine counts the uncapped damage, the log shows only the HP that was left). Super Fang (half the target's current HP) and
 Psywave (up to 149) match the engine's maximum; Bide's damage (twice what it took while storing) is not modeled and gives 0.
+
+## Trapping and Substitute
+
+The partial-trapping rules follow the Smogon RBY partial-trapping article and the engine. The duration is hidden (2-5 uses,
+weights 3:3:1:1), so the parser exports the probability that the victim is still trapped (`player_trapped`,
+`opponent_trapped`: 0 when free, 1.0 after the first use, 0.625, 0.4, 0.5 after the 2nd to 4th, 0 after the 5th). A trap that
+was not renewed in the turn is cleared, as is one on a Pokemon that makes a Substitute (`-end ... [partiallytrapped]`). On
+about 600 fuzz games every 0 and every 1 matched the engine and the in-between values were calibrated (0.62 observed for 0.625,
+0.39 for 0.4).
+
+Substitute (Gen 1 mod): `player_effects` / `opponent_effects` list every volatile (substitute, confusion, leechseed,
+focusenergy ...) and match the engine on all four in the Substitute fuzz set (`SUB_MODE=1`). The quirks handled:
+creating a Substitute is not a hit (its HP cost leaves `lastDamage` alone); damage absorbed by a Substitute, or that breaks
+it, sets `lastDamage` to an uncapped amount the log never shows, so Counter then uses the damage calculator's average roll
+(`features.counter_fraction(estimate=...)`; in the checker those cases are counted but not graded); a confused Pokemon's
+self-hit can land on the foe's Substitute and then no damage line names it (the parser reads a missing line as a self-hit and
+ends Bide / charge / Thrash / the trap); a cure of bad poison is printed as `psn` (Haze); a last usable move that is disabled
+means Struggle.
+
+## Parser version
+
+`metamon.recurrent.parse.PARSER_VERSION` is stamped into each work folder by the launcher; a folder made by another version is
+refused (its trajectories, labels and built data would be stale).
 
 ## What counts as a decision
 

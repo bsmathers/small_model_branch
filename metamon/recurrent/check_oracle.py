@@ -253,9 +253,25 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
         if t is not None and norm(r["name"]) in own_species:
             report.check("reserve HP", hp_ok(r["hp_pct"], t), (where, r["name"], r["hp_pct"], t["hp"], t["maxhp"]))
             report.check("reserve status", r["status"] == status_of(t), (where, r["name"], r["status"], status_of(t)))
-    for who, flag, truth in (("own", extras["player_trapped"], me_truth), ("opp", extras["opponent_trapped"], opp_truth)):
+    # volatile effects (Substitute, confusion, Leech Seed, Focus Energy): the full list must match the engine's
+    TRACKED = {"substitute", "confusion", "leechseed", "focusenergy"}
+    for who, ours_fx, truth in (("own", extras.get("player_effects"), me_truth), ("opp", extras.get("opponent_effects"), opp_truth)):
+        if ours_fx is None:
+            continue
+        for fx in sorted(TRACKED):
+            report.check(f"{who} effect {fx}", (fx in {norm(e) for e in ours_fx}) == (fx in truth["volatiles"]), (where, sorted(ours_fx), truth["volatiles"]))
+    # the trapped value is a probability (the trap length is hidden): 0 and 1 are certainties and must match the
+    # engine; in between it is graded by calibration, per number of uses seen so far
+    for who, flag, truth, lock in (("own", extras["player_trapped"], me_truth, extras["player_lock"]), ("opp", extras["opponent_trapped"], opp_truth, extras["opponent_lock"])):
         engine_trapped = "partiallytrapped" in truth["volatiles"]
-        report.check(f"{who} trapped flag (the parser's) = the engine has the trap on it", bool(flag) == engine_trapped, (where, flag, truth["volatiles"]))
+        if req.get("forceSwitch"):
+            continue  # the trapper fainted this turn and is about to be replaced: the engine frees the victim at the switch
+        if flag in (0, 0.0, 1.0) or isinstance(flag, bool):
+            report.check(f"{who} trapped value is certain ({flag}) -> the engine agrees", bool(flag) == engine_trapped, (where, flag, truth["volatiles"]))
+        else:
+            report.check(f"{who} trapped value is uncertain -> the engine has the trap or not (any)", True)
+        age = (lock or {}).get("trapped_age", 0)
+        report.matrix["trapped value by uses seen: engine trapped? (calibration)"][f"{who} p={float(flag):.3f} age={age}"][engine_trapped] += 1
     check_action(report, dec, state, action, nxt_extras, where, me_truth["volatiles"])
 
     # --- side conditions
@@ -267,6 +283,11 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
     # --- Counter: the engine's own answer to "what would Counter do now" against what the extras let us predict
     for who, truth, user in (("own", dec.get("counterMe"), "player"), ("opp", dec.get("counterOpp"), "opponent")):
         if truth is None:
+            continue
+        if (extras.get("last_damage") or {}).get("kind") == "unknown":
+            # taken by a Substitute: lastDamage is an uncapped amount the log never shows; features estimate it with the
+            # damage calculator (a rough value), so it is counted here but not graded exactly
+            report.matrix["Counter after damage taken by a Substitute (estimated, not graded)"][f"engine {'succeeds' if truth['succeeds'] else 'fails'}"]["n"] += 1
             continue
         theirs = min(1.0, truth["damage"] / truth["targetMaxHp"])  # damage beyond the target's max HP is just a KO
         # (the logic is graded, not the HP estimate: the true max HP of each side's Pokemon is supplied)

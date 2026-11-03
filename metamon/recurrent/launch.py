@@ -171,6 +171,23 @@ class Launcher:
         traj, labels, built = (os.path.join(src, d) for d in ("trajectories", "labels", "built"))
         self.log(f"{name}: {total} logs, taking every {every}th (about {wanted} games, two points of view each)")
 
+        # every stage resumes from what is on disk, so data made by an older parser must not be mixed in
+        from metamon.recurrent.parse import PARSER_VERSION
+
+        os.makedirs(src, exist_ok=True)
+        stamp = os.path.join(src, ".parser_version")
+        if os.path.exists(stamp):
+            found = open(stamp).read().strip()
+            if found != PARSER_VERSION:
+                raise RuntimeError(
+                    f"{src} was made by parser version {found!r}, the code is {PARSER_VERSION!r}: its trajectories, labels and "
+                    f"built data are stale. Use another WORK folder or move {src} away."
+                )
+        elif any(os.path.isdir(os.path.join(src, d)) and os.listdir(os.path.join(src, d)) for d in ("trajectories", "labels", "built")):
+            raise RuntimeError(f"{src} has data but no .parser_version stamp (made before parser versions): move it away or use another WORK folder.")
+        with open(stamp, "w") as f:
+            f.write(PARSER_VERSION)
+
         # parse, in parallel shards
         procs = a.parse_procs or self.cpus
         stage = f"parse_{name}"

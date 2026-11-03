@@ -26,6 +26,9 @@ its `states` and `actions` identical. It adds a parallel `extras` list, one entr
         partial trapping (Bind, Wrap, Fire Spin, Clamp): set when a trap move hits the Pokemon (first
         use or a [from] continuation) or a |cant|...|partiallytrapped line names it, cleared when it
         moves or switches out. Gen 1 logs have no trap start or end line.
+  player_effects / opponent_effects
+        every volatile effect on each active Pokemon (lowercase names without spaces or underscores: substitute,
+        confusion, leechseed, focusenergy...). The model reads `substitute` from these.
   player_conditions_all / opponent_conditions_all
         every active side condition (the official state keeps only the most recent one as a string).
   player_team / opponent_team
@@ -78,6 +81,29 @@ def _pokemon_dict(pokemon) -> Optional[dict]:
     if pokemon is None:
         return None
     return dataclasses.asdict(interface.UniversalPokemon.from_ReplayPokemon(pokemon))
+
+
+# Bumped whenever the parser's output (states, actions, extras) or the features built from it change; the launcher refuses to
+# reuse a work folder made by another version, because its trajectories, labels and built data would be stale.
+PARSER_VERSION = "2-trap-probability-effects-field39"
+
+# Gen 1 trap duration is hidden: 2, 3, 4 or 5 uses with weights 3:3:1:1 (eighths). After k uses the victim is
+# still trapped at the next decision exactly when the total exceeds k, so P(trapped | k) is the share of
+# totals above k among those not below it (a first use is never the last).
+TRAP_PROBABILITY = {1: 1.0, 2: 5 / 8, 3: 2 / 5, 4: 1 / 2, 5: 0.0}
+
+
+def _trap_probability(pokemon) -> float:
+    age = getattr(pokemon, "trapped_age", 0) if pokemon is not None else 0
+    return TRAP_PROBABILITY.get(age, 0.0) if age else 0.0
+
+
+def _effects(pokemon) -> list[str]:
+    """Every volatile effect on the active Pokemon (substitute, confusion, leechseed, focusenergy...), not just the most
+    recent one that the official state keeps."""
+    if pokemon is None:
+        return []
+    return sorted(_plain(getattr(e, "name", str(e))) for e in pokemon.effects)
 
 
 def _lock_dict(pokemon) -> Optional[dict]:
@@ -149,8 +175,10 @@ class RecurrentReplayParser(ReplayParser):
                     "action_reason": reason,
                     "player_lock": _lock_dict(own[0]),
                     "opponent_lock": _lock_dict(opp[0]),
-                    "player_trapped": own_trapped,
-                    "opponent_trapped": bool(opp[0] is not None and opp[0].partially_trapped),
+                    "player_effects": _effects(own[0]),
+                    "opponent_effects": _effects(opp[0]),
+                    "player_trapped": _trap_probability(own[0]),
+                    "opponent_trapped": _trap_probability(opp[0]),
                     "player_conditions_all": _conditions(turn.conditions_1 if p1 else turn.conditions_2),
                     "opponent_conditions_all": _conditions(turn.conditions_2 if p1 else turn.conditions_1),
                     "player_team": [_pokemon_dict(m) for m in own_team],

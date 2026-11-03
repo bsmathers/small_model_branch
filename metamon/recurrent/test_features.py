@@ -125,17 +125,23 @@ def test_switch_records_the_species_not_a_move():
     assert enc.ids["last_opp_move"][0] == 0
 
 
-def test_trapped_flags_come_from_the_extras():
+def test_trapped_and_effect_values_come_from_the_extras():
+    # field tail: ... screens (6), trapped (2), effects (8: substitute, confusion, leechseed, focusenergy per side), derived (1)
     tables = _tables()
     own = [_mon("tauros", active=True)]
     opp = [_mon("chansey", active=True)]
     base = encode_observer(_state(own[0], opp[0]), own, opp, LastTurn(), 3, tables)
-    assert base.floats["field"][-3:].sum() == 0.0
-    extras = {"player_trapped": True, "opponent_trapped": False, "player_conditions_all": ["reflect"], "opponent_conditions_all": []}
+    assert base.floats["field"][-11:].sum() == 0.0
+    extras = {
+        "player_trapped": 0.625, "opponent_trapped": 0.0, "player_conditions_all": ["reflect"], "opponent_conditions_all": [],
+        "player_effects": ["confusion"], "opponent_effects": ["substitute", "leechseed"],
+    }
     enc = encode_observer(_state(own[0], opp[0]), own, opp, LastTurn(), 3, tables, extras=extras)
-    assert list(enc.floats["field"][-3:-1]) == [1.0, 0.0]
-    assert enc.floats["field"][-1] == 0.0  # not derived
-    assert enc.floats["field"][-3 - 6] == 1.0  # our Reflect (the first screen flag)
+    f = enc.floats["field"]
+    assert list(f[-11:-9]) == [0.625, 0.0]
+    assert list(f[-9:-1]) == [0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    assert f[-1] == 0.0  # not derived
+    assert f[-11 - 6] == 1.0  # our Reflect (the first screen flag)
 
 
 def test_party_is_in_policy_order():
@@ -207,6 +213,33 @@ def test_counter_after_counter_depends_on_what_the_foe_selected_not_what_it_used
     # and it works the other way round: the foe's Counter against us uses OUR last move
     mine = {**_extras("bodyslam", side="opponent"), "last_move": {"player": "bodyslam", "opponent": "tackle"}}
     assert counter_fraction("opponent", mine, t, hp, hp) > 0.0
+
+
+def test_counter_after_a_substitute_hit_uses_the_estimate_when_given():
+    t = _counter_tables()
+    hp = 703.0
+    unknown = _extras("bodyslam", kind="unknown", side="player")
+    asked = []
+
+    def estimate(victim_side, move):
+        asked.append((victim_side, move))
+        return 0.15  # a share of the victim's max HP
+
+    # the foe's Body Slam hit our Substitute: Counter doubles the estimated damage (same max HP on both sides here)
+    assert abs(counter_fraction("player", unknown, t, hp, hp, estimate=estimate) - 0.3) < 1e-9
+    assert asked == [("player", "bodyslam")]
+
+
+def test_trap_probability_table_and_effect_flags():
+    from types import SimpleNamespace
+
+    from metamon.recurrent.parse import TRAP_PROBABILITY, _trap_probability
+
+    # the trap lasts 2/3/4/5 uses with weights 3/3/1/1: P(still trapped | k uses seen)
+    assert TRAP_PROBABILITY == {1: 1.0, 2: 5 / 8, 3: 2 / 5, 4: 1 / 2, 5: 0.0}
+    assert _trap_probability(SimpleNamespace(trapped_age=2)) == 5 / 8
+    assert _trap_probability(SimpleNamespace(trapped_age=0)) == 0.0
+    assert _trap_probability(None) == 0.0
 
 
 if __name__ == "__main__":
