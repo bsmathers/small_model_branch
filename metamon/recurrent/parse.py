@@ -80,6 +80,27 @@ def _pokemon_dict(pokemon) -> Optional[dict]:
     return dataclasses.asdict(interface.UniversalPokemon.from_ReplayPokemon(pokemon))
 
 
+def _lock_dict(pokemon) -> Optional[dict]:
+    """The locks on a Pokemon when its player decides (see forward._track_lock)."""
+    if pokemon is None:
+        return None
+    return {"lock": pokemon.lock, "age": pokemon.lock_age, "trapped_age": pokemon.trapped_age, "disabled": pokemon.disabled_move}
+
+
+def _plain(text: Optional[str]) -> Optional[str]:
+    return None if text is None else "".join(c for c in text.lower() if c.isalnum())
+
+
+def _memory(turn, p1: bool) -> tuple[Optional[dict], dict, dict]:
+    """Counter's memory (see Turn.last_damage) from the observer's point of view."""
+    ld = turn.last_damage
+    if ld is not None:
+        ld = {**ld, "side": "player" if (ld["side"] == "p1") == p1 else "opponent", "name": _plain(ld["name"])}
+    mine, theirs = (turn.last_move_1, turn.last_move_2) if p1 else (turn.last_move_2, turn.last_move_1)
+    sel_mine, sel_theirs = (turn.counter_selected_1, turn.counter_selected_2) if p1 else (turn.counter_selected_2, turn.counter_selected_1)
+    return ld, {"player": _plain(mine), "opponent": _plain(theirs)}, {"player": bool(sel_mine), "opponent": bool(sel_theirs)}
+
+
 def _conditions(conditions: dict) -> list[str]:
     return sorted(clean_no_numbers(c.name) for c in conditions)
 
@@ -113,8 +134,12 @@ class RecurrentReplayParser(ReplayParser):
                     # asleep or frozen and nothing else explains it (the Gen 1 trap-and-switch bug
                     # leaves a frozen Pokemon without any |cant| line); it cannot act in that state
                     reason = status
+            last_damage, last_move, counter_selected = _memory(turn, p1)
             extras.append(
                 {
+                    "last_damage": last_damage,
+                    "last_move": last_move,
+                    "counter_selected": counter_selected,
                     "last_player_action": summarize_action(own_moves[0] or own_choices[0]),
                     "last_opponent_action": summarize_action(opp_moves[0] or opp_choices[0]),
                     "turn": turn.turn_number,
@@ -122,6 +147,8 @@ class RecurrentReplayParser(ReplayParser):
                     "player_cant": own_cant,
                     "opponent_cant": opp_cant,
                     "action_reason": reason,
+                    "player_lock": _lock_dict(own[0]),
+                    "opponent_lock": _lock_dict(opp[0]),
                     "player_trapped": own_trapped,
                     "opponent_trapped": bool(opp[0] is not None and opp[0].partially_trapped),
                     "player_conditions_all": _conditions(turn.conditions_1 if p1 else turn.conditions_2),

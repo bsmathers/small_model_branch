@@ -744,6 +744,10 @@ class SimProtocol:
         self._note_no_action(other, "opponent_fainted")
         pokemon.current_hp = 0
         pokemon.status = PEStatus.FNT
+        # a fainted Pokemon loses its stat boosts and volatile effects (the engine shows it with none)
+        pokemon.boosts = type(pokemon.boosts)()
+        pokemon.effects = {}
+        pokemon.partially_trapped = False
         self.curr_turn.mark_forced_switch(args[0])
 
     def _parse_status_curestatus(self, args: List[str], name: str):
@@ -1196,6 +1200,211 @@ class SimProtocol:
         )
 
     TRAP_MOVES = {"Wrap", "Bind", "Clamp", "Fire Spin"}
+    LOCK_EVENTS = {"move", "switch", "drag", "faint", "cant", "turn", "upkeep", "-prepare", "-mustrecharge", "-start", "-end",
+                   "-damage", "-immune", "-miss", "-fail", "-notarget", "-status", "-heal", "-activate"}
+    # Moves that leave the battle's lastDamage alone in Gen 1 (data/mods/gen1/scripts.ts SKIP_LASTDAMAGE); every
+    # other move sets it to 0 when it starts, and a miss sets it to 0 again
+    SKIP_LASTDAMAGE = {
+        "confuseray", "conversion", "counter", "focusenergy", "glare", "haze", "leechseed", "lightscreen", "mimic", "mist",
+        "poisongas", "poisonpowder", "recover", "reflect", "rest", "softboiled", "splash", "stunspore", "substitute",
+        "supersonic", "teleport", "thunderwave", "toxic", "transform",
+    }
+
+    @staticmethod
+    def _hp_percent(text: str) -> float:
+        """'47/100', '47/100 par' or '0 fnt' -> 47.0 (the log shows HP as a percentage in these replays)."""
+        head = text.split(" ")[0]
+        return float(head.split("/")[0]) if head.replace("/", "").replace(".", "").isdigit() else 0.0
+
+    def _track_memory(self, name: str, data: List[str]):
+        """The Gen 1 battle memory behind Counter: lastDamage and each side's last move (see Turn.last_damage).
+        The engine (sim/battle.ts, data/mods/gen1) sets lastDamage from the damage of a move, from the amount a
+        draining move heals ("draining can be countered"), and from a confusion self-hit; not from poison, burn,
+        Leech Seed or recoil."""
+        turn = self.curr_turn
+        if not data or turn is None:
+            return
+        if name == "move" and len(data) >= 2:
+            called = any(t.startswith("[from]") and self._plain(t[len("[from]"):]) not in (self._plain(data[1]), "lockedmove") for t in data[2:])
+            selected_counter = self._plain(data[1]) == "counter" and not called
+            if data[0][:2] == "p1":
+                turn.last_move_1, turn.counter_selected_1 = data[1], selected_counter
+            else:
+                turn.last_move_2, turn.counter_selected_2 = data[1], selected_counter
+            if self._plain(data[1]) not in self.SKIP_LASTDAMAGE or "[miss]" in data[2:]:
+                turn.last_damage = None
+            return
+        if name == "cant":
+            # it selected something that did not run: the selection is unknown, taken as not Counter
+            if data[0][:2] == "p1":
+                turn.counter_selected_1 = False
+            else:
+                turn.counter_selected_2 = False
+            return
+        if name not in ("-damage", "-heal", "-activate"):
+            return  # (looking up a Pokemon by name can attach a nickname to it: only do that when needed)
+        pokemon = self._lock_pokemon(data[0])
+        if pokemon is None:
+            return
+        sources = [t for t in data[2:] if t.startswith("[from]")]
+        if name == "-damage" and len(data) >= 2:
+            if not sources:
+                kind = "hit"
+            elif "confusion" in self._plain(sources[0]):
+                kind = "confusion"
+            else:
+                return
+            lost = (pokemon.current_hp or 0) - self._hp_percent(data[1])
+            turn.last_damage = {"kind": kind, "side": data[0][:2], "name": pokemon.name, "pct": max(lost, 0.0)}
+        elif name == "-heal" and len(data) >= 2 and any("drain" in self._plain(t) for t in sources):
+            gained = self._hp_percent(data[1]) - (pokemon.current_hp or 0)
+            turn.last_damage = {"kind": "drain", "side": data[0][:2], "name": pokemon.name, "pct": max(gained, 0.0)}
+        elif name == "-activate" and len(data) >= 3 and data[1] == "Substitute" and "[damage]" in data[2:]:
+            # damage taken by a Substitute is tracked uncapped by the engine: the amount is not in the log
+            turn.last_damage = {"kind": "unknown", "side": data[0][:2], "name": pokemon.name, "pct": 0.0}
+
+    @staticmethod
+    def _plain(text: str) -> str:
+        return "".join(c for c in text.lower() if c.isalnum())
+
+    def _lock_pokemon(self, ident: str):
+        try:
+            return self.curr_turn.get_pokemon_from_str(ident, fallback_to_nickname=False)
+        except RareValueError:
+            return None
+
+    def _active_of(self, side: str):
+        return (self.curr_turn.active_pokemon_1 if side == "p1" else self.curr_turn.active_pokemon_2)[0]
+
+    def _end_trap(self, trapper, ident: str):
+        """The trapper stopped (another move, a switch, a faint): its victim is free."""
+        if trapper.lock == "trap_user":
+            trapper.lock, trapper.lock_move, trapper.lock_age = None, None, 0
+            victim = self._active_of("p2" if ident[:2] == "p1" else "p1")
+            if victim is not None:
+                victim.trapped_age = 0
+
+    def _break_locks(self, pokemon, ident: str):
+        """Full paralysis and a confusion self-hit end Bide, a charge, Thrash and a trap (not Rage, not a recharge)."""
+        if pokemon.lock in ("bide", "charge", "thrash"):
+            pokemon.lock, pokemon.lock_move = None, None
+        self._end_trap(pokemon, ident)
+
+    def _revoke_pending_lock(self):
+        """The move that was about to lock its user did not land (missed, failed, hit an immune target)."""
+        pending, self._pending_lock = getattr(self, "_pending_lock", None), None
+        if pending is None:
+            return
+        user, before, victim = pending
+        user.lock, user.lock_move, user.lock_age = before
+        if victim is not None:
+            victim[0].trapped_age = victim[1]
+
+    def _track_lock(self, name: str, data: List[str]):
+        """Gen 1 locks that the engine puts on a Pokemon, followed from the public log, with the engine's own
+        rules for when they end (data/mods/gen1 in Pokemon Showdown). Which of them leave a choice open
+        (switching, or fighting) is decided in recurrent.records.lock_shape."""
+        if name in ("turn", "upkeep"):
+            self._pending_lock = None
+            return
+        if name in ("-immune", "-miss", "-fail", "-notarget"):
+            self._revoke_pending_lock()
+            return
+        if not data:
+            return
+        ident = data[0]
+        if name in ("switch", "drag"):
+            departing = self._active_of(ident[:2])
+            if departing is not None:
+                self._end_trap(departing, ident)
+            return
+        pokemon = self._lock_pokemon(ident)
+        if pokemon is None:
+            return
+        if name == "move":
+            self._pending_lock = None
+            if len(data) < 2:
+                return
+            move_name, tags = data[1], data[2:]
+            continuing = False
+            for t in tags:
+                if t.startswith("[from]"):
+                    source = self._plain(t[len("[from]"):])
+                    if source == self._plain(move_name) or source == "lockedmove":
+                        continuing = True  # "[from] Clamp" on a Clamp, "[from]lockedmove" on Thrash: the same lock goes on
+                    else:
+                        return  # a move called by another one (Metronome, Mirror Move) changes no locks
+            if (
+                pokemon.lock == "charge"
+                and "[still]" not in tags
+                and self._plain(move_name) == self._plain(pokemon.lock_move or "")
+            ):
+                pokemon.lock, pokemon.lock_move = None, None  # the charged move is executed (also when it misses)
+            if move_name in ("Thrash", "Petal Dance"):
+                pokemon.lock = "thrash"  # the Gen 1 mod removes the failure handler: it locks even on a miss or an immune target
+                return
+            if move_name in self.TRAP_MOVES and len(data) > 2:
+                target = self._lock_pokemon(data[2])
+                if target is not None and target.lock == "recharge":
+                    target.lock = None  # Gen 1: a trapping move negates the target's recharge, even if it misses
+            if "[miss]" in tags or "[notarget]" in tags:
+                if move_name in self.TRAP_MOVES and not continuing:
+                    self._end_trap(pokemon, ident)
+                return
+            before = (pokemon.lock, pokemon.lock_move, pokemon.lock_age)
+            if move_name == "Rage":
+                pokemon.lock = "rage"
+                self._pending_lock = (pokemon, before, None)
+            if move_name in self.TRAP_MOVES and len(data) > 2:
+                victim = self._lock_pokemon(data[2])
+                if pokemon.lock == "trap_user" and pokemon.lock_move == move_name and continuing:
+                    pokemon.lock_age += 1
+                else:  # a fresh use: the trap starts over (a continuation carries the "[from]" tag)
+                    pokemon.lock, pokemon.lock_move, pokemon.lock_age = "trap_user", move_name, 1
+                self._pending_lock = (pokemon, before, (victim, victim.trapped_age) if victim is not None else None)
+                if victim is not None:
+                    victim.trapped_age = pokemon.lock_age
+                    if victim.lock == "recharge":
+                        victim.lock = None  # a trapping move that lands cancels the victim's pending recharge
+            elif pokemon.lock == "trap_user":
+                self._end_trap(pokemon, ident)
+        elif name == "-mustrecharge":
+            pokemon.lock, pokemon.lock_age = "recharge", 0  # it stays until the recharge turn: Gen 1 has no timer
+        elif name == "-status":
+            if len(data) > 1 and data[1] == "slp" and pokemon.lock == "recharge":
+                pokemon.lock = None  # a sleep move that lands replaces the pending recharge
+        elif name == "cant":
+            reason = data[1] if len(data) > 1 else ""
+            if reason == "recharge" and pokemon.lock == "recharge":
+                pokemon.lock = None
+            elif reason == "par":
+                self._break_locks(pokemon, ident)
+            elif reason == "flinch" and pokemon.lock == "recharge":
+                pokemon.lock = None  # being flinched ends a pending recharge
+        elif name == "-damage":
+            if any("[from] confusion" in t for t in data[2:]):
+                self._break_locks(pokemon, ident)
+        elif name == "-prepare":
+            pokemon.lock, pokemon.lock_move = "charge", data[1] if len(data) > 1 else None
+        elif name in ("-start", "-end") and len(data) > 1:
+            effect = data[1].split(":")[-1].strip()
+            if effect == "Bide":
+                if name == "-start":
+                    pokemon.lock = "bide"
+                elif pokemon.lock == "bide":
+                    pokemon.lock = None
+            elif effect == "Disable":
+                pokemon.disabled_move = data[2].split(":")[-1].strip() if name == "-start" and len(data) > 2 else None
+            elif name == "-start" and effect == "confusion" and any(t in ("[silent]", "[fatigue]") for t in data[2:]):
+                if pokemon.lock == "thrash":
+                    pokemon.lock = None  # the Thrash lock ran out: the Pokemon is confused (silently)
+        elif name == "faint":
+            self._end_trap(pokemon, ident)
+            if pokemon.trapped_age:  # a trapped Pokemon that faints frees the trapper from its lock
+                trapper = self._active_of("p2" if ident[:2] == "p1" else "p1")
+                if trapper is not None and trapper.lock == "trap_user":
+                    trapper.lock, trapper.lock_move, trapper.lock_age = None, None, 0
+            pokemon.clear_locks()
 
     def _note_game_ended(self):
         """A game that ends before a turn is played (timeout, forfeit) leaves both sides without an action."""
@@ -1407,6 +1616,9 @@ class SimProtocol:
                     message[0] is the message type and message[1:] are the arguments.
         """
         name, *data = message
+        if name in self.LOCK_EVENTS:
+            self._track_lock(name, data)  # before IGNORES: -prepare is ignored by the rest of the parser
+            self._track_memory(name, data)
         if name in ("-hint", "hint"):
             self._parse_hint(data)
             return

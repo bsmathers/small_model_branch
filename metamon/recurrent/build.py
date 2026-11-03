@@ -51,18 +51,19 @@ NAME_RE = re.compile(r"^[^_]+_[^_]*_(.+?)_vs_(.+?)_\d\d-\d\d-\d{4}_(?:WIN|LOSS|T
 # (The user of a trapping move is semi-locked into it while the trap lasts, but the logs do not show when a
 # trap ran out, so those decisions are left as normal ones.)
 NORMAL, FIGHT_OR_SWITCH, FORCED_RECHARGE, NO_CHOICE = 0, 1, 2, 4
-FORCED = (FORCED_RECHARGE, NO_CHOICE)
+FORCED_LOCK = FORCED_RECHARGE  # a full lock: recharging, the second turn of a charge move, Thrash, Rage
+FORCED = (FORCED_LOCK, NO_CHOICE)
 FIGHT = 9  # `played` code: some move, which one is unknown or does not matter
 
 
 def decision_kind(d) -> int:
     if d.forced_switch:  # choosing a replacement: moves are not legal, nothing else is special
         return NORMAL
-    if d.recharge_next:
-        return FORCED_RECHARGE
+    if d.lock_shape == "full":
+        return FORCED_LOCK
     if d.action_index == -1 and d.action_reason == "game_ended":
         return NO_CHOICE
-    if d.trapped or d.own_status in ("slp", "frz"):
+    if d.lock_shape == "semi" or d.own_status in ("slp", "frz") or d.struggling:
         return FIGHT_OR_SWITCH
     return NORMAL
 

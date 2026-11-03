@@ -5,8 +5,9 @@
 
 The harness measures the defender's total HP loss in a turn, which includes a burn/poison tick (max HP / 16)
 and confusion self-hits when the move inflicts them, so Burn/Poison/Confusion-inflicting moves read high;
-those are reported separately. Multi-hit and variable-damage moves (Counter, Bide, Psywave, Super Fang)
-are not modeled by the encoder and are skipped.
+those are reported separately. Multi-hit moves and Bide are not modeled and are skipped; Counter, Psywave and Super Fang
+are skipped here too, because Counter depends on battle memory (see check_oracle.py, which grades it) and the other two are
+checked against this harness's maxima in test form.
 """
 import re
 import sys

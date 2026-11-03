@@ -20,19 +20,59 @@ training games and trains. Options: `--games` per source (default 30000), `--mix
 or newer, fp16 before that, fp32 on CPU), `--work DIR`. Output: `WORK/run/weights_<step>.pt`; progress in
 `WORK/run/log.txt` and `WORK/logs/`.
 
+## Checking the parser against Pokemon Showdown
+
+`tools/oracle/showdown_oracle.js` plays seeded random Gen 1 OU battles in the real simulator and records, at every decision,
+the exact request Showdown sent, the hidden engine state, and the answer of Counter's own `damageCallback`;
+`check_oracle.py` compares our parsed trajectories with it decision by decision (state, PP, switches, the moves the engine
+offers, the lock shape of the request, Counter):
+
+```
+node tools/oracle/showdown_oracle.js SHOWDOWN_DIR TEAMS_DIR ORACLE_DIR 300 [FIRST_SEED]   # LOCK_MODE=1 / COUNTER_MODE=1 stress locks / Counter
+python -m metamon.recurrent.parse ORACLE_LOGS TRAJ_DIR                                     # the *.log files in a folder of their own
+python -m metamon.recurrent.check_oracle ORACLE_DIR TRAJ_DIR
+```
+
+On 1,200 battles (about 202,000 engine decisions, ordinary play plus sets that stress locks and Counter) the parser matches the engine exactly on HP, status, stat boosts, screens, PP,
+the alive switches, whether each listed move is available (PP left, not disabled), Struggle, replacement states, and the
+shape of the request (one forced move, a single Fight entry with switching allowed, or a normal list). Known gaps: a
+Pokemon's moves that never appear in the log and teammates that never appear are unknowable (the parser fills them in with
+guesses and the checker reports them separately); Mimic, which replaces a move slot (about 0.2% of PP values in a set where
+15% of the Pokemon carry it); and the Counter cases below.
+
+## Counter
+
+Counter is bugged in Gen 1 and is handled as the engine does (`features.counter_fraction`, fed by the parser's
+`last_damage`, `last_move` and `counter_selected`). It deals twice the battle's `lastDamage` (the damage of the last move
+executed by either side), ignores type immunities, and works only if the target's last move *used* is Normal or Fighting
+with power (Counter itself counts) and its last move *selected* is not Counter; the two differ after a switch or a turn in
+which the target could not act. `lastDamage` is reset by every move except a short list (Recover, Reflect, Toxic... in
+`SKIP_LASTDAMAGE`) and by a miss, and is set by move damage, by half the damage of a draining move, and by a confusion
+self-hit, not by poison, burn, Leech Seed or recoil. Against the engine's own answer on about 82,000 evaluations (a set where 70% of the Pokemon carry Counter): right about
+whether Counter works in 98.9%, and it catches 99.2% of the real successes; the damage is within 3% of the target's max HP in
+99.6%. The misses are information the log does not contain: a paralyzed foe that had selected Counter, and an overkill (the
+engine counts the uncapped damage, the log shows only the HP that was left). Super Fang (half the target's current HP) and
+Psywave (up to 149) match the engine's maximum; Bide's damage (twice what it took while storing) is not modeled and gives 0.
+
 ## What counts as a decision
 
 Metamon always lists every move and every alive switch as legal, so the builder works out the real options
 (`build.py`, `decision_kind`):
 
-- **asleep, frozen, or losing the turn to a trapping move:** in Gen 1 these lock the Fight button (every move
-  fails alike) but never prevent switching, so the real choice is to fight or to switch out. The target's move
-  probability is spread evenly over the legal moves, and a recorded "no action" means "fight". A trapped
-  turn counts only when the player was already trapped and the next state confirms the lost turn: the
-  parser's flag alone never learns that a trap ran out, and a lost turn alone also happens when a fresh Wrap
-  lands before the player moves. The user of a trapping move is also locked into it while the trap lasts, but the logs do not show
-  when it ran out, so those decisions are left as normal ones;
-- **recharge turn:** the only option is the no-op: no policy or imitation loss, legal set = the no-op;
+The kind of a decision is the shape of the request Showdown would send, followed from the public log (`forward._track_lock`,
+`records.lock_shape`):
+
+- **a full lock, one option and no switching** (no policy or imitation loss): a pending recharge after Hyper Beam, the second
+  turn of a charge move (Fly, Dig, Solar Beam, Razor Wind, Skull Bash, Sky Attack), Thrash and Petal Dance, and Rage;
+- **a Fight entry with switching allowed:** asleep or frozen, using a trapping move (Wrap, Bind, Clamp, Fire Spin) or caught in one
+  right after its first turn (later the request lists every move again, which is what the player sees), and Bide. All the
+  moves are the same, so the target's move probability is spread evenly over the legal moves, and a recorded "no action" means
+  "fight". Struggle (every move out of PP) is the same shape;
+- the engine's own rules end a lock: full paralysis or a confusion self-hit end Bide, a charge, Thrash and a trap (not Rage or a
+  recharge); a flinch, a sleep move that lands, or a trapping move (even a miss) cancels a pending recharge; Thrash and Petal Dance
+  lock even into an immune target or on a miss, while Rage and a trap need to land;
+- moves with no PP left or taken away by Disable are not available (`records.decision_facts`).
+
 - **no recorded action for another reason** (full paralysis, flinch, fainted before acting): the player chose
   a move that then failed, so Exeggcute's blend applies, and the imitation target is "some move" (the policy's
   total probability on moves);

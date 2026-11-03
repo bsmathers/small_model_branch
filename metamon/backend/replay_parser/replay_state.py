@@ -130,7 +130,13 @@ class Move(PEMove):
         except:
             raise MovedexMissingEntry(name, self.lookup_name)
         self.gen_ = gen
-        self.pp = self.current_pp  # split from poke-env PP counter
+        # Showdown's calculatePP: base * (5 + PP Ups) / 5 with 3 PP Ups, and in Gen 1 and 2 a 40 PP move loses 3
+        base_pp = self.entry.get("pp", 0)
+        full_pp = base_pp if self.entry.get("noPPBoosts") else base_pp * 8 // 5
+        if gen <= 2 and base_pp == 40:
+            full_pp -= 3
+        self.pp = full_pp if full_pp > 0 else self.current_pp  # split from poke-env PP counter
+        self._current_pp = self.pp
         self.maximum_pp = self.pp
 
     def set_pp(self, pp: int):
@@ -143,7 +149,7 @@ class Move(PEMove):
         new = self.__class__(name=self.name, gen=self.gen_)
         new.pp = self.pp
         new._current_pp = self.pp
-        self.maximum_pp = self.maximum_pp
+        new.maximum_pp = self.maximum_pp
         memo[id(self)] = new
         return new
 
@@ -175,6 +181,17 @@ class Pokemon:
         # Gen 1 partial trapping (Bind, Wrap, Fire Spin, Clamp) has no start or end line in the log.
         # A Pokemon is trapped from a |cant|...|partiallytrapped line until it moves or switches out.
         self.partially_trapped: bool = False
+        # What the Gen 1 engine locks the Pokemon into, tracked from the public log (see forward._track_lock):
+        #   lock: "recharge", "charge" (second turn of Fly, Dig, Solar Beam...), "thrash" (Thrash, Petal Dance),
+        #         "rage", "bide", or "trap_user" (using Wrap, Bind, Fire Spin or Clamp)
+        #   lock_move: the move of a charge or trap; lock_age: consecutive uses of the trap move
+        #   trapped_age: the age of the trap this Pokemon is caught in (0: not trapped)
+        #   disabled_move: the move Disable took away
+        self.lock: Optional[str] = None
+        self.lock_move: Optional[str] = None
+        self.lock_age: int = 0
+        self.trapped_age: int = 0
+        self.disabled_move: Optional[str] = None
 
         # pokedex lookup
         self.active_ability: Optional[str] = None
@@ -269,6 +286,14 @@ class Pokemon:
         self.type = self.had_type
         self.effects = {}
         self.partially_trapped = False
+        self.clear_locks()
+
+    def clear_locks(self):
+        self.lock = None
+        self.lock_move = None
+        self.lock_age = 0
+        self.trapped_age = 0
+        self.disabled_move = None
 
     def on_end_of_turn(self):
         # "within-turn state" is reset
@@ -613,6 +638,17 @@ class Turn:
     # A side that could not act reveals no move or choice, so its action label is None (index -1).
     cant_1: List[Optional[str]] = field(default_factory=lambda: [None, None])
     cant_2: List[Optional[str]] = field(default_factory=lambda: [None, None])
+    # Gen 1 keeps these on the battle, not on a Pokemon, and Counter reads them (see forward._track_memory):
+    # the damage of the last move executed, {"kind": "hit" | "drain" | "confusion" | "unknown", "side": "p1" | "p2"
+    # (who lost the HP, or who drained), "name": species, "pct": percent of that Pokemon's max HP}, and the last
+    # move each side used. They persist from turn to turn (the next Turn is a copy of this one).
+    last_damage: Optional[dict] = None
+    last_move_1: Optional[str] = None
+    last_move_2: Optional[str] = None
+    # whether the side's last move SELECTION was Counter (the engine keeps it apart from the last move used; a switch
+    # leaves it unchanged, and a turn without a move leaves it unknown, which is taken as "not Counter")
+    counter_selected_1: bool = False
+    counter_selected_2: bool = False
     weather: PEWeather | Nothing = Nothing.NO_WEATHER
     battle_field: Dict[PEField, int] = field(default_factory=dict)
     conditions_1: Dict[PESideCondition, int] = field(default_factory=dict)

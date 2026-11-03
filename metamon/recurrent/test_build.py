@@ -3,13 +3,14 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 
+from metamon.recurrent.records import lock_shape
 from metamon.recurrent.build import (
     FIGHT, FIGHT_OR_SWITCH, FORCED_RECHARGE, NO_CHOICE, NORMAL, adjust, decision_kind, played_code,
 )
 
 
 def dec(**kw):
-    base = dict(forced_switch=False, recharge_next=False, trapped=False, action_index=0, action_reason=None,
+    base = dict(forced_switch=False, lock_shape=None, struggling=False, disabled_move=None, action_index=0, action_reason=None,
                 own_status="nostatus", slot_map=np.array([0, 1, 2, 3, 4, 5, 6, 7, -1]))
     base.update(kw)
     return NS(**base)
@@ -19,13 +20,24 @@ def test_kinds():
     assert decision_kind(dec()) == NORMAL
     assert decision_kind(dec(own_status="slp", action_index=-1)) == FIGHT_OR_SWITCH
     assert decision_kind(dec(own_status="frz")) == FIGHT_OR_SWITCH
-    assert decision_kind(dec(recharge_next=True)) == FORCED_RECHARGE
-    assert decision_kind(dec(recharge_next=True, own_status="slp")) == FORCED_RECHARGE  # forced beats asleep
-    assert decision_kind(dec(trapped=True)) == FIGHT_OR_SWITCH  # a trapped Pokemon can still switch out
-    assert decision_kind(dec(trapped=True, recharge_next=True)) == FORCED_RECHARGE
+    assert decision_kind(dec(lock_shape="full")) == FORCED_RECHARGE
+    assert decision_kind(dec(lock_shape="full", own_status="slp")) == FORCED_RECHARGE  # a full lock beats sleep
+    assert decision_kind(dec(lock_shape="semi")) == FIGHT_OR_SWITCH  # trapped, trapping or Bide: switching stays allowed
+    assert decision_kind(dec(struggling=True)) == FIGHT_OR_SWITCH  # every move is out of PP: Struggle, and switching is allowed
     assert decision_kind(dec(action_index=-1, action_reason="game_ended")) == NO_CHOICE
     assert decision_kind(dec(action_index=-1, action_reason="par")) == NORMAL  # paralyzed: a real choice that then failed
-    assert decision_kind(dec(forced_switch=True, trapped=True, own_status="slp")) == NORMAL  # choosing a replacement
+    assert decision_kind(dec(forced_switch=True, lock_shape="semi", own_status="slp")) == NORMAL  # choosing a replacement
+
+
+def test_lock_shapes_follow_the_engine():
+    lock = lambda kind, age=0, trapped=0: {"lock": kind, "age": age, "trapped_age": trapped, "disabled": None}
+    for full in ("recharge", "charge", "thrash", "rage"):  # one option and no switching
+        assert lock_shape(lock(full)) == "full"
+    assert lock_shape(lock("bide")) == "semi"
+    # the engine tells the player it is locked only right after the first use of a trap; later the request lists every move
+    assert lock_shape(lock("trap_user", age=1)) == "semi" and lock_shape(lock("trap_user", age=2)) is None
+    assert lock_shape(lock(None, trapped=1)) == "semi" and lock_shape(lock(None, trapped=2)) is None
+    assert lock_shape(lock(None)) is None and lock_shape(None) is None
 
 
 def row(moves, switches):

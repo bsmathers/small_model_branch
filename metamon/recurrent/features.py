@@ -150,6 +150,60 @@ def _damage_fraction(attacker, defender, move, tables: Tables, attacker_stats, d
     return min(1.0, damage / max(1.0, defender_stats["hp"]))
 
 
+def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: float, opp_hp: float, max_hp=None) -> float:
+    """What Counter used by `user` ("player" or "opponent") would do now, as a fraction of the target's max HP.
+
+    Gen 1 Counter (data/mods/gen1/moves.ts) deals twice the battle's lastDamage, the damage of the last move
+    executed by either side, and ignores type immunities (a Ghost is hit). It succeeds when three things hold:
+      - lastDamage is not 0;
+      - the target's last move USED is Normal or Fighting with power (Counter itself qualifies: it is Fighting
+        with power 1, a quirk of the engine);
+      - the target's last move SELECTED was not Counter.
+    The last two memories differ when the target selected a move that did not run (it could not act) or switched since
+    running Counter, and the log never shows selections: the parser follows them (a move run sets the selection, a
+    switch leaves it, a turn without a move leaves it unknown and taken as "not Counter", which the engine confirms
+    in most such cases). `own_hp` and `opp_hp` are the max HP of
+    the two active Pokemon; `max_hp(side, species)` can supply a Pokemon's true max HP instead of the max-DV estimate.
+    """
+    if not extras or not extras.get("last_damage"):
+        return 0.0
+    damage, last_move = extras["last_damage"], extras.get("last_move") or {}
+    if damage["kind"] == "unknown":
+        return 0.0  # taken by a Substitute: the engine tracks the uncapped amount, which the log does not show
+    target = "opponent" if user == "player" else "player"
+    moved = last_move.get(target)
+    if not moved or moved not in tables.moves:
+        return 0.0
+    power, move_type = tables.move_power_type(moved)
+    if power <= 0 or move_type not in ("normal", "fighting"):
+        return 0.0
+    if (extras.get("counter_selected") or {}).get(target) and extras.get(f"{target}_cant") is None:
+        return 0.0  # its last move selection was Counter (it did not select anything new that failed to run): the test fails
+    # the damage in HP: a share of the max HP of the Pokemon that lost it (or healed, for a drain)
+    try:
+        victim_hp = max_hp(damage["side"], damage["name"]) if max_hp else _stat_of(tables.base_stats(damage["name"])["hp"], hp=True)
+    except KeyError:
+        victim_hp = own_hp if damage["side"] == "player" else opp_hp
+    target_hp = opp_hp if user == "player" else own_hp
+    return min(1.0, 2.0 * damage["pct"] / 100.0 * victim_hp / max(1.0, target_hp))
+
+
+def _move_damage(user: str, attacker, defender, move, tables: Tables, attacker_stats, defender_stats, extras, own_hp: float, opp_hp: float) -> float:
+    """Max-roll damage of one move as a fraction of the defender's max HP, with the Gen 1 moves whose damage is
+    not a function of the two Pokemon's stats handled as the engine does."""
+    key = "".join(c for c in move.name.lower() if c.isalnum())
+    if key == "counter":
+        return counter_fraction(user, extras, tables, own_hp, opp_hp)
+    if key == "superfang":  # half of the target's current HP, at least 1 (ignores type immunity)
+        hp = defender_stats["hp"]
+        return max(1.0, float(int(defender.hp_pct * hp) // 2)) / max(1.0, hp) if defender.hp_pct > 0 else 0.0
+    if key == "psywave":  # a random 1 to 149 at level 100
+        return min(1.0, 149.0 / max(1.0, defender_stats["hp"]))
+    if key == "bide":  # twice the damage taken while it was stored: not visible in the state
+        return 0.0
+    return _damage_fraction(attacker, defender, move, tables, attacker_stats, defender_stats)
+
+
 def _own_stats(pokemon, tables: Tables) -> dict[str, float]:
     """The observer's own unboosted stats: the actual values when present, else the Gen 1 estimate."""
     base = tables.base_stats(_name(pokemon))
@@ -313,9 +367,9 @@ def encode_observer(
     opp_stats = _opp_stats(opp_active, tables)
     damage = np.zeros(8, dtype=np.float32)
     for j, move in enumerate(own_active.moves[:N_MOVES]):
-        damage[j] = _damage_fraction(own_active, opp_active, move, tables, own_stats, opp_stats)
+        damage[j] = _move_damage("player", own_active, opp_active, move, tables, own_stats, opp_stats, extras, own_stats["hp"], opp_stats["hp"])
     for j, move in enumerate(opp_active.moves[:N_MOVES]):
-        damage[4 + j] = _damage_fraction(opp_active, own_active, move, tables, opp_stats, own_stats)
+        damage[4 + j] = _move_damage("opponent", opp_active, own_active, move, tables, opp_stats, own_stats, extras, own_stats["hp"], opp_stats["hp"])
 
     speed = np.array([own_stats["spe"] / SPEED_SCALE, opp_stats["spe"] / SPEED_SCALE], dtype=np.float32)
     party = np.array(

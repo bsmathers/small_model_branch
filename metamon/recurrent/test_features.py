@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 
-from metamon.recurrent.features import action_slot_map, canonical_own, CANT_REASONS, FIELD_WIDTH, KINDS, LAST_SIDE_WIDTH, LastTurn, encode_observer, N_MOVES, N_OPP, N_OWN
+from metamon.recurrent.features import action_slot_map, canonical_own, counter_fraction, CANT_REASONS, FIELD_WIDTH, KINDS, LAST_SIDE_WIDTH, LastTurn, encode_observer, N_MOVES, N_OPP, N_OWN
 from metamon.recurrent.tables import Tables
 
 
@@ -158,6 +158,55 @@ def test_party_is_in_policy_order():
     mapping = action_slot_map(state, ordered)
     # alive reserves in name order: alakazam, exeggutor, tauros, zapdos -> slots (reserve index 0, 2, 3, 4) + 4
     assert list(mapping) == [0, 1, 2, 3, 4, 6, 7, 8, -1][:9]
+
+
+def _counter_tables() -> Tables:
+    t = _tables()
+    t.moves.update({"counter": (1, "fighting"), "thunderbolt": (95, "electric"), "seismictoss": (1, "fighting"), "splash": (0, "normal")})
+    t.base.update({"snorlax": {"hp": 160, "atk": 110, "def": 65, "spe": 30, "spa": 65}})
+    return t
+
+
+def _extras(foe_move, damage_pct=20.0, victim="chansey", side="player", kind="hit", selected=False, foe_cant=None):
+    return {
+        "last_damage": {"kind": kind, "side": side, "name": victim, "pct": damage_pct},
+        "last_move": {"player": "tackle", "opponent": foe_move},
+        "counter_selected": {"player": False, "opponent": selected},
+        "opponent_cant": foe_cant,
+        "player_cant": None,
+    }
+
+
+def test_counter_is_twice_the_last_damage_and_needs_a_counterable_last_move():
+    t = _counter_tables()
+    hp = 703.0  # chansey; the target of our Counter is the foe, the damage was taken by our own chansey
+    # the foe's last move was Body Slam (Normal, power): Counter works, for twice what we lost (20% of our max HP)
+    assert abs(counter_fraction("player", _extras("bodyslam"), t, hp, hp) - 0.4) < 1e-9
+    # the damage was a share of the Pokemon that lost it, and the fraction is of the target's max HP
+    snorlax_hp = (160 + 15) * 2 + 63 + 110
+    assert abs(counter_fraction("player", _extras("bodyslam", victim="snorlax"), t, hp, hp) - 2 * 0.2 * snorlax_hp / hp) < 1e-9
+    # Thunderbolt is Electric: not counterable; a status move has no power; neither works
+    assert counter_fraction("player", _extras("thunderbolt"), t, hp, hp) == 0.0
+    assert counter_fraction("player", _extras("splash"), t, hp, hp) == 0.0
+    # no damage in the battle, or damage taken by a Substitute (amount not in the log): nothing to counter
+    assert counter_fraction("player", {**_extras("bodyslam"), "last_damage": None}, t, hp, hp) == 0.0
+    assert counter_fraction("player", _extras("bodyslam", kind="unknown"), t, hp, hp) == 0.0
+    # twice a big hit is a KO, never more than the target's max HP
+    assert counter_fraction("player", _extras("bodyslam", damage_pct=80.0), t, hp, hp) == 1.0
+
+
+def test_counter_after_counter_depends_on_what_the_foe_selected_not_what_it_used():
+    t = _counter_tables()
+    hp = 703.0
+    # Counter itself is Fighting with power 1, so a foe whose last USED move was Counter is still counterable ...
+    assert counter_fraction("player", _extras("counter", selected=False), t, hp, hp) > 0.0
+    # ... but not when it also SELECTED Counter last (the engine's separate selection test)
+    assert counter_fraction("player", _extras("counter", selected=True), t, hp, hp) == 0.0
+    # a foe that selected Counter but then could not act (paralyzed, fainted): the selection is unknown, taken as not Counter
+    assert counter_fraction("player", _extras("counter", selected=True, foe_cant="par"), t, hp, hp) > 0.0
+    # and it works the other way round: the foe's Counter against us uses OUR last move
+    mine = {**_extras("bodyslam", side="opponent"), "last_move": {"player": "bodyslam", "opponent": "tackle"}}
+    assert counter_fraction("opponent", mine, t, hp, hp) > 0.0
 
 
 if __name__ == "__main__":

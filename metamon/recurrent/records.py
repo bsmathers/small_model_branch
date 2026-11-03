@@ -87,8 +87,9 @@ class Decision:
     win: float  # the observer's result: 1.0 win, 0.5 tie, 0.0 loss
     slot_map: np.ndarray  # Metamon action index -> this model's policy slot (-1: not a legal option)
     own_status: str  # the observer's active Pokemon's status when it decides ("slp", "frz", ...)
-    trapped: bool  # the observer was already trapped (Wrap, Bind, ...) when it decided, and lost the turn to it; it can still switch
-    recharge_next: bool  # the observer must recharge this turn: its only option is the no-op
+    lock_shape: Optional[str]  # the lock on the observer's active Pokemon: "full", "semi" or None (see lock_shape)
+    disabled_move: Optional[str]  # the move Disable took away from the observer's active Pokemon
+    struggling: bool  # every move is out of PP, so the only move is Struggle
 
 
 def result_from_filename(path: str) -> float:
@@ -98,6 +99,39 @@ def result_from_filename(path: str) -> float:
         if base.endswith(suffix):
             return value
     raise ValueError(f"cannot read the result from {base}")
+
+
+FULL_LOCKS = ("recharge", "charge", "thrash", "rage")  # one option, no switching
+# How old a trap can be while the engine still tells the player it is locked. Later the request shows every move
+# (the trap may have ended without the player being told), which is also what the player sees.
+CERTAIN_TRAP_AGE = 1
+
+
+def lock_shape(lock: Optional[dict]) -> Optional[str]:
+    """The shape of the engine's request for a Pokemon with these locks, apart from sleep and freeze:
+    "full" (the locked move only, no switching), "semi" (a single Fight entry, switching allowed) or None."""
+    if not lock:
+        return None
+    if lock["lock"] in FULL_LOCKS:
+        return "full"
+    if lock["lock"] == "bide" or (lock["lock"] == "trap_user" and lock["age"] <= CERTAIN_TRAP_AGE) or 0 < lock["trapped_age"] <= CERTAIN_TRAP_AGE:
+        return "semi"
+    return None
+
+
+def decision_facts(states: list[dict], actions: list[int], extras: list[dict], t: int) -> dict:
+    """What decides the kind of decision t (see build.decision_kind), derived from the trajectory alone."""
+    s, e = states[t], extras[t]
+    return dict(
+        forced_switch=bool(e["forced_switch"]),
+        action_index=actions[t],
+        action_reason=e["action_reason"],
+        own_status=s["player_active_pokemon"]["status"],
+        lock_shape=lock_shape(e.get("player_lock")),
+        disabled_move=(e.get("player_lock") or {}).get("disabled"),
+        # every move has run out of PP: the engine offers Struggle only, and switching stays allowed
+        struggling=bool(s["player_active_pokemon"]["moves"]) and all(m["current_pp"] == 0 for m in s["player_active_pokemon"]["moves"]),
+    )
 
 
 def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
@@ -115,26 +149,9 @@ def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
             features=features,
             t=t,
             length=len(states),
-            action_index=a,
             next_action=e["next_player_action"],
-            action_reason=e["action_reason"],
-            forced_switch=bool(e["forced_switch"]),
             win=win,
             slot_map=action_slot_map(state, ordered_party),
-            own_status=s["player_active_pokemon"]["status"],
-            # Both signals are needed. The parser's flag alone never learns that a trap ran out (or that the player
-            # switched away); a lost turn alone also happens when a fresh Wrap lands before the player moves, while
-            # it was still free to use any move.
-            trapped=bool(
-                e["player_trapped"]
-                and t + 1 < len(extras)
-                and not s["forced_switch"]
-                and extras[t + 1]["player_cant"] == "partiallytrapped"
-            ),
-            recharge_next=bool(
-                t + 1 < len(extras)
-                and not s["forced_switch"]
-                and (extras[t + 1]["player_cant"] == "recharge" or extras[t + 1]["last_player_action"]["kind"] == "recharge")
-            ),
+            **decision_facts(states, actions, extras, t),
         )
         prev = s
