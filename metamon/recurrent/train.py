@@ -1,0 +1,272 @@
+"""Trains the recurrent policy/value model from built games (build.py).
+
+    python -m metamon.recurrent.train OUT_DIR \
+        --source human=/data/built/human:0.4 --source bots=/data/built/bots:0.3 --source pac=/data/built/pac:0.3 \
+        --steps 100000 --batch 128 --device cuda
+
+Loss per scored step:  alpha * KL(target || policy over the legal slots) + BCE(win logit, game result)
+with target = the proposer blend by default (a duel of 250 games found the blend player level with the router);
+`--target judge|mix` selects the judge softmax or a mixture. Decisions where the observer could not act (action -1) carry no policy
+term. Progress and validation are written as plain text to OUT_DIR/log.txt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from metamon.recurrent.dataset import Windows, collate, scan
+from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS, PolicyValueModel, count_parameters
+
+BIG_NEGATIVE = -1e9
+
+
+def policy_target(batch: dict, mode: str, mix: float) -> torch.Tensor:
+    blend, judge = batch["blend"], batch["judge"]
+    if mode == "blend":
+        return blend
+    if mode == "judge":
+        return torch.where(judge.sum(-1, keepdim=True) > 0, judge, blend)
+    mixed = (1 - mix) * judge + mix * blend
+    return torch.where(judge.sum(-1, keepdim=True) > 0, mixed, blend)
+
+
+def compute(model_out, batch: dict, mode: str, mix: float):
+    """Per-step quantities, [B, T] each, over the post-burn-in outputs."""
+    logits, win_logit = model_out
+    legal = batch["legal"] > 0
+    logp = F.log_softmax(logits.float().masked_fill(~legal, BIG_NEGATIVE), dim=-1)
+    target = policy_target(batch, mode, mix)
+    target = target * legal
+    target = target / target.sum(-1, keepdim=True).clamp_min(1e-8)
+    kl = (target * (target.clamp_min(1e-8).log() - logp)).sum(-1)
+    top1 = (logp.argmax(-1) == target.argmax(-1)).float()
+    win = batch["win"][:, None].expand_as(win_logit)
+    bce = F.binary_cross_entropy_with_logits(win_logit.float(), win, reduction="none")
+    p = torch.sigmoid(win_logit.float())
+    return {"kl": kl, "top1": top1, "bce": bce, "brier": (p - win) ** 2, "p": p}
+
+
+def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return (x * mask).sum() / mask.sum().clamp_min(1)
+
+
+def run_batch(model, batch: dict, args):
+    ids = {k: batch[f"ids_{k}"] for k in ID_KEYS}
+    floats = {k: batch[f"floats_{k}"] for k in FLOAT_KEYS}
+    logits, win_logit, _ = model(ids, floats)
+    return compute((logits, win_logit), batch, args.target, args.mix)
+
+
+@torch.no_grad()
+def validate(model, loader, args, device) -> dict:
+    model.eval()
+    sums = {k: 0.0 for k in ("kl", "top1", "bce", "brier")}
+    count_p = count_w = 0.0
+    bins = np.zeros((10, 3))  # count, sum of predictions, sum of results
+    by_source: dict[int, list[float]] = {}
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
+            out = run_batch(model, batch, args)
+        pol = (batch["policy_ok"] & batch["scored"]).float()
+        sc = batch["scored"].float()
+        for k in ("kl", "top1"):
+            sums[k] += (out[k] * pol).sum().item()
+        for k in ("bce", "brier"):
+            sums[k] += (out[k] * sc).sum().item()
+        count_p += pol.sum().item()
+        count_w += sc.sum().item()
+        idx = (out["p"].clamp(0, 0.9999) * 10).long()
+        for b in range(10):
+            m = (idx == b).float() * sc
+            bins[b] += [m.sum().item(), (out["p"] * m).sum().item(), (batch["win"][:, None].expand_as(out["p"]) * m).sum().item()]
+        for s in batch["source"].unique().tolist():
+            m = (batch["source"] == s).float()[:, None]
+            r = by_source.setdefault(s, [0.0, 0.0, 0.0, 0.0])
+            r[0] += (out["kl"] * pol * m).sum().item()
+            r[1] += (pol * m).sum().item()
+            r[2] += (out["bce"] * sc * m).sum().item()
+            r[3] += (sc * m).sum().item()
+    model.train()
+    result = {
+        "kl": sums["kl"] / max(count_p, 1),
+        "top1": sums["top1"] / max(count_p, 1),
+        "bce": sums["bce"] / max(count_w, 1),
+        "brier": sums["brier"] / max(count_w, 1),
+        "decisions": count_w,
+    }
+    result["calibration"] = [(int(c), s / c if c else 0.0, w / c if c else 0.0) for c, s, w in bins]
+    result["by_source"] = {s: (r[0] / max(r[1], 1), r[2] / max(r[3], 1)) for s, r in by_source.items()}
+    return result
+
+
+def amp_dtype(args):
+    return torch.float16 if args.precision == "fp16" else torch.bfloat16
+
+
+def amp_enabled(args, device) -> bool:
+    return args.precision != "fp32" and device.type == "cuda"
+
+
+def lr_at(step: int, args) -> float:
+    if step < args.warmup:
+        return args.lr * (step + 1) / args.warmup
+    frac = (step - args.warmup) / max(args.steps - args.warmup, 1)
+    return args.lr * (args.min_lr_ratio + (1 - args.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * min(frac, 1.0))))
+
+
+def parse_sources(items: list[str], validation: bool, fraction: int):
+    sources = []
+    for item in items:
+        name, rest = item.split("=", 1)
+        directory, weight = rest.rsplit(":", 1)
+        sources.append(scan(name, directory, float(weight), validation, fraction))
+    return sources
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    ap.add_argument("--source", action="append", required=True, help="name=directory:weight")
+    ap.add_argument("--steps", type=int, default=100_000)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--chunk", type=int, default=64)
+    ap.add_argument("--burn-in", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--min-lr-ratio", type=float, default=0.05)
+    ap.add_argument("--warmup", type=int, default=1000)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--clip", type=float, default=1.0)
+    ap.add_argument("--alpha", type=float, default=1.0, help="weight of the KL term against the win BCE")
+    ap.add_argument("--target", choices=("mix", "blend", "judge"), default="blend")
+    ap.add_argument("--mix", type=float, default=0.5, help="share of the proposer blend in the mixed target")
+    ap.add_argument("--val-fraction", type=int, default=20, help="hold out 1 game in N")
+    ap.add_argument("--val-every", type=int, default=2000)
+    ap.add_argument("--val-batches", type=int, default=0, help="limit validation to N batches (0 = all)")
+    ap.add_argument("--save-every", type=int, default=5000)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16", help="autocast on CUDA; fp16 uses loss scaling")
+    ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    log_file = open(os.path.join(args.out, "log.txt"), "a")
+
+    def log(text: str) -> None:
+        line = f"{time.strftime('%H:%M:%S')} {text}"
+        print(line, flush=True)
+        log_file.write(line + "\n")
+        log_file.flush()
+
+    train_sources = parse_sources(args.source, False, args.val_fraction)
+    val_sources = parse_sources(args.source, True, args.val_fraction)
+    names = [s.name for s in train_sources]
+    log(f"sources {' '.join(f'{s.name}:{len(s.paths)}games/{int(s.lengths.sum())}decisions/weight{s.weight}' for s in train_sources)}")
+    log(f"validation {' '.join(f'{s.name}:{len(s.paths)}games' for s in val_sources)}")
+
+    train_loader = DataLoader(
+        Windows(train_sources, args.burn_in, args.chunk, args.seed), batch_size=args.batch, num_workers=args.workers,
+        collate_fn=collate, pin_memory=device.type == "cuda", persistent_workers=args.workers > 0, prefetch_factor=4 if args.workers else None,
+    )
+    val_loader = DataLoader(
+        Windows(val_sources, args.burn_in, args.chunk, endless=False), batch_size=args.batch, num_workers=min(args.workers, 4), collate_fn=collate,
+    )
+
+    model = PolicyValueModel().to(device)
+    log(f"model {count_parameters(model):,} parameters")
+    if args.compile:
+        model.step = torch.compile(model.step)
+    decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "role" not in n]
+    no_decay = [p for n, p in model.named_parameters() if not (p.ndim >= 2 and "role" not in n)]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay}, {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95))
+
+    scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and device.type == "cuda")
+    step = 0
+    latest = os.path.join(args.out, "latest.pt")
+    if args.resume and os.path.exists(latest):
+        state = torch.load(latest, map_location=device)
+        model.load_state_dict(state["model"])
+        opt.load_state_dict(state["opt"])
+        if "scaler" in state:
+            scaler.load_state_dict(state["scaler"])
+        step = state["step"]
+        log(f"resumed at step {step}")
+
+    def save(path: str) -> None:
+        tmp = path + ".tmp"
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(), "step": step, "args": vars(args)}, tmp)
+        os.replace(tmp, path)
+
+    model.train()
+    start, window_start = time.time(), time.time()
+    running = {"loss": 0.0, "kl": 0.0, "bce": 0.0, "top1": 0.0, "n": 0}
+    for batch in train_loader:
+        if step >= args.steps:
+            break
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        for g in opt.param_groups:
+            g["lr"] = lr_at(step, args)
+        with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
+            out = run_batch(model, batch, args)
+        pol = (batch["policy_ok"] & batch["scored"]).float()
+        sc = batch["scored"].float()
+        kl = masked_mean(out["kl"], pol)
+        bce = masked_mean(out["bce"], sc)
+        loss = args.alpha * kl + bce
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        scaler.step(opt)  # skips the update when fp16 gradients overflowed
+        scaler.update()
+        step += 1
+        running["loss"] += loss.item()
+        running["kl"] += kl.item()
+        running["bce"] += bce.item()
+        running["top1"] += masked_mean(out["top1"], pol).item()
+        running["n"] += 1
+        if step % 100 == 0:
+            n = running["n"]
+            rate = n * args.batch * (args.chunk + args.burn_in) / (time.time() - window_start)
+            log(f"step {step} loss {running['loss'] / n:.4f} kl {running['kl'] / n:.4f} bce {running['bce'] / n:.4f} top1 {running['top1'] / n:.3f} "
+                f"grad {norm:.2f} lr {lr_at(step, args):.2e} {rate:,.0f} steps/s")
+            running = {k: 0.0 for k in running}
+            running["n"] = 0
+            window_start = time.time()
+        if step % args.val_every == 0 or step == args.steps:
+            result = validate(model, val_loader if not args.val_batches else _limit(val_loader, args.val_batches), args, device)
+            log(f"validation step {step} decisions {int(result['decisions'])} kl {result['kl']:.4f} top1 {result['top1']:.3f} "
+                f"bce {result['bce']:.4f} brier {result['brier']:.4f}")
+            log("calibration " + " ".join(f"[{i / 10:.1f}-{(i + 1) / 10:.1f}) n={c} pred={p:.3f} won={w:.3f}" for i, (c, p, w) in enumerate(result["calibration"]) if c))
+            log("by source " + " ".join(f"{names[s]}: kl {k:.4f} bce {b:.4f}" for s, (k, b) in sorted(result["by_source"].items())))
+        if step % args.save_every == 0 or step == args.steps:
+            save(latest)
+            torch.save(model.state_dict(), os.path.join(args.out, f"weights_{step}.pt"))
+    log(f"done at step {step}, {time.time() - start:.0f}s")
+
+
+def _limit(loader, n):
+    class Limited:
+        def __iter__(self):
+            for i, b in enumerate(loader):
+                if i >= n:
+                    return
+                yield b
+    return Limited()
+
+
+if __name__ == "__main__":
+    main()

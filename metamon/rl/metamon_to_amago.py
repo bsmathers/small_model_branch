@@ -292,6 +292,8 @@ def make_placeholder_experiment(
         start_collecting_at_epoch=float("inf"),
         train_timesteps_per_epoch=0,
         stagger_traj_file_lengths=False,
+        # AMAGO's default is the float 1e10, which random.randint rejects on Python 3.14
+        traj_save_len=10**10,
         train_batches_per_epoch=0,
         val_interval=None,
         val_timesteps_per_epoch=0,

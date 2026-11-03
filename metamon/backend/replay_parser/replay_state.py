@@ -172,6 +172,9 @@ class Pokemon:
         )  # unique id used internally to avoid matching by names at all
         self.lvl: int = lvl
         self.gen: int = gen
+        # Gen 1 partial trapping (Bind, Wrap, Fire Spin, Clamp) has no start or end line in the log.
+        # A Pokemon is trapped from a |cant|...|partiallytrapped line until it moves or switches out.
+        self.partially_trapped: bool = False
 
         # pokedex lookup
         self.active_ability: Optional[str] = None
@@ -265,6 +268,7 @@ class Pokemon:
         self.move_change_to_from = {}
         self.type = self.had_type
         self.effects = {}
+        self.partially_trapped = False
 
     def on_end_of_turn(self):
         # "within-turn state" is reset
@@ -605,6 +609,10 @@ class Turn:
     choices_1: List[Optional[Action]] = field(default_factory=lambda: [None, None])
     moves_2: List[Optional[Action]] = field(default_factory=lambda: [None, None])
     choices_2: List[Optional[Action]] = field(default_factory=lambda: [None, None])
+    # |cant| reason per side and slot for this turn (par, slp, frz, recharge, partiallytrapped, flinch...).
+    # A side that could not act reveals no move or choice, so its action label is None (index -1).
+    cant_1: List[Optional[str]] = field(default_factory=lambda: [None, None])
+    cant_2: List[Optional[str]] = field(default_factory=lambda: [None, None])
     weather: PEWeather | Nothing = Nothing.NO_WEATHER
     battle_field: Dict[PEField, int] = field(default_factory=dict)
     conditions_1: Dict[PESideCondition, int] = field(default_factory=dict)
@@ -748,6 +756,8 @@ class Turn:
         next_turn.moves_2 = [None, None]
         next_turn.choices_1 = [None, None]
         next_turn.choices_2 = [None, None]
+        next_turn.cant_1 = [None, None]
+        next_turn.cant_2 = [None, None]
         next_turn.subturns = []
         next_turn.turn_number += 1
         next_turn.replacements_1 = []

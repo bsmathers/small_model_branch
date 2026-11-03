@@ -122,9 +122,17 @@ class POVReplay:
         self.winner = filled_replay.winner == (
             Winner.PLAYER_1 if from_p1_pov else Winner.PLAYER_2
         )
+        # the result including ties; None when the log has no result line
+        if filled_replay.winner is None:
+            self.result = None
+        elif filled_replay.winner == Winner.TIE:
+            self.result = "TIE"
+        else:
+            self.result = "WIN" if self.winner else "LOSS"
 
         self._povturnlist: list[Turn] = []
         self._actionlist: list[list[Optional[Action]]] = []
+        self._cantlist: list[Optional[str]] = []
         self._fill_one_side(replay, filled_replay)
         self._resolve_transforms()
         self._resolve_zoroark()
@@ -137,6 +145,11 @@ class POVReplay:
     @property
     def actionlist(self) -> list[list[Optional[Action]]]:
         return self._actionlist
+
+    @property
+    def cantlist(self) -> list[Optional[str]]:
+        """For each state, the |cant| reason of the action that followed it (None if it acted)."""
+        return self._cantlist
 
     def _flatten_turnlist_from_pov(self, start_from_turn: int = 0) -> list[Turn]:
         flat = []
@@ -260,6 +273,7 @@ class POVReplay:
     def _align_states_actions(self, replay: ParsedReplay):
         self._povturnlist = []
         self._actionlist = []
+        self._cantlist = []
         for idx, (turn_t, turn_t1) in enumerate(
             zip(replay.turnlist, replay.turnlist[1:])
         ):
@@ -273,6 +287,7 @@ class POVReplay:
                     action[subturn.slot] = subturn.action
                     self._povturnlist.append(subturn.turn)
                     self._actionlist.append(action)
+                    self._cantlist.append(None)
 
             self._povturnlist.append(
                 turn_t
@@ -290,10 +305,12 @@ class POVReplay:
                     # we can fall back to that.
                     actionlist[move_idx] = choice
             self._actionlist.append(actionlist)
+            self._cantlist.append((turn_t1.cant_1 if self.from_p1_pov else turn_t1.cant_2)[0])
 
         # add final state
         self._povturnlist.append(turn_t1)
         self._actionlist.append([None, None])
+        self._cantlist.append(None)
 
 
 def add_filled_final_turn(

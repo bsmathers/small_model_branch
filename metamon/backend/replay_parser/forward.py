@@ -444,6 +444,9 @@ class SimProtocol:
         move_name = args[1]
         move = Move(name=move_name, gen=self.replay.gen)
         probably_repeat_move = False
+        if pokemon is not None:
+            pokemon.partially_trapped = False  # a Pokemon that moves is no longer trapped
+        self._pending_trap = None
 
         # id target
         target_pokemon, target_team_idx, target_slot_idx = None, None, None
@@ -455,6 +458,17 @@ class SimProtocol:
                 target_team_idx, target_slot_idx = (
                     self.curr_turn.player_id_to_action_idx(args[2])
                 )
+
+        # Gen 1 partial trapping: the target of a hitting trap move (the first use, or a continuation
+        # tagged [from]) cannot act. Continuation turns print no |cant| for the target.
+        if (
+            move_name in self.TRAP_MOVES
+            and target_pokemon is not None
+            and not any("[miss]" in a or "[notarget]" in a for a in args)
+        ):
+            self._pending_trap = (target_pokemon, target_pokemon.partially_trapped, args[2])
+            target_pokemon.partially_trapped = True
+            self._note_no_action(args[2], "partiallytrapped")
 
         # find extra info from the message
         extra_from_message = None
@@ -617,6 +631,10 @@ class SimProtocol:
         pokemon = self.curr_turn.get_pokemon_from_str(args[0])
         assert pokemon is not None
 
+        if name == "-damage" and any("[from] confusion" in a for a in args[2:]):
+            # a confused Pokemon that hurts itself loses the turn: no move or |cant| line is printed
+            self._note_no_action(args[0], "confusion")
+
         if len(args) > 2:
             # parse extra info for items and abilities
             found_item, found_ability, found_move, found_of_pokemon = (
@@ -719,6 +737,11 @@ class SimProtocol:
         """
         pokemon = self.curr_turn.get_pokemon_from_str(args[0])
         assert pokemon is not None
+        self._note_no_action(args[0], "fainted")  # knocked out before it could act
+        # a faint ends the turn: the other side loses its action if it had not acted yet (for
+        # example when the faster Pokemon faints from Self-Destruct or recoil)
+        other = "p2a: x" if args[0][:2] == "p1" else "p1a: x"
+        self._note_no_action(other, "opponent_fainted")
         pokemon.current_hp = 0
         pokemon.status = PEStatus.FNT
         self.curr_turn.mark_forced_switch(args[0])
@@ -733,8 +756,12 @@ class SimProtocol:
         status = PEStatus[args[1].upper()]
         if name == "-status":
             pokemon.status = status
+            if status in (PEStatus.SLP, PEStatus.FRZ):
+                self._note_no_action(args[0], args[1].lower())  # lost the turn if it had not acted
         elif pokemon.status == status:
             pokemon.status = Nothing.NO_STATUS
+            if status == PEStatus.SLP and any("[msg]" in a for a in args):
+                self._note_no_action(args[0], "wokeup")  # waking up costs the turn in Gen 1
         if found_mon and found_ability:
             found_mon = self.curr_turn.get_pokemon_from_str(found_mon)
             found_mon.reveal_ability(found_ability)
@@ -1168,19 +1195,66 @@ class SimProtocol:
             target=None,
         )
 
+    TRAP_MOVES = {"Wrap", "Bind", "Clamp", "Fire Spin"}
+
+    def _note_game_ended(self):
+        """A game that ends before a turn is played (timeout, forfeit) leaves both sides without an action."""
+        self._note_no_action("p1a: x", "game_ended")
+        self._note_no_action("p2a: x", "game_ended")
+
+    def _parse_hint(self, args: List[str]):
+        """
+        |-hint|MESSAGE. Hints are otherwise ignored. The Gen 1 sleep-counter hint marks a sleeping
+        Pokemon that loses its turns without any |cant| line (it switched in asleep after spending
+        a turn partially trapped).
+        """
+        if args and "switches to a Pokémon that is asleep" in args[0]:
+            for ident, actives in (("p1a: x", self.curr_turn.active_pokemon_1), ("p2a: x", self.curr_turn.active_pokemon_2)):
+                active = actives[0]
+                if active is not None and active.status == PEStatus.SLP:
+                    self._note_no_action(ident, "slp")
+
+    def _note_no_action(self, ident: str, reason: str):
+        """
+        Records why the side's active did not act this turn (par, slp, frz, recharge, flinch,
+        partiallytrapped, fainted, wokeup). The first reason wins, and nothing is recorded if the
+        side already acted. The action label of such a side is None (index -1).
+        """
+        team, slot = self.curr_turn.player_id_to_action_idx(ident)
+        moves = self.curr_turn.moves_1 if team == 1 else self.curr_turn.moves_2
+        cant = self.curr_turn.cant_1 if team == 1 else self.curr_turn.cant_2
+        if moves[slot] is None and cant[slot] is None:
+            cant[slot] = reason
+
     def _parse_cant(self, args: List[str]):
         """
         |cant|POKEMON|REASON or |cant|POKEMON|REASON|MOVE
         """
         # pokemon cannot move and we usually aren't told what the player's preferred action was.
-        # the action labels default to None, so we do nothing here.
-        pass
+        # the action labels default to None (index -1); the reason is kept so that the cause of the
+        # missing action is known (par, slp, frz, recharge, partiallytrapped, flinch...).
+        team, slot = self.curr_turn.player_id_to_action_idx(args[0])
+        reason = args[1] if len(args) > 1 else ""
+        (self.curr_turn.cant_1 if team == 1 else self.curr_turn.cant_2)[slot] = reason
+        if reason == "partiallytrapped":
+            pokemon = self.curr_turn.get_pokemon_from_str(args[0], fallback_to_nickname=False)
+            if pokemon is not None:
+                pokemon.partially_trapped = True
 
     def _parse_immune(self, args: List[str]):
         """
         |-immune|POKEMON
         """
         pokemon = self.curr_turn.get_pokemon_from_str(args[0])
+        pending = getattr(self, "_pending_trap", None)
+        if pending is not None and pending[0] is pokemon:
+            # the trap move that just ran had no effect (for example a Ghost-type target)
+            pokemon.partially_trapped = pending[1]
+            team, slot = self.curr_turn.player_id_to_action_idx(pending[2])
+            cant = self.curr_turn.cant_1 if team == 1 else self.curr_turn.cant_2
+            if cant[slot] == "partiallytrapped":
+                cant[slot] = None
+            self._pending_trap = None
         found_item, found_ability, found_move, found_mon = parse_from_effect_of(args)
         if found_ability:
             pokemon.reveal_ability(found_ability)
@@ -1333,6 +1407,9 @@ class SimProtocol:
                     message[0] is the message type and message[1:] are the arguments.
         """
         name, *data = message
+        if name in ("-hint", "hint"):
+            self._parse_hint(data)
+            return
         if name in self.IGNORES:
             return
         if name == "gen":
@@ -1348,10 +1425,12 @@ class SimProtocol:
             self._parse_turn(data)
         elif name == "win":
             self._parse_win(data)
+            self._note_game_ended()
         elif name == "choice":
             self._parse_choice(data)
         elif name == "tie":
             self._parse_tie(data)
+            self._note_game_ended()
         elif name == "rule":
             self._parse_rule(data)
         elif name == "poke":
