@@ -129,6 +129,24 @@ async function playBattle(index) {
 		const sets = Teams.import(fs.readFileSync(path.join(teamsDir, f), 'utf8'));
 		// Gen 1 has no abilities, but some pool files list real ones (Intimidate...): the real server has "No Ability"
 		for (const set of sets) set.ability = 'No Ability';
+		if (process.env.FUZZ_MODE) {
+			// every Pokemon is a random Gen 1 species with four random moves from the whole Gen 1 move list
+			const gen1 = sim.Dex.mod('gen1');
+			const species = gen1.species.all().filter(s => s.num >= 1 && s.num <= 151 && !s.forme);
+			const moves = gen1.moves.all().filter(m => !m.isNonstandard && m.num >= 1 && m.num <= 165 && m.id !== 'struggle');
+			for (const set of sets) {
+				set.species = species[Math.floor(rng() * species.length)].name;
+				set.name = '';
+				const chosen = new Set();
+				while (chosen.size < 4) chosen.add(moves[Math.floor(rng() * moves.length)].name);
+				set.moves = [...chosen];
+			}
+			const names = new Set();
+			for (const set of sets) {  // species clause
+				while (names.has(set.species)) set.species = species[Math.floor(rng() * species.length)].name;
+				names.add(set.species);
+			}
+		}
 		if (process.env.COUNTER_MODE) {
 			// most Pokemon carry Counter, so that its odd rules come up often
 			for (const set of sets) {
@@ -152,7 +170,13 @@ async function playBattle(index) {
 				set.moves = unique;
 			}
 		}
-		return Teams.pack(sets);
+		// The real server validates teams: in a format with no EV limit (every Gen 1 and 2 format) a set without EVs gets 252
+		// in every stat, while the bare simulator would give it none. Reproduce that, and pass the sets themselves.
+		const team = Teams.unpack(Teams.pack(sets));
+		for (const set of team) {
+			if (!set.evs) set.evs = {hp: 252, atk: 252, def: 252, spa: 252, spd: 252, spe: 252};
+		}
+		return team;
 	};
 	const t1 = pick(), t2 = pick();
 	const stream = new BattleStream();

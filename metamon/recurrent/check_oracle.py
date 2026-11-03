@@ -38,6 +38,7 @@ from metamon.recurrent.records import decision_facts
 from metamon.recurrent.tables import Tables
 
 TABLES = Tables.from_dex(1)
+ESTIMATE_HP = False
 
 
 def norm(text) -> str:
@@ -129,7 +130,9 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
     truth_switches = {p["species"] for p in dec["me"]["pokemon"] if p["position"] != 0 and not p["fainted"]}
     ours_switches = {norm(p["name"]) for p in state["available_switches"]}
     shown = own_species  # a teammate that never appears in the log cannot be known by any parser
-    report.check("switch targets = alive reserves (those the log shows)", truth_switches & shown == ours_switches, (where, sorted((truth_switches & shown) ^ ours_switches)))
+    # the parser fills a teammate that never appears in the log with a likely one: leave the filler out of the comparison
+    report.check("switch targets = alive reserves (those the log shows)", truth_switches & shown == ours_switches & shown, (where, sorted((truth_switches & shown) ^ (ours_switches & shown))))
+    report.check("switch targets: at most one filler for a teammate the log never shows (and only when one is missing)", len(ours_switches - shown) <= len(truth_switches - shown), (where, sorted(ours_switches - shown), sorted(truth_switches - shown)))
     report.check("switch targets: same number as the engine (unseen ones are filled in)", len(ours_switches) == len(truth_switches), (where, len(ours_switches), len(truth_switches)))
     report.check("never-shown alive reserves (unknowable, informational)", not (truth_switches - shown), (where, sorted(truth_switches - shown)))
 
@@ -147,7 +150,11 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
     report.check("opp active HP", hp_ok(opp["hp_pct"], opp_truth), (where, opp["hp_pct"], opp_truth["hp"], opp_truth["maxhp"]))
 
     def status_of(p: dict) -> str:
-        return "fnt" if p["fainted"] or p["hp"] <= 0 else (p["status"] or "nostatus")
+        if p["fainted"] or p["hp"] <= 0:
+            return "fnt"
+        if p["status"] == "psn" and (p["statusState"] or {}).get("id") == "tox" or p["status"] == "tox":
+            return "tox"  # the engine's status record says whether it is Toxic; the log (and the parser) say tox
+        return p["status"] or "nostatus"
 
     report.check("own active status", me["status"] == status_of(me_truth), (where, me["status"], status_of(me_truth)))
     report.check("opp active status", opp["status"] == status_of(opp_truth), (where, opp["status"], status_of(opp_truth)))
@@ -187,7 +194,7 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
         theirs = min(1.0, truth["damage"] / truth["targetMaxHp"])  # damage beyond the target's max HP is just a KO
         # (the logic is graded, not the HP estimate: the true max HP of each side's Pokemon is supplied)
         true_hp = {("player", p["species"]): p["maxhp"] for p in dec["me"]["pokemon"]} | {("opponent", p["species"]): p["maxhp"] for p in dec["opp"]["pokemon"]}
-        ours = counter_fraction(user, extras, TABLES, me_truth["maxhp"], opp_truth["maxhp"], max_hp=lambda side, species: true_hp[(side, species)])
+        ours = counter_fraction(user, extras, TABLES, me_truth["maxhp"], opp_truth["maxhp"], max_hp=None if ESTIMATE_HP else (lambda side, species: true_hp[(side, species)]))
         report.matrix["Counter outcome (rows: engine succeeds?; columns: we predict damage?)"][f"engine {'succeeds' if truth['succeeds'] else 'fails'}"][f"ours {'>0' if ours > 0 else '=0'}"] += 1
         report.check(f"Counter ({who}): predicted to succeed iff the engine succeeds", (ours > 0) == (truth["succeeds"] and theirs > 0.005), (where, "ours", round(ours, 3), "engine", truth["damage"], truth["targetMaxHp"], truth["lastDamage"], truth["targetSide"], "memory", extras.get("last_damage"), extras.get("last_move")))
         if ours > 0 and theirs > 0:
@@ -230,7 +237,12 @@ def main() -> None:
     ap.add_argument("trajectories")
     ap.add_argument("--examples", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0, help="only the first N trajectories")
+    ap.add_argument("--skip-mimic", action="store_true", help="leave out games in which a Pokemon uses Mimic (it replaces a move slot)")
+    ap.add_argument("--skip-exotic", action="store_true", help="leave out games with Mimic, Transform, Metronome or Mirror Move")
+    ap.add_argument("--estimate-hp", action="store_true", help="Counter damage with the encoder's max-DV HP estimate instead of the true max HP")
     args = ap.parse_args()
+    global ESTIMATE_HP
+    ESTIMATE_HP = args.estimate_hp
     report = Report(args.examples)
     files = sorted(glob.glob(os.path.join(args.trajectories, "*.json.lz4")))
     if args.limit:
@@ -245,8 +257,12 @@ def main() -> None:
         states, actions, extras = traj["states"], traj["actions"], traj["extras"]
         if not report.check("trajectory has one state more than the engine had decisions", len(states) == len(decisions) + 1, (gid, side, len(states), len(decisions))):
             continue
-        n_traj += 1
         log = open(os.path.join(args.oracle, f"{gid}.log")).read()
+        if args.skip_mimic and "|Mimic|" in log:
+            continue
+        if args.skip_exotic and re.search(r"^\|move\|[^|]*\|(Mimic|Transform|Metronome|Mirror Move)\|", log, re.M):
+            continue
+        n_traj += 1
         own_species, own_used = revealed(log, side)
         _, opp_used = revealed(log, "p2" if side == "p1" else "p1")
         for i, dec in enumerate(decisions):
