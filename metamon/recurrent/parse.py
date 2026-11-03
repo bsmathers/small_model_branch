@@ -158,6 +158,11 @@ class RecurrentReplayParser(ReplayParser):
                     "forced_switch": bool(state.force_switch),
                 }
             )
+        # After our own forced replacement the new state is the same step as the faint that caused it; the replacement
+        # we chose is the last action (the original convention left the previous turn's move there).
+        for i in range(1, len(extras)):
+            if extras[i - 1]["forced_switch"] and extras[i - 1]["next_player_action"]["kind"] == "switch":
+                extras[i]["last_player_action"] = extras[i - 1]["next_player_action"]
         return extras
 
     def povreplay_to_seq_extras(self, replay: backward.POVReplay):

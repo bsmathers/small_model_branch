@@ -1189,15 +1189,11 @@ class SimProtocol:
     def _parse_mustrecharge(self, args: List[str]):
         """
         |-mustrecharge|POKEMON
+
+        Printed right after the Hyper Beam that causes it, in the same turn. The upstream parser used it to record a
+        Recharge no-op for the Pokemon, which replaced the Hyper Beam in that turn's action label and left the real
+        recharge turn unlabelled. The no-op is now recorded on the recharge turn itself (see _parse_cant).
         """
-        self.curr_turn.set_move_attribute(
-            s=args[0][:3],
-            move_name="Recharge",
-            is_noop=True,
-            is_switch=False,
-            user=self.curr_turn.get_pokemon_from_str(args[0]),
-            target=None,
-        )
 
     TRAP_MOVES = {"Wrap", "Bind", "Clamp", "Fire Spin"}
     LOCK_EVENTS = {"move", "switch", "drag", "faint", "cant", "turn", "upkeep", "-prepare", "-mustrecharge", "-start", "-end",
@@ -1445,6 +1441,16 @@ class SimProtocol:
         team, slot = self.curr_turn.player_id_to_action_idx(args[0])
         reason = args[1] if len(args) > 1 else ""
         (self.curr_turn.cant_1 if team == 1 else self.curr_turn.cant_2)[slot] = reason
+        if reason == "recharge":
+            # the forced recharge turn: the only option the player had was the no-op
+            self.curr_turn.set_move_attribute(
+                s=args[0][:3],
+                move_name="Recharge",
+                is_noop=True,
+                is_switch=False,
+                user=self.curr_turn.get_pokemon_from_str(args[0]),
+                target=None,
+            )
         if reason == "partiallytrapped":
             pokemon = self.curr_turn.get_pokemon_from_str(args[0], fallback_to_nickname=False)
             if pokemon is not None:

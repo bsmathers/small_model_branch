@@ -114,11 +114,69 @@ def revealed(log: str, side: str) -> tuple[set, dict]:
     return species, moves
 
 
+def revealed_timeline(log: str, side: str) -> dict:
+    """turn -> {species: moves it has been seen to use before that turn began}, from the public log (a move called by
+    another is not its own)."""
+    snapshots, moves, active = {}, collections.defaultdict(set), None
+    snapshots[1] = {}
+    for line in log.split("\n"):
+        parts = line.split("|")
+        if len(parts) >= 3 and parts[1] == "turn":
+            snapshots[int(parts[2])] = {k: frozenset(v) for k, v in moves.items()}
+            continue
+        if len(parts) < 4:
+            continue
+        if parts[1] in ("switch", "drag") and parts[2].startswith(side + "a:"):
+            active = norm(parts[3].split(",")[0])
+        elif parts[1] == "move" and parts[2].startswith(side + "a:") and active:
+            tags = [x for x in parts[5:] if x.startswith("[from]")]
+            if not tags or tags[0] == "[from]lockedmove" or norm(tags[0][6:]) == norm(parts[3]):
+                moves[active].add(norm(parts[3]))
+    snapshots["end"] = {k: frozenset(v) for k, v in moves.items()}
+    return snapshots
+
+
 def pokemon_by_species(side_state: dict) -> dict:
     return {p["species"]: p for p in side_state["pokemon"]}
 
 
-def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, facts: dict, tag: str, own_species: set, own_moves_used: dict, opp_moves_used: dict) -> None:
+def check_action(report: Report, dec: dict, state: dict, action: int, nxt_extras: dict | None, where: str, volatiles: list) -> None:
+    """The action label of the decision (and the last-action feature of the next state) against the engine's real choice."""
+    from metamon.interface import move_name, pokemon_name
+
+    req, choice = dec["request"], dec["choice"]
+    kind, number = choice.split()
+    names = [move_name(m["name"]) for m in state["player_active_pokemon"]["moves"]]
+    moves_sorted = sorted(names)
+    switches_sorted = [norm(p["name"]) for p in sorted(state["available_switches"], key=lambda p: pokemon_name(p["name"]))]
+    if kind == "switch":
+        species = norm(req["side"]["pokemon"][int(number) - 1]["details"].split(",")[0])
+        want = 4 + switches_sorted.index(species) if species in switches_sorted else None
+        report.check("action label: a switch is labelled with its target's rank among the alive reserves", want is None or action == want, (where, choice, species, action, want))
+        if nxt_extras is not None:
+            last = nxt_extras["last_player_action"]
+            report.check("last-action feature: a switch is a switch to that species", last["kind"] == "switch" and norm(last["name"]) == species, (where, choice, species, last))
+        return
+    shape = truth_shape(req)
+    chosen = req["active"][0]["moves"][int(number) - 1]["id"] if req.get("active") and int(number) <= len(req["active"][0]["moves"]) else None
+    if action >= 4:
+        report.check("action label: a move is never labelled as a switch", False, (where, choice, action))
+    elif action == -1:
+        # allowed: a chosen move that never ran. It must be explained by what happened next
+        explained = nxt_extras is not None and (nxt_extras["player_cant"] is not None or nxt_extras["last_player_action"]["kind"] != "move")
+        report.check("action label: -1 only when the chosen move did not run (a cant reason follows)", explained, (where, choice, chosen, nxt_extras and (nxt_extras["player_cant"], nxt_extras["last_player_action"])))
+    else:
+        locked_unaware = bool(set(volatiles) & {"partialtrappinglock", "fakepartiallytrapped"})  # chose one move, the engine ran the trap
+        if shape in ("normal", "struggle") and not locked_unaware:
+            ok = chosen == "struggle" or (action < len(moves_sorted) and norm(moves_sorted[action]) == chosen)
+            report.check("action label: a move is labelled with its position among our sorted moves", ok, (where, choice, chosen, action, moves_sorted))
+        # (a trapper that is locked without being told chose one move and ran another: the log shows the one that ran)
+        if nxt_extras is not None and shape == "normal" and not set(volatiles) & {"partialtrappinglock", "fakepartiallytrapped"}:
+            last = nxt_extras["last_player_action"]
+            report.check("last-action feature: the move that ran is the move chosen", last["kind"] != "move" or norm(last["name"]) == chosen, (where, choice, chosen, last))
+
+
+def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, facts: dict, tag: str, own_species: set, own_moves_used: dict, opp_moves_used: dict, action: int = -1, nxt_extras: dict | None = None, opp_timeline: dict | None = None) -> None:
     req = dec["request"]
     me_truth = next(p for p in dec["me"]["pokemon"] if p["position"] == 0)  # slot 0 is the active one, also when it just fainted
     opp_truth = next(p for p in dec["opp"]["pokemon"] if p["position"] == 0)
@@ -180,6 +238,25 @@ def compare_game(report: Report, dec: dict, i: int, state: dict, extras: dict, f
     seen_so_far = opp_moves_used.get(norm(opp["name"]), set())
     for mv in set(opp_ours) & set(opp_truth_moves):
         report.check("opp move PP", opp_ours[mv]["current_pp"] == opp_truth_moves[mv]["pp"], (where, mv, opp_ours[mv]["current_pp"], opp_truth_moves[mv]["pp"]))
+
+    # --- what the opponent has shown so far, and the trapped flags the model reads
+    # (PP would miss a charge move on its charging turn: Gen 1 spends the PP when it executes, but the move is seen)
+    snap = opp_timeline.get(dec["turn"] + (1 if req.get("forceSwitch") else 0))
+    if snap is None:
+        snap = opp_timeline["end"]  # (an empty snapshot is a real answer: nothing seen yet)
+    used_so_far = set(snap.get(opp_truth["species"], ())) - {"struggle"}  # (Struggle is not one of its moves)
+    report.check("opp moves: exactly the moves it has been seen to use so far", {norm(m["name"]) for m in opp["moves"]} == used_so_far, (where, sorted({norm(m["name"]) for m in opp["moves"]} ^ used_so_far)))
+    report.check("opponents_remaining = opponent Pokemon not fainted", state["opponents_remaining"] == sum(1 for p in dec["opp"]["pokemon"] if not p["fainted"]), (where, state["opponents_remaining"], sum(1 for p in dec["opp"]["pokemon"] if not p["fainted"])))
+    by_species = {p["species"]: p for p in dec["me"]["pokemon"]}
+    for r in state["available_switches"]:
+        t = by_species.get(norm(r["name"]))
+        if t is not None and norm(r["name"]) in own_species:
+            report.check("reserve HP", hp_ok(r["hp_pct"], t), (where, r["name"], r["hp_pct"], t["hp"], t["maxhp"]))
+            report.check("reserve status", r["status"] == status_of(t), (where, r["name"], r["status"], status_of(t)))
+    for who, flag, truth in (("own", extras["player_trapped"], me_truth), ("opp", extras["opponent_trapped"], opp_truth)):
+        engine_trapped = "partiallytrapped" in truth["volatiles"]
+        report.check(f"{who} trapped flag (the parser's) = the engine has the trap on it", bool(flag) == engine_trapped, (where, flag, truth["volatiles"]))
+    check_action(report, dec, state, action, nxt_extras, where, me_truth["volatiles"])
 
     # --- side conditions
     for who, ours, truth in (("own", extras["player_conditions_all"], dec["me"]["conditions"]), ("opp", extras["opponent_conditions_all"], dec["opp"]["conditions"])):
@@ -265,9 +342,11 @@ def main() -> None:
         n_traj += 1
         own_species, own_used = revealed(log, side)
         _, opp_used = revealed(log, "p2" if side == "p1" else "p1")
+        opp_timeline = revealed_timeline(log, "p2" if side == "p1" else "p1")
         for i, dec in enumerate(decisions):
             n_dec += 1
-            compare_game(report, dec, i, states[i], extras[i], decision_facts(states, actions, extras, i), f"{gid}/{side}", own_species, own_used, opp_used)
+            compare_game(report, dec, i, states[i], extras[i], decision_facts(states, actions, extras, i), f"{gid}/{side}", own_species, own_used, opp_used,
+                         action=actions[i], nxt_extras=extras[i + 1] if i + 1 < len(extras) else None, opp_timeline=opp_timeline)
     print(f"{n_traj} trajectories, {n_dec} decisions compared\n")
     report.print()
 
