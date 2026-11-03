@@ -20,6 +20,20 @@ training games and trains. Options: `--games` per source (default 30000), `--mix
 or newer, fp16 before that, fp32 on CPU), `--work DIR`. Output: `WORK/run/weights_<step>.pt`; progress in
 `WORK/run/log.txt` and `WORK/logs/`.
 
+## What counts as a decision
+
+Metamon always lists every move and every alive switch as legal, so the builder works out the real options
+(`build.py`, `decision_kind`):
+
+- **asleep or frozen:** the real choice is to fight or to switch out; all moves fail alike, so the target's
+  move probability is spread evenly over the legal moves, and a recorded "no action" means "fight";
+- **recharge turn:** the only option is the no-op: no policy or imitation loss, legal set = the no-op;
+- **partially trapped:** no switching and every move is the same: no policy or imitation loss;
+- **no recorded action for another reason** (full paralysis, flinch, fainted before acting): the player chose
+  a move that then failed, so Exeggcute's blend applies, and the imitation target is "some move" (the policy's
+  total probability on moves);
+- **timeouts** (the game ended before a choice): dropped.
+
 ## Training objective
 
 Per decision: `alpha * KL(Exeggcute blend || policy)` (all games), `bc_weight * KL(played action || policy)`

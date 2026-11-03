@@ -86,6 +86,9 @@ class Decision:
     forced_switch: bool
     win: float  # the observer's result: 1.0 win, 0.5 tie, 0.0 loss
     slot_map: np.ndarray  # Metamon action index -> this model's policy slot (-1: not a legal option)
+    own_status: str  # the observer's active Pokemon's status when it decides ("slp", "frz", ...)
+    trapped: bool  # the observer is partially trapped (Wrap, Bind, ...): it cannot switch
+    recharge_next: bool  # the observer must recharge this turn: its only option is the no-op
 
 
 def result_from_filename(path: str) -> float:
@@ -118,5 +121,12 @@ def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
             forced_switch=bool(e["forced_switch"]),
             win=win,
             slot_map=action_slot_map(state, ordered_party),
+            own_status=s["player_active_pokemon"]["status"],
+            trapped=bool(e["player_trapped"]),
+            recharge_next=bool(
+                t + 1 < len(extras)
+                and not s["forced_switch"]
+                and (extras[t + 1]["player_cant"] == "recharge" or extras[t + 1]["last_player_action"]["kind"] == "recharge")
+            ),
         )
         prev = s

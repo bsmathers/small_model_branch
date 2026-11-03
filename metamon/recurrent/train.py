@@ -56,9 +56,14 @@ def compute(model_out, batch: dict, mode: str, mix: float):
     win = batch["win"][:, None].expand_as(win_logit)
     bce = F.binary_cross_entropy_with_logits(win_logit.float(), win, reduction="none")
     p = torch.sigmoid(win_logit.float())
+    # KL(one-hot of the played action || policy). Code 9 is "some move" (which one is unknown): the policy's
+    # total probability on the moves.
     played = batch["played"]
-    bc = -logp.gather(-1, played.clamp(min=0).unsqueeze(-1)).squeeze(-1)  # KL(one-hot of the played action || policy)
-    bc_top1 = (logp.argmax(-1) == played).float()
+    fight = played == 9
+    moves_mass = logp[..., :4].exp().sum(-1).clamp_min(1e-8)
+    bc = torch.where(fight, -moves_mass.log(), -logp.gather(-1, played.clamp(0, 8).unsqueeze(-1)).squeeze(-1))
+    best = logp.argmax(-1)
+    bc_top1 = torch.where(fight, best < 4, best == played).float()
     return {"kl": kl, "top1": top1, "bce": bce, "brier": (p - win) ** 2, "p": p, "bc": bc, "bc_top1": bc_top1}
 
 
