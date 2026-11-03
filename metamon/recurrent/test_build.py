@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 import numpy as np
 
 from metamon.recurrent.build import (
-    FIGHT, FIGHT_OR_SWITCH, FORCED_RECHARGE, FORCED_TRAPPED, NO_CHOICE, NORMAL, adjust, decision_kind, played_code,
+    FIGHT, FIGHT_OR_SWITCH, FORCED_RECHARGE, NO_CHOICE, NORMAL, adjust, decision_kind, played_code,
 )
 
 
@@ -21,7 +21,8 @@ def test_kinds():
     assert decision_kind(dec(own_status="frz")) == FIGHT_OR_SWITCH
     assert decision_kind(dec(recharge_next=True)) == FORCED_RECHARGE
     assert decision_kind(dec(recharge_next=True, own_status="slp")) == FORCED_RECHARGE  # forced beats asleep
-    assert decision_kind(dec(trapped=True, own_status="slp")) == FORCED_TRAPPED
+    assert decision_kind(dec(trapped=True)) == FIGHT_OR_SWITCH  # a trapped Pokemon can still switch out
+    assert decision_kind(dec(trapped=True, recharge_next=True)) == FORCED_RECHARGE
     assert decision_kind(dec(action_index=-1, action_reason="game_ended")) == NO_CHOICE
     assert decision_kind(dec(action_index=-1, action_reason="par")) == NORMAL  # paralyzed: a real choice that then failed
     assert decision_kind(dec(forced_switch=True, trapped=True, own_status="slp")) == NORMAL  # choosing a replacement
@@ -41,12 +42,10 @@ def test_asleep_spreads_the_fight_probability_evenly_over_the_legal_moves():
     assert abs(blend2.sum() - 1) < 1e-6 and (legal2 == legal).all()
 
 
-def test_recharge_leaves_only_the_no_op_and_trapped_only_the_moves():
+def test_recharge_leaves_only_the_no_op():
     legal = row([1, 1, 1, 1], [1, 1, 1, 0, 0])
     r, _, _ = adjust(FORCED_RECHARGE, legal, legal / legal.sum(), legal / legal.sum())
     assert list(r) == [1, 0, 0, 0, 0, 0, 0, 0, 0]
-    t, _, _ = adjust(FORCED_TRAPPED, legal, legal / legal.sum(), legal / legal.sum())
-    assert list(t[:4]) == [1, 1, 1, 1] and t[4:].sum() == 0
 
 
 def test_played_codes():

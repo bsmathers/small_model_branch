@@ -43,12 +43,15 @@ NAME_RE = re.compile(r"^[^_]+_[^_]*_(.+?)_vs_(.+?)_\d\d-\d\d-\d{4}_(?:WIN|LOSS|T
 
 # Decision kinds. What the player could do depends on its situation, and Metamon's own legal set does not say
 # (it always lists every move and every alive switch):
-#   FIGHT_OR_SWITCH  asleep or frozen: any move just fails, so the real choice is to fight or to switch out
+#   FIGHT_OR_SWITCH  asleep, frozen, or losing the turn to a trapping move: in Gen 1 these "semi-lock" the Fight
+#                    button (any move just fails) but never prevent switching, so the real choice is to
+#                    fight or to switch out
 #   FORCED_RECHARGE  recharging after Hyper Beam: the only option is the no-op
-#   FORCED_TRAPPED   partially trapped: no switching, and every move is the same
 #   NO_CHOICE        the game ended before the player chose (timeout)
-NORMAL, FIGHT_OR_SWITCH, FORCED_RECHARGE, FORCED_TRAPPED, NO_CHOICE = 0, 1, 2, 3, 4
-FORCED = (FORCED_RECHARGE, FORCED_TRAPPED, NO_CHOICE)
+# (The user of a trapping move is semi-locked into it while the trap lasts, but the logs do not show when a
+# trap ran out, so those decisions are left as normal ones.)
+NORMAL, FIGHT_OR_SWITCH, FORCED_RECHARGE, NO_CHOICE = 0, 1, 2, 4
+FORCED = (FORCED_RECHARGE, NO_CHOICE)
 FIGHT = 9  # `played` code: some move, which one is unknown or does not matter
 
 
@@ -57,11 +60,9 @@ def decision_kind(d) -> int:
         return NORMAL
     if d.recharge_next:
         return FORCED_RECHARGE
-    if d.trapped:
-        return FORCED_TRAPPED
     if d.action_index == -1 and d.action_reason == "game_ended":
         return NO_CHOICE
-    if d.own_status in ("slp", "frz"):
+    if d.trapped or d.own_status in ("slp", "frz"):
         return FIGHT_OR_SWITCH
     return NORMAL
 
@@ -73,9 +74,6 @@ def adjust(kind: int, legal: np.ndarray, blend: np.ndarray, judge: np.ndarray):
         legal[:] = 0
         legal[0] = 1  # the no-op uses the first move slot
         blend[:] = judge[:] = legal
-    elif kind == FORCED_TRAPPED:
-        legal[4:] = 0
-        blend[:] = judge[:] = legal / max(legal.sum(), 1)
     elif kind == FIGHT_OR_SWITCH and legal[:4].sum() > 0:
         # every move fails the same way: the fight option's probability is spread evenly over the moves
         moves = legal[:4] > 0

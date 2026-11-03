@@ -87,7 +87,7 @@ class Decision:
     win: float  # the observer's result: 1.0 win, 0.5 tie, 0.0 loss
     slot_map: np.ndarray  # Metamon action index -> this model's policy slot (-1: not a legal option)
     own_status: str  # the observer's active Pokemon's status when it decides ("slp", "frz", ...)
-    trapped: bool  # the observer is partially trapped (Wrap, Bind, ...): it cannot switch
+    trapped: bool  # the observer was already trapped (Wrap, Bind, ...) when it decided, and lost the turn to it; it can still switch
     recharge_next: bool  # the observer must recharge this turn: its only option is the no-op
 
 
@@ -122,7 +122,15 @@ def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
             win=win,
             slot_map=action_slot_map(state, ordered_party),
             own_status=s["player_active_pokemon"]["status"],
-            trapped=bool(e["player_trapped"]),
+            # Both signals are needed. The parser's flag alone never learns that a trap ran out (or that the player
+            # switched away); a lost turn alone also happens when a fresh Wrap lands before the player moves, while
+            # it was still free to use any move.
+            trapped=bool(
+                e["player_trapped"]
+                and t + 1 < len(extras)
+                and not s["forced_switch"]
+                and extras[t + 1]["player_cant"] == "partiallytrapped"
+            ),
             recharge_next=bool(
                 t + 1 < len(extras)
                 and not s["forced_switch"]
