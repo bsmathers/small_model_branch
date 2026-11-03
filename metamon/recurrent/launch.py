@@ -195,7 +195,7 @@ class Launcher:
 
         # build
         stage = f"build_{name}"
-        self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(self.cpus)], self.env(HF_HUB_OFFLINE=1))
+        self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(self.cpus), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1))
         self.log(f"{name}: built {self.count_files(built, '.npz')} games")
         self.counts = getattr(self, "counts", {})
         self.counts[name] = (wanted, n_traj)
@@ -207,7 +207,7 @@ class Launcher:
         for name, weight in self.mix.items():
             cmd += ["--source", f"{name}={os.path.join(self.work, name, 'built')}:{weight}"]
         cmd += ["--steps", str(a.steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
-                "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--lr", str(a.lr),
+                "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--bc-weight", str(a.bc_weight), "--lr", str(a.lr), "--ckpt-every", str(a.ckpt_every),
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
@@ -249,7 +249,7 @@ class Launcher:
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
         self.prefetch()
         raw = self.fetch_data()
-        self.mix = dict(m.split("=") for m in a.mix) if a.mix else {n: 1.0 for n in SOURCES}
+        self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
         for name in SOURCES:
             if float(self.mix.get(name, 0)) > 0:
                 self.prepare(name, raw[name], a.games)
@@ -268,10 +268,13 @@ def main() -> None:
     ap.add_argument("--raw-human", default=None, help="a folder of .log files, instead of downloading")
     ap.add_argument("--raw-strong", default=None)
     ap.add_argument("--games", type=int, default=30000, help="games to take from each source (0: all)")
-    ap.add_argument("--mix", action="append", help="name=weight, e.g. human=0.5 (default: equal; weight 0 skips a source)")
+    ap.add_argument("--mix", action="append", help="name=weight, e.g. human=0.4 (default human=0.4 strong=0.6; weight 0 skips a source)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
-    ap.add_argument("--alpha", type=float, default=1.0)
+    ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")
+    ap.add_argument("--bc-weight", type=float, default=1.0, help="weight of the imitation term on the imitated bots' games")
+    ap.add_argument("--bc-players", default="Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3", help="usernames whose played actions are imitated")
+    ap.add_argument("--ckpt-every", type=int, default=1, help="steps between writes of latest.pt (1: every iteration)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--val-fraction", type=int, default=20, help="hold out 1 game in N (by battle id)")
     ap.add_argument("--val-every", type=int, default=2000)

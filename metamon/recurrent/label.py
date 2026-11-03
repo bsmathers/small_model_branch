@@ -206,7 +206,7 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
         ).view(lanes, 1, -1)
         time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long, device=device)
         recorder.record.clear()
-        with torch.inference_mode(), torch.autocast("cuda", dtype=half or torch.bfloat16, enabled=half is not None and device.type == "cuda"):
+        with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
             actions, hidden = policy.get_actions(batch, rl2, time_idxs, hidden_state=hidden, sample=False)
         actions = actions.reshape(lanes).tolist()
         for i in range(lanes):

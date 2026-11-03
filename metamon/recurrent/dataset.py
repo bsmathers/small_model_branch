@@ -83,6 +83,11 @@ def window(game: dict, start: int, size: int) -> dict[str, np.ndarray]:
     valid[: end - start] = True
     out["valid"] = valid
     out["policy_ok"] = cut(game["policy_ok"].astype(bool)) & valid
+    # the action actually played, on games of the imitated bots (older built games have neither key)
+    played = cut(game["played"].astype(np.int64)) if "played" in game else np.full(size, -1, np.int64)
+    played = np.where(valid, played, -1)
+    out["played"] = played
+    out["bc_ok"] = (played >= 0) & bool(game["bc_game"] if "bc_game" in game else False)
     out["start"] = np.array(start)
     out["win"] = np.array(float(game["win"]), np.float32)
     return out

@@ -4,7 +4,7 @@
 #
 #   ./launch.sh --smoke        # a few minutes; prints timings and a projection for the full run
 #   ./launch.sh                # the full run
-#   ./launch.sh --games 60000 --steps 30000 --mix human=0.5 --mix strong=0.5
+#   ./launch.sh --games 60000 --steps 30000 --mix human=0.4 --mix strong=0.6
 #
 # Environment: WORK (default /workspace/work or ~/work), PYTHON (default python3), HF_TOKEN (only if the data
 # repo is private), SKIP_INSTALL=1 to skip the install step.

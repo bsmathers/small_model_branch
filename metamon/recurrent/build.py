@@ -9,6 +9,8 @@ One `<name>.npz` per game with
     policy_ok      bool [T]  the decision has a policy target (the observer acted, labels exist, and none
                              of the label mass fell on an action with no slot)
     win            float32 scalar   the observer's result: 1 win, 0.5 tie, 0 loss
+    played         int8 [T]  the policy slot of the action the observer actually played (-1: none or not legal)
+    bc_game        bool scalar  the observer is one of the `--bc-players` (strong bots whose play is imitated)
 
 Exeggcute's action indices (moves 0-3 by sorted name, then the alive reserves by sorted species) are
 mapped to this model's slots (the active's sorted moves, then the five reserve slots by sorted species,
@@ -22,6 +24,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import re
 from multiprocessing import Pool
 
 import numpy as np
@@ -31,6 +34,15 @@ from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS
 from metamon.recurrent.records import iter_decisions
 
 _TABLES = None
+_BC_PLAYERS: set[str] = set()
+DEFAULT_BC_PLAYERS = "Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3"
+NAME_RE = re.compile(r"^[^_]+_[^_]*_(.+?)_vs_(.+?)_\d\d-\d\d-\d{4}_(?:WIN|LOSS|TIE)\.json\.lz4$")
+
+
+def observer_name(path: str) -> str | None:
+    """The observer's username, from the parser's file name `<id>_<rating>_<player>_vs_<opponent>_<date>_<result>`."""
+    m = NAME_RE.match(os.path.basename(path))
+    return m.group(1) if m else None
 
 
 def build_game(args) -> tuple[str, int] | tuple[str, str]:
@@ -67,15 +79,23 @@ def build_game(args) -> tuple[str, int] | tuple[str, str]:
         acted = np.array([d.action_index >= 0 for d in decisions])
         out["policy_ok"] = acted & labels["has_blend"] & (mapped["legal"].sum(1) > 0) & ~lost
         out["win"] = np.float32(decisions[0].win)
+        played = np.full(n, -1, np.int8)
+        for t, d in enumerate(decisions):
+            a = d.action_index
+            if 0 <= a < len(d.slot_map) and d.slot_map[a] >= 0 and mapped["legal"][t, d.slot_map[a]] > 0:
+                played[t] = d.slot_map[a]
+        out["played"] = played
+        out["bc_game"] = np.bool_(observer_name(traj_path) in _BC_PLAYERS)
         np.savez_compressed(out_path, **out)
         return traj_path, n
     except Exception as exc:  # report and keep going
         return traj_path, f"{type(exc).__name__}: {exc}"
 
 
-def _init(tables_dir: str) -> None:
-    global _TABLES
+def _init(tables_dir: str, bc_players: tuple = ()) -> None:
+    global _TABLES, _BC_PLAYERS
     _TABLES = Tables.load(tables_dir)
+    _BC_PLAYERS = set(bc_players)
 
 
 def main() -> None:
@@ -85,6 +105,7 @@ def main() -> None:
     ap.add_argument("output")
     ap.add_argument("tables")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--bc-players", default=DEFAULT_BC_PLAYERS, help="comma-separated usernames whose own actions are imitated")
     args = ap.parse_args()
     os.makedirs(args.output, exist_ok=True)
     jobs = []
@@ -95,8 +116,9 @@ def main() -> None:
         if traj and not os.path.exists(out):
             jobs.append((traj[0], label, out))
     done = failed = 0
-    _init(args.tables)  # fail here, not in a worker that the pool would respawn forever
-    with Pool(args.workers, initializer=_init, initargs=(args.tables,)) as pool:
+    bc_players = tuple(x for x in args.bc_players.split(",") if x)
+    _init(args.tables, bc_players)  # fail here, not in a worker that the pool would respawn forever
+    with Pool(args.workers, initializer=_init, initargs=(args.tables, bc_players)) as pool:
         for path, result in pool.imap_unordered(build_game, jobs, chunksize=4):
             if isinstance(result, str):
                 failed += 1

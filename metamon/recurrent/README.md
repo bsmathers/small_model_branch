@@ -14,10 +14,21 @@ git clone git@github.com:bsmathers/small_model_branch.git && cd small_model_bran
 `launch.sh` installs the requirements (`pip install -e .` plus a CUDA build of torch if none is present),
 then `metamon.recurrent.launch` downloads the data from `bsmathers/raw_replays` and Exeggcute's checkpoints and
 usage statistics, parses both points of view of every game, labels them with Exeggcute, builds the
-training games and trains. Options: `--games` per source (default 30000), `--mix human=0.5 --mix strong=0.5`,
-`--steps` (20000), `--batch` (auto: the largest that fits in GPU memory), `--precision auto` (bf16 on Ampere
+training games and trains. Options: `--games` per source (default 30000), `--mix human=0.4 --mix strong=0.6` (the default),
+`--steps` (20000), `--batch` (auto: the largest that fits in GPU memory), `--bc-weight` (1.0) and
+`--bc-players` (see below), `--ckpt-every` (1: `latest.pt` is rewritten every iteration), `--precision auto` (bf16 on Ampere
 or newer, fp16 before that, fp32 on CPU), `--work DIR`. Output: `WORK/run/weights_<step>.pt`; progress in
 `WORK/run/log.txt` and `WORK/logs/`.
+
+## Training objective
+
+Per decision: `alpha * KL(Exeggcute blend || policy)` (all games), `bc_weight * KL(played action || policy)`
+(only games played by `Tauros-v1`, `Tauros-v2`, `SmallG1Online-v2` and `SmallG1Online-v3`, on their own
+decisions), and a binary cross-entropy on the game result for the win head. Sources are mixed 40% human,
+60% strong-bot by decisions.
+
+Resuming: `latest.pt` holds the model, optimizer and step and is written every iteration by a background
+thread (atomic replace; at most one write behind). Run the same command again to continue.
 
 ## Choosing a machine
 
