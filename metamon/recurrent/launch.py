@@ -258,7 +258,8 @@ class Launcher:
 
         # label, a few processes per GPU (each is mostly Python overhead around small batches)
         gpus = max(1, len(self.gpus))
-        per_gpu = a.label_procs or (3 if self.cpus >= 12 else 2) if self.gpus else 1
+        # the router's per-game loop is Python on one core, so labelling is CPU-bound: about one process per core, a core left free
+        per_gpu = a.label_procs or max(2, min(8, (self.cpus - 1) // gpus)) if self.gpus else 1
         shards = gpus * per_gpu
         threads = max(1, self.cpus // shards) if not self.gpus else max(1, min(4, self.cpus // shards))
         stage = f"label_{name}"
@@ -360,7 +361,7 @@ def main() -> None:
     ap.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--parse-procs", type=int, default=0, help="parser processes (default: one per CPU)")
-    ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default 3, or 2 on small hosts)")
+    ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: one per core, 2 to 8)")
     ap.add_argument("--label-batch", type=int, default=64, help="games labelled in lockstep per process")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()

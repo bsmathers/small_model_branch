@@ -118,6 +118,12 @@ class Recorder:
             return shortlist, scores
 
         def choose_hook(**kw):
+            # The router's per-game loop reads each member's probabilities with dozens of tiny .item() calls. On a GPU every
+            # one of them waits for the device; moving the [batch, actions] tables to the CPU once per step (a no-op after
+            # the first game of the batch) gives the same numbers without the waiting.
+            for step in kw["member_steps"]:
+                if step["probs"].device.type != "cpu":
+                    step["probs"] = step["probs"].cpu()
             self.weights = None
             self.judge = None
             self.judge_calls = 0
