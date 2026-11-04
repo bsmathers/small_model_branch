@@ -45,6 +45,8 @@ class Launcher:
         with open(os.path.join(self.logs, "launch.txt"), "a") as f:
             f.write(line + "\n")
 
+    SINGLE_THREAD = {"OMP_NUM_THREADS": 1, "MKL_NUM_THREADS": 1, "OPENBLAS_NUM_THREADS": 1, "NUMEXPR_NUM_THREADS": 1}
+
     def env(self, **extra) -> dict:
         env = dict(os.environ)
         env.update({"METAMON_CACHE_DIR": self.cache, "PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1"})
@@ -57,7 +59,15 @@ class Launcher:
         procs = []
         for i, (cmd, env) in enumerate(zip(commands, envs)):
             handle = open(os.path.join(self.logs, f"{stage}_{i}.txt"), "w")
-            procs.append((subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT), handle))
+            try:
+                procs.append((subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT), handle))
+            except BlockingIOError as e:
+                for p, _ in procs:
+                    p.terminate()
+                raise RuntimeError(
+                    f"{stage}: the container refused to start process {i + 1} of {len(commands)} ({e}); it limits processes or memory. "
+                    f"Re-run with fewer, e.g. --parse-procs 4 --label-procs 1."
+                ) from e
         last = 0.0
         try:
             while any(p.poll() is None for p, _ in procs):
@@ -86,11 +96,52 @@ class Launcher:
 
     # ---- stages ----
 
+    @staticmethod
+    def _read(path: str):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            return None
+
+    def usable_cpus(self) -> int:
+        """CPUs this container may use: the affinity mask and the cgroup quota (os.cpu_count() reports the whole host, which
+        on a shared rented machine can be 100+ cores)."""
+        n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        quota = self._read("/sys/fs/cgroup/cpu.max")  # cgroup v2: "<quota> <period>" or "max <period>"
+        if quota and not quota.startswith("max"):
+            q, period = quota.split()[:2]
+            n = min(n, max(1, int(int(q) / int(period))))
+        else:
+            q, period = self._read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), self._read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+            if q and period and int(q) > 0:
+                n = min(n, max(1, int(int(q) / int(period))))
+        return max(1, n)
+
+    def process_cap(self) -> int:
+        """How many worker processes the container can really run: each parser process holds about 0.3 GiB (measured),
+        and a rented container limits the number of processes and threads (forking past it fails with EAGAIN)."""
+        mem = None
+        for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            v = self._read(path)
+            if v and v.isdigit() and int(v) < 2**50:
+                mem = int(v) / 2**30
+        if mem is None:
+            try:
+                mem = int(next(l for l in open("/proc/meminfo") if l.startswith("MemTotal")).split()[1]) / 2**20
+            except (OSError, StopIteration):
+                mem = 16.0
+        cap = max(1, int(mem // 1))  # (1 GiB each leaves room for the label and build workers)
+        pids = self._read("/sys/fs/cgroup/pids.max") or self._read("/sys/fs/cgroup/pids/pids.max")
+        if pids and pids.isdigit():
+            cap = min(cap, max(1, (int(pids) - 100) // 24))  # a worker plus its helper threads
+        return max(1, min(cap, 32))
+
     def hardware(self) -> None:
         import torch
 
         a = self.args
-        self.cpus = os.cpu_count() or 1
+        self.cpus = self.usable_cpus()
+        self.proc_cap = self.process_cap()
         self.gpus = []
         if a.device != "cpu" and torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
@@ -106,7 +157,7 @@ class Launcher:
         else:
             self.precision = "fp32"
         free = __import__("shutil").disk_usage(self.work).free / 2**30
-        self.log(f"hardware: {self.cpus} CPUs, " + (", ".join(f"{g['name']} {g['mem']:.0f} GiB (sm_{g['cc'][0]}{g['cc'][1]})" for g in self.gpus) or "no GPU") + f"; precision {self.precision}; {free:.0f} GiB free at {self.work}")
+        self.log(f"hardware: {self.cpus} CPUs (worker cap {self.proc_cap}), " + (", ".join(f"{g['name']} {g['mem']:.0f} GiB (sm_{g['cc'][0]}{g['cc'][1]})" for g in self.gpus) or "no GPU") + f"; precision {self.precision}; {free:.0f} GiB free at {self.work}")
         if free < 40 and not a.smoke:
             self.log("warning: under 40 GiB free; the default sample needs about 25 GiB with the downloads")
 
@@ -191,17 +242,17 @@ class Launcher:
             f.write(PARSER_VERSION)
 
         # parse, in parallel shards
-        procs = a.parse_procs or self.cpus
+        procs = a.parse_procs or min(self.cpus, self.proc_cap)
         stage = f"parse_{name}"
         cmds = [[self.py, "-m", "metamon.recurrent.parse", raw_dir, traj, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(stage, cmds, [self.env(HF_HUB_OFFLINE=1)] * procs, lambda: f"{self.count_files(traj, '.lz4')} trajectories")
+        self.run_parallel(stage, cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(traj, '.lz4')} trajectories")
 
         # the original parser's states and actions, which Exeggcute reads (it was trained on them), folded into each trajectory
         legacy = os.path.join(src, "legacy")
         cmds = [[self.py, os.path.join("tools", "legacy_parse.py"), raw_dir, legacy, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(f"legacy_{name}", cmds, [self.env(HF_HUB_OFFLINE=1)] * procs, lambda: f"{self.count_files(legacy, '.lz4')} legacy trajectories")
+        self.run_parallel(f"legacy_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(legacy, '.lz4')} legacy trajectories")
         cmds = [[self.py, "-m", "metamon.recurrent.merge_legacy", traj, legacy, "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(f"merge_{name}", cmds, [self.env(HF_HUB_OFFLINE=1)] * procs)
+        self.run_parallel(f"merge_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs)
         n_traj = self.count_files(traj, ".lz4")
         self.log(f"{name}: parsed {n_traj} trajectories (games the two parsers disagree on are in {traj}_rejected)")
 
@@ -221,7 +272,7 @@ class Launcher:
 
         # build
         stage = f"build_{name}"
-        self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(self.cpus), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1))
+        self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
         self.log(f"{name}: built {self.count_files(built, '.npz')} games")
         self.counts = getattr(self, "counts", {})
         self.counts[name] = (wanted, n_traj)
