@@ -78,7 +78,8 @@ def summarize_action(action: Optional[Action]) -> dict:
 
 
 def _pokemon_dict(pokemon) -> Optional[dict]:
-    if pokemon is None:
+    if pokemon is None or pokemon.current_hp is None or pokemon.max_hp is None:
+        # (a Pokemon that only a `|poke|` roster line names and that has not appeared: nothing is known about it yet)
         return None
     return dataclasses.asdict(interface.UniversalPokemon.from_ReplayPokemon(pokemon))
 
@@ -264,6 +265,10 @@ class RecurrentReplayParser(ReplayParser):
         except (ForwardException, BackwardException) as e:
             self.add_exception_to_history(e, gameid)
             warnings.warn(f"{gameid}: {e}")
+            return False
+        except Exception as e:  # one odd game must not stop a shard that has thousands more
+            self.error_history.setdefault("Other", {}).setdefault(type(e).__name__, []).append(gameid)
+            warnings.warn(f"{gameid}: {type(e).__name__}: {e}")
             return False
 
     def parse_replay(self, path: str, pov_username: Optional[str] = None):

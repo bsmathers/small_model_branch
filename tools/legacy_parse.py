@@ -106,8 +106,8 @@ def main() -> None:
                 with lz4.frame.open(out, "wb") as f:
                     f.write(json.dumps({"states": [s.to_dict() for s in states], "actions": action_idxs}).encode("utf-8"))
             ok += 1
-        except (ForwardException, BackwardException) as e:
-            warnings.warn(f"{gameid}: {e}")
+        except Exception as e:  # (also covers ForwardException and BackwardException) one odd game must not stop a shard
+            warnings.warn(f"{gameid}: {type(e).__name__}: {e}")
         done += 1
     print(f"legacy-parsed {ok} of {done} games")
 
