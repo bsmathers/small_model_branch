@@ -93,6 +93,20 @@ state's slots by identity (a move by name, a reserve by species: `features.label
 corrected state lacks counts as lost and the decision is excluded from the policy loss. The launcher runs `parse`, `legacy`,
 `merge`, `label`, `build` in that order.
 
+## Labelling speed
+
+Profiled per phase (`label_batch`, 1,034 decisions): the five Exeggcute members' state encoders are the real work (82% on
+CPU); the router around them used to be 26% and is now about 10%. Three changes, all exact (labels equal the previous ones
+to 1e-7, `chosen` identical):
+
+- the router's per-game reads (legal actions, cycle keys, previous reward, each member's probability table) use host tensors,
+  so a GPU is never waited on game by game;
+- the critic is evaluated once per member per step for all games and all actions (the critic is discrete, so one pass gives every
+  action's value), instead of once per game and shortlist;
+- `--batch` defaults to 256 games per process (about 11 MiB of caches per game), so the members' fixed per-step cost is shared.
+
+The label stage prints decisions per second; that figure times the stage on any machine.
+
 ## Parser version
 
 `metamon.recurrent.parse.PARSER_VERSION` is stamped into each work folder by the launcher; a folder made by another version is

@@ -33,6 +33,8 @@ import time
 from dataclasses import replace
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from metamon.recurrent.records import load_trajectory
 
@@ -155,6 +157,43 @@ class Recorder:
             self.record[idx] = rec
             return chosen
 
+        # The router scores a shortlist with the critic one game at a time: a tiny network call per game, and the call
+        # recomputes the same state embedding for every candidate. The critic of this ensemble is discrete, so one pass gives the
+        # value of EVERY action of a state. Computing that table for all games of the step at once, then reading the shortlist
+        # rows, is the same arithmetic in one call per member instead of one per game and candidate.
+        self._critic_tables: dict[int, tuple] = {}
+        score_one = policy._score_candidates_with_critic
+
+        def critic_table(step) -> torch.Tensor:
+            entry = self._critic_tables.get(id(step))
+            if entry is not None and entry[0] is step:
+                return entry[1]
+            if len(self._critic_tables) > 64:
+                self._critic_tables.clear()
+            member_policy = step["member"].policy
+            traj_emb = step["traj_emb"]  # [games, 1, d]
+            games, actions = traj_emb.shape[0], policy.action_dim
+            device = traj_emb.device
+            gammas = len(member_policy.gammas)
+            state = traj_emb.repeat_interleave(actions, dim=0)  # row g * actions + a: state of game g, action a
+            action_tensor = torch.arange(actions, device=device).repeat(games)
+            one_hot = F.one_hot(action_tensor, num_classes=actions).float().view(1, games * actions, 1, 1, actions)
+            critic_actions = member_policy.actor.policy_dist.action_from_buffer(one_hot.repeat(1, 1, 1, gammas, 1))
+            values = member_policy.critics(state, critic_actions)
+            if hasattr(member_policy.critics, "bin_dist_to_raw_vals"):
+                values = member_policy.critics.bin_dist_to_raw_vals(values)
+            else:
+                values = member_policy.popart(values, normalized=False)
+            table = values.mean(dim=3)[0, :, 0, -1, 0].detach().view(games, actions).float().cpu()
+            self._critic_tables[id(step)] = (step, table)
+            return table
+
+        def score_hook(step, batch_idx, shortlist):
+            return critic_table(step)[batch_idx, shortlist]
+
+        self.exact_critic = score_one  # (the original, kept for the equivalence check)
+        policy._score_candidates_with_critic = score_hook
+
         policy._build_proposer_variants = build_hook
         policy._judge_shortlist = judge_hook
         policy._choose_action_for_batch = choose_hook
@@ -204,14 +243,12 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
             legal_list.append(legal)
             if t < lengths[i]:
                 out[i]["legal"][t, [a for a in legal if a < N_SLOTS]] = 1.0
-        batch = {
-            k: torch.as_tensor(np.stack([o[k] for o in obs_list]), device=device)[:, None]
-            for k in obs_list[0]
-        }
-        rl2 = torch.as_tensor(
-            np.concatenate([prev_reward[:, None], prev_action], axis=1), device=device
-        ).view(lanes, 1, -1)
-        time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long, device=device)
+        # The tensors stay on the CPU: the router reads them game by game on the host (legal actions, cycle keys, the previous
+        # reward), and each such read of a device tensor waits for the device. The members move what they need to their own
+        # device once per step.
+        batch = {k: torch.as_tensor(np.stack([o[k] for o in obs_list]))[:, None] for k in obs_list[0]}
+        rl2 = torch.as_tensor(np.concatenate([prev_reward[:, None], prev_action], axis=1)).view(lanes, 1, -1)
+        time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long)
         recorder.record.clear()
         with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
             actions, hidden = policy.get_actions(batch, rl2, time_idxs, hidden_state=hidden, sample=False)
@@ -250,7 +287,7 @@ def main() -> None:
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--cache", default=os.environ.get("METAMON_CACHE_DIR", "."))
-    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--batch", type=int, default=256, help="games labelled in lockstep (the members' fixed per-step cost is shared by all of them; the caches take about 11 MiB per game)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16", help="runs the members under CUDA autocast")
@@ -273,7 +310,7 @@ def main() -> None:
     # longest games first inside each batch group keeps the lockstep padding small
     lengths = {f: len(load_trajectory(f)["legacy_states"]) for f in files}
     files.sort(key=lambda f: lengths[f])
-    done = 0
+    done = decisions = 0
     start = time.time()
     for b in range(0, len(files), args.batch):
         group = files[b : b + args.batch]
@@ -282,7 +319,8 @@ def main() -> None:
         for f, r in zip(group, results):
             np.savez_compressed(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"), **r)
         done += len(group)
-        print(f"labelled {done}/{len(files)} games, {time.time() - start:.0f}s", flush=True)
+        decisions += sum(len(r["chosen"]) for r in results)
+        print(f"labelled {done}/{len(files)} games, {time.time() - start:.0f}s ({decisions / max(time.time() - start, 1e-9):.0f} decisions/s)", flush=True)
 
 
 if __name__ == "__main__":

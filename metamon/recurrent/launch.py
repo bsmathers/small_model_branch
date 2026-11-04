@@ -364,7 +364,7 @@ def main() -> None:
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--parse-procs", type=int, default=0, help="parser processes (default: one per CPU)")
     ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: one per core, 2 to 8)")
-    ap.add_argument("--label-batch", type=int, default=64, help="games labelled in lockstep per process")
+    ap.add_argument("--label-batch", type=int, default=256, help="games labelled in lockstep per process")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()
     args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)
