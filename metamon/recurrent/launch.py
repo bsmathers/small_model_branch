@@ -308,16 +308,18 @@ class Launcher:
         """Scales the smoke timings up to the default sizes. Rough: the startup cost of each stage is counted
         at full size, so the projection errs high."""
         a = self.args
-        full_games = {n: a.games for n in SOURCES}
-        scale_games = sum(full_games.values()) / max(1, sum(w for w, _ in self.counts.values()))
+        sources = [n for n in SOURCES if n in self.counts]
+        scale_games = a.full_games * len(sources) / max(1, sum(w for w, _ in self.counts.values()))
+        # each stage's fixed startup (loading the ensemble takes about a minute per label process) happens once, not per game
+        startup = {"label": 60.0, "parse": 5.0, "legacy": 5.0, "merge": 1.0, "build": 3.0}
         parts = []
         for stage in ("parse", "legacy", "merge", "label", "build"):
             t = sum(v for k, v in self.timings.items() if k.startswith(stage + "_"))
-            parts.append((stage, t * scale_games))
-        smoke_steps = a.steps
+            work = max(t - startup[stage] * len(sources), 0.3 * t)
+            parts.append((stage, work * scale_games))
         t_train = self.timings.get("train", 0.0)
-        parts.append(("train (20000 steps)", t_train / max(1, smoke_steps) * 20000))
-        self.log("projected for --games %d per source and 20000 steps (hours): " % a.games + ", ".join(f"{k} {v / 3600:.1f}" for k, v in parts) + f"; total {sum(v for _, v in parts) / 3600:.1f}")
+        parts.append((f"train ({a.full_steps} steps)", t_train / max(1, a.steps) * a.full_steps))
+        self.log(f"projected for --games {a.full_games} per source and {a.full_steps} steps (hours, rough): " + ", ".join(f"{k} {v / 3600:.1f}" for k, v in parts) + f"; total {sum(v for _, v in parts) / 3600:.1f}")
 
     def main(self) -> None:
         a = self.args
@@ -365,6 +367,7 @@ def main() -> None:
     ap.add_argument("--label-batch", type=int, default=64, help="games labelled in lockstep per process")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()
+    args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)
     if args.smoke:
         args.cache = args.cache or os.path.join(args.work, "metamon-cache")  # shared with the full run
         args.games = min(args.games, 150)
