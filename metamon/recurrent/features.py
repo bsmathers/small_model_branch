@@ -371,7 +371,8 @@ def encode_observer(
         ids["own_status"][slot] = STATUS_IDS[pokemon.status]
         for j, move in enumerate(pokemon.moves[:N_MOVES]):
             ids["own_moves"][slot, j] = tables.move_id(move.name)
-            own[slot, 6 + j] = move.current_pp / max(1, move.max_pp) if move.max_pp else 0.0
+            # (a move forced to run at 0 PP underflows to 63 in Gen 1, so the ratio can exceed 1: clip it)
+            own[slot, 6 + j] = min(1.0, move.current_pp / max(1, move.max_pp)) if move.max_pp else 0.0
         own[slot, 0] = pokemon.hp_pct if live else 0.0
         own[slot, 1] = 1.0 if is_active else 0.0
         own[slot, 2:6] = [_boost(pokemon.atk_boost), _boost(pokemon.def_boost), _boost(pokemon.spe_boost), _boost(pokemon.spa_boost)]
