@@ -213,6 +213,7 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     lanes = len(trajectories)
     spaces = [copy.deepcopy(spec.observation_space) for _ in range(lanes)]
     # Exeggcute reads what the ORIGINAL parser produced (it was trained on that); see merge_legacy.py
+    # (from_dict rewrites the dict it is given, and the encoder timing labels the same trajectories twice: it gets a copy)
     states = [[UniversalState.from_dict(copy.deepcopy(s)) for s in t["legacy_states"]] for t in trajectories]
     lengths = [len(s) - 1 for s in states]  # a decision per state but the last
     horizon = max(lengths)
@@ -227,11 +228,23 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     prev_action = np.zeros((lanes, n_actions), np.float32)
     prev_reward = np.zeros(lanes, np.float32)
     hidden = None
+    last_obs: list = [None] * lanes
     for t in range(horizon):
         obs_list, legal_list = [], []
         for i in range(lanes):
-            ti = min(t, lengths[i] - 1)  # finished lanes repeat their last decision; outputs are ignored
-            s = states[i][ti]
+            if t >= lengths[i]:
+                # A finished lane only keeps the batch rectangular; its outputs are ignored. Give it its last observation with a single
+                # legal action: the router returns that action at once, with no features, shortlist or critic reads for the lane.
+                if last_obs[i] is None:  # (a trajectory with no decision at all)
+                    last_obs[i] = spaces[i].state_to_obs(states[i][0])
+                obs = dict(last_obs[i])
+                mask = np.ones(n_actions, bool)
+                mask[0] = False
+                obs["illegal_actions"] = mask
+                obs_list.append(obs)
+                legal_list.append([0])
+                continue
+            s = states[i][t]
             obs = spaces[i].state_to_obs(s)
             legal = sorted(
                 {
@@ -242,10 +255,10 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
             mask = np.ones(n_actions, bool)
             mask[legal] = False
             obs["illegal_actions"] = mask
+            last_obs[i] = obs
             obs_list.append(obs)
             legal_list.append(legal)
-            if t < lengths[i]:
-                out[i]["legal"][t, [a for a in legal if a < N_SLOTS]] = 1.0
+            out[i]["legal"][t, [a for a in legal if a < N_SLOTS]] = 1.0
         # The tensors stay on the CPU: the router reads them game by game on the host (legal actions, cycle keys, the previous
         # reward), and each such read of a device tensor waits for the device. The members move what they need to their own
         # device once per step.
@@ -351,9 +364,8 @@ def main() -> None:
     fast_tstep.enable(policy, args.encoder != "exact")
     print(f"froze {fast_tstep.freeze_sigma_reparam(policy, half)} SigmaReparam layers", flush=True)
 
-    # longest games first inside each batch group keeps the lockstep padding small
-    lengths = {f: len(load_trajectory(f)["legacy_states"]) for f in files}
-    files.sort(key=lambda f: lengths[f])
+    # similar lengths together keep the lockstep padding small; the file size tracks the length closely and costs no decoding
+    files.sort(key=os.path.getsize)
     if args.encoder == "auto" and files:
         pick_encoder(spec, policy, recorder, [load_trajectory(f) for f in files[len(files) // 2 : len(files) // 2 + args.batch]], half)
     done = decisions = 0

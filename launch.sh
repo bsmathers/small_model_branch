@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-command launch for the recurrent policy/value model: installs the requirements, then runs
-# metamon.recurrent.launch (data download, parse, label, build, train). Safe to run again: every stage resumes.
+# metamon.recurrent.launch (download + unzip the finished trajectories from bsmathers/labeled_gen1_retrajectories, label,
+# build, train; add --from-raw to parse raw logs instead). Safe to run again: every stage resumes.
 #
 #   ./launch.sh --smoke        # a few minutes; prints timings and a projection for the full run
 #   ./launch.sh                # the full run

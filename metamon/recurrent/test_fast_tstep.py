@@ -68,6 +68,35 @@ def test_independent_pokemon_encoding_reuses_unchanged_pokemon():
         fast_tstep._encode_independent = original
 
 
+def test_cache_mirror_rolls_exactly_like_the_original_update():
+    from amago.nets import transformer
+
+    fast_tstep.install_cache_mirror()
+    cls = transformer.TformerHiddenState
+
+    def make(lens):
+        torch.manual_seed(0)
+        caches = []
+        for _ in range(2):
+            c = transformer.Cache(torch.device("cpu"), torch.float32, layers=2, batch_size=3, max_seq_len=4, n_heads=2, head_dim=2)
+            c.data[:] = torch.randn_like(c.data)
+            caches.append(c)
+        return cls(caches[0], caches[1], torch.tensor(lens, dtype=torch.int32))
+
+    # lanes start at different lengths, so they fill up (and roll) at different steps; a reset in the middle
+    mirrored, reference = make([0, 2, 3]), make([0, 2, 3])
+    for step in range(12):
+        if step == 6:
+            mirrored.reset(torch.tensor([1]))
+            reference.reset(torch.tensor([1]))
+        mirrored.update()
+        cls._original_update(reference)
+        assert torch.equal(mirrored.seq_lens, reference.seq_lens), step
+        assert torch.equal(mirrored.key_cache.data.nan_to_num(-7.0), reference.key_cache.data.nan_to_num(-7.0)), step
+        assert torch.equal(mirrored.val_cache.data.nan_to_num(-7.0), reference.val_cache.data.nan_to_num(-7.0)), step
+    assert mirrored.seq_lens.max() <= 4
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     for name, fn in tests:

@@ -84,7 +84,44 @@ def _patch(enc) -> None:
     enc._inner_forward_impl = impl
 
 
+def install_cache_mirror() -> None:
+    """Keeps a host copy of the transformer cache's sequence lengths, so a step does not have to ask the device.
+
+    `TformerHiddenState.update` finds the lanes whose cache is full with `torch.where(seq_lens == max)` and rolls only those: a
+    device-to-host wait twice per step per member, and a clone of an empty slice when no lane is full (the usual case: games
+    are shorter than the cache). The lengths are fully determined on the host (+1 per update, -1 when rolled, 0 on reset), so
+    the host copy answers the same question without waiting, and the rolling code runs only when some lane is full."""
+    import numpy as np
+    from amago.nets import transformer
+
+    cls = transformer.TformerHiddenState
+    if getattr(cls, "_host_mirror", False):
+        return
+    original_update, original_reset = cls.update, cls.reset
+
+    def update(self):
+        host = getattr(self, "_host_lens", None)
+        if host is None:
+            host = self.seq_lens.cpu().numpy().astype(np.int64)
+        host = host + 1
+        full = np.flatnonzero(host == self.key_cache.max_seq_len)
+        if full.size == 0:
+            self.seq_lens += 1
+        else:
+            original_update(self)  # the original path: the same lanes (those equal to the maximum) are rolled and decremented
+            host[full] -= 1
+        self._host_lens = host
+
+    def reset(self, idxs):
+        original_reset(self, idxs)
+        self._host_lens = None  # re-read from the device on the next update
+
+    cls._original_update = original_update  # (the tests compare against it)
+    cls.update, cls.reset, cls._host_mirror = update, reset, True
+
+
 def install(policy) -> None:
+    install_cache_mirror()
     for member in policy.members:
         _patch(member.policy.tstep_encoder)
 

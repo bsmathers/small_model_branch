@@ -22,10 +22,25 @@ from metamon.recurrent.features import CANT_REASONS, KINDS, STATUS_IDS, Encoded,
 from metamon.recurrent.tables import Tables
 
 
+try:  # (several times faster than json; the same values)
+    import orjson
+except ImportError:  # pragma: no cover
+    orjson = None
+
+
+def _loads(raw: bytes):
+    if orjson is not None:
+        try:
+            return orjson.loads(raw)
+        except orjson.JSONDecodeError:  # (e.g. a NaN, which json.dumps writes and orjson refuses)
+            pass
+    return json.loads(raw)
+
+
 def load_trajectory(path: str) -> dict:
     """A trajectory written by metamon.recurrent.parse: states, actions and extras."""
     with lz4.frame.open(path, "rb") as f:
-        data = json.loads(f.read())
+        data = _loads(f.read())
     if "extras" not in data:
         raise ValueError(f"{os.path.basename(path)} has no extras: parse the raw log with metamon.recurrent.parse")
     if "legacy_states" not in data:

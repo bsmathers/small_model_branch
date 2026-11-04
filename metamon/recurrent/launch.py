@@ -1,4 +1,7 @@
-"""Runs the whole job on one machine: fetch data and Exeggcute's checkpoints, parse, label, build, train.
+"""Runs the whole job on one machine: fetch the trajectories and Exeggcute's checkpoints, label, build, train.
+
+The trajectories are the finished two-parser files (bsmathers/labeled_gen1_retrajectories: one zip per source, unzipped
+into WORK/<source>/trajectories). `--from-raw` parses raw replay logs instead (bsmathers/raw_replays).
 
 Normally started through `launch.sh`, which installs the requirements first:
 
@@ -213,16 +216,91 @@ class Launcher:
     def count_files(self, directory: str, suffix: str) -> int:
         return sum(1 for n in os.listdir(directory) if n.endswith(suffix)) if os.path.isdir(directory) else 0
 
-    def prepare(self, name: str, raw_dir: str, games: int) -> None:
+    def fetch_trajectories(self, name: str, games: int) -> None:
+        """Gets the finished trajectories (corrected + original-parser states, see merge_legacy.py) of one source: from a
+        zip in the dataset repo, or from a local folder (--traj-human-dir / --traj-strong-dir). With `games`, keeps every
+        k-th game (both points of view). Files labelled in the zip (.npz) are kept too, so the label stage skips them."""
+        a = self.args
+        src = os.path.join(self.work, name)
+        traj, labels = os.path.join(src, "trajectories"), os.path.join(src, "labels")
+        marker = os.path.join(src, ".trajectories_done")
+        if os.path.exists(marker):
+            self.log(f"{name}: trajectories already extracted ({open(marker).read().strip()})")
+            return
+        local = {"human": a.traj_human_dir, "strong": a.traj_strong_dir}[name]
+        opened = None
+        if local:
+            members = [(f, os.path.join(d, f)) for d, _, fs in os.walk(local) for f in fs]
+            read = lambda ref: open(ref, "rb")
+        else:
+            from huggingface_hub import HfApi, hf_hub_download
+
+            zip_name = {"human": a.traj_human_zip, "strong": a.traj_strong_zip}[name]
+            if not zip_name:
+                files = [f for f in HfApi().list_repo_files(a.traj_repo, repo_type="dataset") if f.endswith(".zip")]
+                hits = [f for f in files if name in os.path.basename(f).lower()]
+                if len(hits) != 1:
+                    raise RuntimeError(f"cannot pick the {name} zip in {a.traj_repo} (zips there: {files}); pass --traj-{name}-zip")
+                zip_name = hits[0]
+            self.log(f"downloading {a.traj_repo}/{zip_name}")
+            path = hf_hub_download(repo_id=a.traj_repo, repo_type="dataset", filename=zip_name, local_dir=os.path.join(self.work, "hf"))
+            opened = zipfile.ZipFile(path)
+            members = [(os.path.basename(m), m) for m in opened.namelist() if not m.endswith("/") and not m.startswith("__MACOSX")]
+            read = opened.open
+        members = [(b, ref) for b, ref in members if not b.startswith(".") and (b.endswith(".json.lz4") or b.endswith(".npz"))]
+        game = lambda b: b.split("_")[0]
+        ids = sorted({game(b) for b, _ in members if b.endswith(".json.lz4")})
+        if not ids:
+            raise RuntimeError(f"no .json.lz4 trajectories found for {name} ({'folder ' + local if local else a.traj_repo})")
+        every = max(1, len(ids) // games) if games else 1
+        keep = set(ids[::every])
+        self.log(f"{name}: {len(ids)} games in the dataset, taking every {every}th (about {len(keep)} games, two points of view each)")
+        os.makedirs(traj, exist_ok=True)
+        os.makedirs(labels, exist_ok=True)
+        count = 0
+        for b, ref in members:
+            if game(b) not in keep:
+                continue
+            out = os.path.join(traj if b.endswith(".lz4") else labels, b)  # the basename only: no path tricks
+            with read(ref) as f, open(out, "wb") as o:
+                o.write(f.read())
+            count += b.endswith(".lz4")
+        if opened is not None:
+            opened.close()
+            os.remove(opened.filename)  # the zip is no longer needed
+        self.log(f"{name}: extracted {count} trajectories")
+        open(marker, "w").write(f"{count} trajectories, every {every}th game\n")
+
+    def parse_raw(self, name: str, raw_dir: str, games: int, src: str, traj: str):
+        """--from-raw: parse the .log files here (corrected parser + original parser + merge)."""
         a = self.args
         total = self.count_files(raw_dir, ".log")
         if total == 0:
             raise RuntimeError(f"no .log files in {raw_dir}")
         every = max(1, total // games) if games else 1
         wanted = total // every
+        self.log(f"{name}: {total} logs, taking every {every}th (about {wanted} games, two points of view each)")
+        # parse, in parallel shards
+        procs = a.parse_procs or min(self.cpus, self.proc_cap)
+        stage = f"parse_{name}"
+        cmds = [[self.py, "-m", "metamon.recurrent.parse", raw_dir, traj, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
+        self.run_parallel(stage, cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(traj, '.lz4')} trajectories")
+
+        # the original parser's states and actions, which Exeggcute reads (it was trained on them), folded into each trajectory
+        legacy = os.path.join(src, "legacy")
+        cmds = [[self.py, os.path.join("tools", "legacy_parse.py"), raw_dir, legacy, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
+        self.run_parallel(f"legacy_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(legacy, '.lz4')} legacy trajectories")
+        cmds = [[self.py, "-m", "metamon.recurrent.merge_legacy", traj, legacy, "--shard", f"{i}/{procs}"] for i in range(procs)]
+        self.run_parallel(f"merge_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs)
+        n_traj = self.count_files(traj, ".lz4")
+        self.log(f"{name}: parsed {n_traj} trajectories (games the two parsers disagree on are in {traj}_rejected)")
+
+        return n_traj, wanted
+
+    def prepare(self, name: str, raw_dir: str | None, games: int) -> None:
+        a = self.args
         src = os.path.join(self.work, name)
         traj, labels, built = (os.path.join(src, d) for d in ("trajectories", "labels", "built"))
-        self.log(f"{name}: {total} logs, taking every {every}th (about {wanted} games, two points of view each)")
 
         # every stage resumes from what is on disk, so data made by an older parser must not be mixed in
         from metamon.recurrent.parse import PARSER_VERSION
@@ -241,20 +319,13 @@ class Launcher:
         with open(stamp, "w") as f:
             f.write(PARSER_VERSION)
 
-        # parse, in parallel shards
-        procs = a.parse_procs or min(self.cpus, self.proc_cap)
-        stage = f"parse_{name}"
-        cmds = [[self.py, "-m", "metamon.recurrent.parse", raw_dir, traj, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(stage, cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(traj, '.lz4')} trajectories")
-
-        # the original parser's states and actions, which Exeggcute reads (it was trained on them), folded into each trajectory
-        legacy = os.path.join(src, "legacy")
-        cmds = [[self.py, os.path.join("tools", "legacy_parse.py"), raw_dir, legacy, "--every", str(every), "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(f"legacy_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs, lambda: f"{self.count_files(legacy, '.lz4')} legacy trajectories")
-        cmds = [[self.py, "-m", "metamon.recurrent.merge_legacy", traj, legacy, "--shard", f"{i}/{procs}"] for i in range(procs)]
-        self.run_parallel(f"merge_{name}", cmds, [self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD)] * procs)
-        n_traj = self.count_files(traj, ".lz4")
-        self.log(f"{name}: parsed {n_traj} trajectories (games the two parsers disagree on are in {traj}_rejected)")
+        if raw_dir is None:
+            # the default: finished trajectories (made with this parser version), no parsing here
+            self.fetch_trajectories(name, games)
+            n_traj = self.count_files(traj, ".lz4")
+            wanted = n_traj // 2
+        else:
+            n_traj, wanted = self.parse_raw(name, raw_dir, games, src, traj)
 
         # label, a few processes per GPU (each is mostly Python overhead around small batches)
         gpus = max(1, len(self.gpus))
@@ -329,10 +400,10 @@ class Launcher:
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
         self.prefetch()
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
-        raw = self.fetch_data()
+        raw = self.fetch_data() if a.from_raw or a.raw_human or a.raw_strong else {}
         for name in SOURCES:
             if float(self.mix.get(name, 0)) > 0:
-                self.prepare(name, raw[name], a.games)
+                self.prepare(name, raw.get(name), a.games)
         self.mix = {k: v for k, v in self.mix.items() if float(v) > 0}
         self.train()
         self.summary()
@@ -342,7 +413,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=os.environ.get("WORK", "/workspace/work" if os.path.isdir("/workspace") else os.path.expanduser("~/work")))
     ap.add_argument("--cache", default=None, help="metamon cache (default WORK/metamon-cache)")
-    ap.add_argument("--data-repo", default="bsmathers/raw_replays")
+    ap.add_argument("--traj-repo", default="bsmathers/labeled_gen1_retrajectories", help="dataset repo with the finished trajectories (one zip per source)")
+    ap.add_argument("--traj-human-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'human' in its name)")
+    ap.add_argument("--traj-strong-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'strong' in its name)")
+    ap.add_argument("--traj-human-dir", default=None, help="a local folder of finished trajectories, instead of downloading")
+    ap.add_argument("--traj-strong-dir", default=None)
+    ap.add_argument("--from-raw", action="store_true", help="parse raw replay logs here instead of using finished trajectories")
+    ap.add_argument("--data-repo", default="bsmathers/raw_replays", help="(--from-raw) repo with the raw logs")
     ap.add_argument("--human-zip", default="human_logs.zip")
     ap.add_argument("--strong-zip", default="strong_model_replays.zip")
     ap.add_argument("--raw-human", default=None, help="a folder of .log files, instead of downloading")
