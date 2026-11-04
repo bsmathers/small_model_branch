@@ -72,19 +72,25 @@ class SDPAAttention(SelfAttention):
         val_cache[batch, cache_seqlens] = v[:, 0]
 
         end = cache_seqlens + 1
-        # Attend over the compact fixed-capacity cache and mask unwritten
-        # slots. Avoiding Tensor.item() prevents an MPS synchronization and a
-        # torch.compile graph break on every decoder layer.
-        max_len = key_cache.shape[1]
-        keys = torch.nan_to_num(key_cache).transpose(1, 2)
-        values = torch.nan_to_num(val_cache).transpose(1, 2)
-        query = q.transpose(1, 2)
-
-        positions = torch.arange(max_len, device=q.device)[None, :]
-        valid = positions < end[:, None]
         left, _ = self.window_size
+        query = q.transpose(1, 2)
         if left >= 0:
-            valid &= positions >= (end - left - 1)[:, None]
+            # Only the last `left + 1` positions can be attended: gather just those instead of copying the whole fixed-capacity
+            # cache (and replacing its unwritten NaNs) at every layer of every step. The set of keys, and their order, are the
+            # ones the masked full-cache version below attends to.
+            width = left + 1
+            positions = end[:, None] - width + torch.arange(width, device=q.device)[None, :]  # [batch, width]
+            valid = positions >= 0
+            gather = positions.clamp(min=0)
+            keys = torch.nan_to_num(key_cache[batch[:, None], gather]).transpose(1, 2)
+            values = torch.nan_to_num(val_cache[batch[:, None], gather]).transpose(1, 2)
+        else:
+            # Attend over the compact fixed-capacity cache and mask unwritten slots. Avoiding Tensor.item() prevents an MPS
+            # synchronization and a torch.compile graph break on every decoder layer.
+            max_len = key_cache.shape[1]
+            keys = torch.nan_to_num(key_cache).transpose(1, 2)
+            values = torch.nan_to_num(val_cache).transpose(1, 2)
+            valid = torch.arange(max_len, device=q.device)[None, :] < end[:, None]
         # Every cached key precedes or equals the one-token query, so passing
         # is_causal=True here would incorrectly keep only key zero for Q=1.
         out = F.scaled_dot_product_attention(

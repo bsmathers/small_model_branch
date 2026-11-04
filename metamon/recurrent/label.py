@@ -204,6 +204,9 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     import torch
     from metamon.interface import UniversalAction, UniversalState
 
+    from metamon.recurrent import fast_tstep
+
+    fast_tstep.reset(policy)  # (a no-op unless the fast encoder is installed) the cached embeddings belong to the previous games
     device = next(iter(m.device for m in policy.members))
     action_space = spec.action_space
     n_actions = action_space.gym_space.n
@@ -282,6 +285,36 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     return out
 
 
+def pick_encoder(spec, policy, recorder, trajectories: list[dict], half, steps: int = 10) -> None:
+    """Times `steps` decisions of the first games with each encoder (a first pass warms it up: compilation, allocator) and keeps the
+    faster one; the fast one wins ties. The labels are discarded."""
+    from metamon.recurrent import fast_tstep
+
+    short = [{**t, "legacy_states": t["legacy_states"][: steps + 1], "legacy_actions": t["legacy_actions"][: steps + 1]} for t in trajectories]
+    elapsed = {}
+    for name in ("fast", "exact"):
+        fast_tstep.enable(policy, name == "fast")
+        label_batch(spec, policy, recorder, short, half)
+        _sync(policy)
+        start = time.perf_counter()
+        label_batch(spec, policy, recorder, short, half)
+        _sync(policy)
+        elapsed[name] = time.perf_counter() - start
+    use_fast = elapsed["fast"] <= 1.05 * elapsed["exact"]
+    fast_tstep.enable(policy, use_fast)
+    print(f"encoder: fast {elapsed['fast']:.1f}s, exact {elapsed['exact']:.1f}s for {steps} decisions of {len(short)} games -> using {'fast' if use_fast else 'exact'}", flush=True)
+
+
+def _sync(policy) -> None:
+    import torch
+
+    for member in policy.members:
+        if member.device.type == "cuda":
+            torch.cuda.synchronize(member.device)
+        elif member.device.type == "mps":
+            torch.mps.synchronize()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -293,6 +326,11 @@ def main() -> None:
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16", help="runs the members under CUDA autocast")
     ap.add_argument("--attention", choices=("sdpa", "flash"), default="sdpa", help="sdpa runs in fp32; flash needs flash_attn and half precision")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument(
+        "--encoder", choices=("auto", "fast", "exact"), default="auto",
+        help="timestep encoder: the members' own (exact), the equivalent one in fast_tstep.py (fast), or whichever is faster on this machine, "
+        "timed on a few steps of the first games (auto)",
+    )
     ap.add_argument("--shard", default="0/1", help="i/n: label every n-th file starting at i")
     args = ap.parse_args()
     import torch
@@ -305,17 +343,24 @@ def main() -> None:
     os.makedirs(args.output, exist_ok=True)
     files = [f for f in files if not os.path.exists(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"))]
     spec, policy = load_ensemble(args.cache, args.device, args.threads, args.attention)
+    half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(args.precision)
     recorder = Recorder(policy)
+    from metamon.recurrent import fast_tstep
+
+    fast_tstep.install(policy)
+    fast_tstep.enable(policy, args.encoder != "exact")
 
     # longest games first inside each batch group keeps the lockstep padding small
     lengths = {f: len(load_trajectory(f)["legacy_states"]) for f in files}
     files.sort(key=lambda f: lengths[f])
+    if args.encoder == "auto" and files:
+        pick_encoder(spec, policy, recorder, [load_trajectory(f) for f in files[len(files) // 2 : len(files) // 2 + args.batch]], half)
     done = decisions = 0
     start = time.time()
     for b in range(0, len(files), args.batch):
         group = files[b : b + args.batch]
         trajectories = [load_trajectory(f) for f in group]
-        results = label_batch(spec, policy, recorder, trajectories, half={"fp16": torch.float16, "bf16": torch.bfloat16}.get(args.precision))
+        results = label_batch(spec, policy, recorder, trajectories, half=half)
         for f, r in zip(group, results):
             np.savez_compressed(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"), **r)
         done += len(group)

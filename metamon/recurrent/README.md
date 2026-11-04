@@ -95,17 +95,23 @@ corrected state lacks counts as lost and the decision is excluded from the polic
 
 ## Labelling speed
 
-Profiled per phase (`label_batch`, 1,034 decisions): the five Exeggcute members' state encoders are the real work (82% on
-CPU); the router around them used to be 26% and is now about 10%. Three changes, all exact (labels equal the previous ones
-to 1e-7, `chosen` identical):
+Profiled per phase (`label_batch`, 1,034 decisions): the five Exeggcute members' encoders are the real work; the router around
+them used to take 48%. In decisions per second on one CPU process (24 games, steady state): 47 originally, 71 after the first
+three changes, 108 now. Everything below is exact up to float rounding: against the unmodified path, on 4,596 decisions, the blend
+differs by at most 2e-6, the judge distribution by at most 1.3e-5, and the router picks the same action every time.
 
-- the router's per-game reads (legal actions, cycle keys, previous reward, each member's probability table) use host tensors,
-  so a GPU is never waited on game by game;
+- the router's per-game reads (legal actions, cycle keys, previous reward, each member's probability table) use host tensors, so a
+  GPU is never waited on game by game;
 - the critic is evaluated once per member per step for all games and all actions (the critic is discrete, so one pass gives every
   action's value), instead of once per game and shortlist;
-- `--batch` defaults to 256 games per process (about 11 MiB of caches per game), so the members' fixed per-step cost is shared.
+- `fast_tstep.py`: the members encode the seven Pokemon of a decision in one perceiver call with block-diagonal masks, which is a 7x
+  larger attention than the same arithmetic done per Pokemon; the labeler encodes each Pokemon on its own, and only those whose tokens or
+  numbers changed since the previous step of that game (about 70% are unchanged);
+- the attention reads only the last 33 cached positions (the window) instead of copying the whole 128-slot cache every layer;
+- `--batch` defaults to 256 games per process (about 11 MiB of caches per game).
 
-The label stage prints decisions per second; that figure times the stage on any machine.
+`--encoder auto` (the default) times the fast and the members' own encoder for a few steps on the first games and keeps the faster one
+(ties go to the fast one), so a machine where the original is quicker keeps it. The label stage prints decisions per second.
 
 ## Parser version
 
