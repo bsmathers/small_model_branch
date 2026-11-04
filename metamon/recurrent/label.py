@@ -349,6 +349,7 @@ def main() -> None:
 
     fast_tstep.install(policy)
     fast_tstep.enable(policy, args.encoder != "exact")
+    print(f"froze {fast_tstep.freeze_sigma_reparam(policy, half)} SigmaReparam layers", flush=True)
 
     # longest games first inside each batch group keeps the lockstep padding small
     lengths = {f: len(load_trajectory(f)["legacy_states"]) for f in files}

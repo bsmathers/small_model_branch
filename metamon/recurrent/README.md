@@ -96,8 +96,8 @@ corrected state lacks counts as lost and the decision is excluded from the polic
 ## Labelling speed
 
 Profiled per phase (`label_batch`, 1,034 decisions): the five Exeggcute members' encoders are the real work; the router around
-them used to take 48%. In decisions per second on one CPU process (24 games, steady state): 47 originally, 71 after the first
-three changes, 108 now. Everything below is exact up to float rounding: against the unmodified path, on 4,596 decisions, the blend
+them used to take 48%. In decisions per second on one CPU process (24 games, steady state, noisy machine): 47 originally, 72 after the first
+three changes, about 123 now. Everything below is exact up to float rounding: against the unmodified path, on 4,596 decisions, the blend
 differs by at most 2e-6, the judge distribution by at most 1.3e-5, and the router picks the same action every time.
 
 - the router's per-game reads (legal actions, cycle keys, previous reward, each member's probability table) use host tensors, so a
@@ -107,6 +107,8 @@ differs by at most 2e-6, the judge distribution by at most 1.3e-5, and the route
 - `fast_tstep.py`: the members encode the seven Pokemon of a decision in one perceiver call with block-diagonal masks, which is a 7x
   larger attention than the same arithmetic done per Pokemon; the labeler encodes each Pokemon on its own, and only those whose tokens or
   numbers changed since the previous step of that game (about 70% are unchanged);
+- the SigmaReparam linears of the trajectory transformers rebuild `gamma / sigma * W` (and, under autocast, re-cast it) on every call; the
+  labeler computes it once (sigma under the labeler's own autocast, so it is bit-identical to the original layer: `test_fast_tstep.py`);
 - the attention reads only the last 33 cached positions (the window) instead of copying the whole 128-slot cache every layer;
 - `--batch` defaults to 256 games per process (about 11 MiB of caches per game).
 
