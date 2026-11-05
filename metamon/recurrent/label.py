@@ -165,17 +165,12 @@ class Recorder:
         self.row_mask = None  # [games, actions] bool, set by label_batch each step: the (game, action) pairs the router can ask about
         score_one = policy._score_candidates_with_critic
 
-        def critic_rows(step, rows: np.ndarray) -> torch.Tensor:
-            """The critic value of the given flat (game * actions + action) rows. The critic is a plain per-row network, so a row does
-            not depend on which other rows are evaluated with it."""
-            member_policy = step["member"].policy
-            traj_emb = step["traj_emb"]  # [games, 1, d]
+        def critic_values(member_policy, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+            """Critic value of each (state [n, 1, d], action [n]) row. The critic is a plain per-row network, so a row does not depend on
+            which other rows are evaluated with it."""
             actions = policy.action_dim
-            device = traj_emb.device
             gammas = len(member_policy.gammas)
-            index = torch.as_tensor(rows, device=device)
-            state = traj_emb[index // actions]  # [n, 1, d]
-            one_hot = F.one_hot(index % actions, num_classes=actions).float().view(1, len(rows), 1, 1, actions)
+            one_hot = F.one_hot(action, num_classes=actions).float().view(1, len(action), 1, 1, actions)
             critic_actions = member_policy.actor.policy_dist.action_from_buffer(one_hot.repeat(1, 1, 1, gammas, 1))
             values = member_policy.critics(state, critic_actions)
             if hasattr(member_policy.critics, "bin_dist_to_raw_vals"):
@@ -184,8 +179,15 @@ class Recorder:
                 values = member_policy.popart(values, normalized=False)
             return values.mean(dim=3)[0, :, 0, -1, 0].detach().float().cpu()
 
+        def critic_rows(step, rows: np.ndarray) -> torch.Tensor:
+            """Critic values of the flat (game * actions + action) rows of one step."""
+            traj_emb = step["traj_emb"]  # [games, 1, d]
+            index = torch.as_tensor(rows, device=traj_emb.device)
+            return critic_values(step["member"].policy, traj_emb[index // policy.action_dim], index % policy.action_dim)
+
         def critic_table(step, batch_idx: int, shortlist) -> torch.Tensor:
             games, actions = step["traj_emb"].shape[0], policy.action_dim
+            wanted = np.asarray(shortlist, dtype=np.int64)
             entry = self._critic_tables.get(id(step))
             if entry is None or entry[0] is not step:
                 if len(self._critic_tables) > 64:
@@ -200,11 +202,9 @@ class Recorder:
                 entry = (step, table, done)
                 self._critic_tables[id(step)] = entry
             _, table, done = entry
-            wanted = np.asarray(shortlist, dtype=np.int64)
             missing = wanted[~done[batch_idx, wanted]]
             if len(missing):  # (not expected: the router asked about a pair outside the mask) computed on demand, never read as zero
-                rows = batch_idx * actions + missing
-                table.view(-1)[torch.as_tensor(rows)] = critic_rows(step, rows)
+                table.view(-1)[torch.as_tensor(batch_idx * actions + missing)] = critic_rows(step, batch_idx * actions + missing)
                 done[batch_idx, missing] = True
             return table[batch_idx, wanted]
 
@@ -223,6 +223,7 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     """Labels a batch of loaded trajectories in lockstep; returns one dict of arrays per trajectory."""
     import torch
     from metamon.interface import UniversalAction, UniversalState
+    from metamon.rl.experimental.ensemble.ensemble import _EnsembleHiddenState, _StallTrackerState
 
     from metamon.recurrent import fast_tstep
 
@@ -233,8 +234,8 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     lanes = len(trajectories)
     spaces = [copy.deepcopy(spec.observation_space) for _ in range(lanes)]
     # Exeggcute reads what the ORIGINAL parser produced (it was trained on that); see merge_legacy.py
-    # (from_dict rewrites the dict it is given, and the encoder timing labels the same trajectories twice: it gets a copy)
-    states = [[UniversalState.from_dict(copy.deepcopy(s)) for s in t["legacy_states"]] for t in trajectories]
+    # (from_dict rewrites the dicts it is given: the trajectories are consumed; the encoder timing passes copies)
+    states = [[UniversalState.from_dict(s) for s in t["legacy_states"]] for t in trajectories]
     lengths = [len(s) - 1 for s in states]  # a decision per state but the last
     horizon = max(lengths)
     for sp in spaces:
@@ -247,8 +248,10 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     ]
     prev_action = np.zeros((lanes, n_actions), np.float32)
     prev_reward = np.zeros(lanes, np.float32)
-    hidden = None
     last_obs: list = [None] * lanes
+    # Phase 1: everything the members read, for every step. None of it depends on what the models output (the RL2 input is the replay's
+    # own action and reward), so the steps can be prepared first.
+    steps = []
     for t in range(horizon):
         obs_list, legal_list = [], []
         for i in range(lanes):
@@ -284,33 +287,11 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
         # device once per step.
         batch = {k: torch.as_tensor(np.stack([o[k] for o in obs_list]))[:, None] for k in obs_list[0]}
         rl2 = torch.as_tensor(np.concatenate([prev_reward[:, None], prev_action], axis=1)).view(lanes, 1, -1)
-        time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long)
-        recorder.record.clear()
-        recorder.row_mask = np.zeros((lanes, n_actions), bool)
+        row_mask = np.zeros((lanes, n_actions), bool)
         for i in range(lanes):
             if t < lengths[i] and len(legal_list[i]) > 1:  # (finished lanes and forced decisions never reach the critic)
-                recorder.row_mask[i, legal_list[i]] = True
-        with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
-            actions, hidden = policy.get_actions(batch, rl2, time_idxs, hidden_state=hidden, sample=False)
-        actions = actions.reshape(lanes).tolist()
-        for i in range(lanes):
-            if t >= lengths[i]:
-                continue
-            rec = recorder.record.get(i)
-            o = out[i]
-            o["chosen"][t] = actions[i]
-            if rec is not None:
-                o["judge_calls"][t] = rec["judge_calls"]
-                if "blend" in rec:
-                    o["blend"][t] = rec["blend"]
-                    o["has_blend"][t] = True
-                if "judge" in rec:
-                    o["judge"][t] = rec["judge"]
-                    o["has_judge"][t] = True
-            # a trajectory decision with one legal action has no router work; its label is that action
-            if len(legal_list[i]) == 1:
-                o["blend"][t, legal_list[i][0]] = 1.0
-                o["has_blend"][t] = True
+                row_mask[i, legal_list[i]] = True
+        steps.append((batch, rl2, legal_list, row_mask))
         # the next step's RL2 input: reward of this transition, action actually played in the replay
         for i in range(lanes):
             if t < lengths[i]:
@@ -319,7 +300,102 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
                 if a >= 0:
                     prev_action[i, action_space.action_to_agent_output(states[i][t], UniversalAction(action_idx=a))] = 1.0
                 prev_reward[i] = float(spec.reward_function(states[i][t], states[i][t + 1]))
+
+    # Phase 2: the members, over the whole game at once when it fits in their context (the way metamon scores a replay: the
+    # training-style parallel forward equals the step-by-step rollout with a KV cache while no cache slot is rolled out). A game longer
+    # than the context runs step by step.
+    sequence = SEQUENCE and horizon <= SEQUENCE_LIMIT
+    with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
+        restore = member_sequence_outputs(policy, steps) if sequence else None
+        try:
+            hidden = _EnsembleHiddenState(member_hidden=[None] * len(policy.members), stall_trackers=[_StallTrackerState() for _ in range(lanes)]) if sequence else None
+            for t in range(horizon):
+                batch, rl2, legal_list, row_mask = steps[t]
+                recorder.record.clear()
+                recorder.row_mask = row_mask
+                if sequence:
+                    for member in policy.members:
+                        member.policy._label_step = t
+                time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long)
+                actions, hidden = policy.get_actions(batch, rl2, time_idxs, hidden_state=hidden, sample=False)
+                actions = actions.reshape(lanes).tolist()
+                for i in range(lanes):
+                    if t >= lengths[i]:
+                        continue
+                    rec = recorder.record.get(i)
+                    o = out[i]
+                    o["chosen"][t] = actions[i]
+                    if rec is not None:
+                        o["judge_calls"][t] = rec["judge_calls"]
+                        if "blend" in rec:
+                            o["blend"][t] = rec["blend"]
+                            o["has_blend"][t] = True
+                        if "judge" in rec:
+                            o["judge"][t] = rec["judge"]
+                            o["has_judge"][t] = True
+                    # a trajectory decision with one legal action has no router work; its label is that action
+                    if len(legal_list[i]) == 1:
+                        o["blend"][t, legal_list[i][0]] = 1.0
+                        o["has_blend"][t] = True
+        finally:
+            if restore is not None:
+                restore()
     return out
+
+
+SEQUENCE = os.environ.get("LABEL_SEQUENCE", "1") == "1"
+# Longer games run step by step. A game longer than the KV cache (128) is fine in one pass: the attention window is 32 steps, so
+# everything the rolled cache drops is out of reach anyway (checked: same labels as the step-by-step rollout).
+SEQUENCE_LIMIT = int(os.environ.get("LABEL_SEQUENCE_LIMIT", "400"))
+SEQUENCE_ROWS = int(os.environ.get("LABEL_SEQUENCE_ROWS", "24576"))  # lane-steps per parallel forward (bounds the activation memory)
+
+
+def member_sequence_outputs(policy, steps):
+    """Runs every member over the whole prepared game and makes its per-step calls return the matching slice.
+
+    The router (ensemble.get_actions, unchanged) calls `policy.get_state_embedding` and `policy.actor` of each member once per step; for the
+    duration of the game those two return the state embedding and action distribution of step `_label_step` from one parallel forward.
+    Returns the function that undoes the replacement."""
+    from types import SimpleNamespace
+
+    obs = {k: torch.cat([step[0][k] for step in steps], dim=1) for k in steps[0][0]}  # [lanes, T, ...]
+    rl2 = torch.cat([step[1] for step in steps], dim=1)
+    lanes, horizon = rl2.shape[:2]
+    time_idxs = torch.arange(horizon).view(1, horizon, 1).expand(lanes, horizon, 1).contiguous()
+    undo = []
+    for member in policy.members:
+        mp = member.policy
+        device = member.device
+        chunk = max(1, SEQUENCE_ROWS // horizon)
+        embs, probs = [], []
+        for a in range(0, lanes, chunk):
+            member_obs = {k: v[a : a + chunk].to(device) for k, v in obs.items()}
+            with torch._dynamo.config.patch(disable=True):  # (the compiled parallel path recompiles per shape; metamon's own scoring turns it off too)
+                emb, _ = mp.get_state_embedding(obs=member_obs, rl2s=rl2[a : a + chunk].to(device), time_idxs=time_idxs[a : a + chunk].to(device), hidden_state=None)
+            dist = mp.actor(emb, straight_from_obs={k: member_obs[k] for k in mp.pass_obs_keys_to_actor})
+            embs.append(emb.detach())
+            probs.append(dist.probs.detach())  # [chunk, T, gammas, actions]
+        emb_all = embs[0] if len(embs) == 1 else torch.cat(embs)
+        probs_all = probs[0] if len(probs) == 1 else torch.cat(probs)
+
+        def get_state_embedding(obs=None, rl2s=None, time_idxs=None, hidden_state=None, _mp=mp, _emb=emb_all):
+            t = _mp._label_step
+            return _emb[:, t : t + 1], hidden_state
+
+        def actor_forward(*args, _mp=mp, _probs=probs_all, **kwargs):
+            t = _mp._label_step
+            return SimpleNamespace(probs=_probs[:, t : t + 1])
+
+        mp.get_state_embedding = get_state_embedding
+        mp.actor.forward = actor_forward
+        undo.append(mp)
+
+    def restore():
+        for mp in undo:
+            del mp.get_state_embedding  # (the class's method shows through again)
+            del mp.actor.forward  # (likewise the module's own)
+
+    return restore
 
 
 def pick_encoder(spec, policy, recorder, trajectories: list[dict], half, steps: int = 10) -> None:
@@ -331,10 +407,10 @@ def pick_encoder(spec, policy, recorder, trajectories: list[dict], half, steps: 
     elapsed = {}
     for name in ("fast", "exact"):
         fast_tstep.enable(policy, name == "fast")
-        label_batch(spec, policy, recorder, short, half)
+        label_batch(spec, policy, recorder, copy.deepcopy(short), half)
         _sync(policy)
         start = time.perf_counter()
-        label_batch(spec, policy, recorder, short, half)
+        label_batch(spec, policy, recorder, copy.deepcopy(short), half)
         _sync(policy)
         elapsed[name] = time.perf_counter() - start
     use_fast = elapsed["fast"] <= 1.05 * elapsed["exact"]
