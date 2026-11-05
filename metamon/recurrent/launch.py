@@ -330,15 +330,18 @@ class Launcher:
         # label, a few processes per GPU (each is mostly Python overhead around small batches)
         gpus = max(1, len(self.gpus))
         # the router's per-game loop is Python on one core, so labelling is CPU-bound: about one process per core, a core left free
-        per_gpu = a.label_procs or max(2, min(8, (self.cpus - 1) // gpus)) if self.gpus else 1
+        # On a GPU the math is a few large calls per batch and the router/critic scoring is small Python-driven work, so a few processes
+        # per GPU overlap one's Python with another's kernels. Each holds ~1 GiB of weights plus activations (about 4 GiB at the default
+        # row budget), so the count is also capped by memory: a 24 GiB card gets 3. A guess, not a measurement: --smoke prints decisions/s.
+        per_gpu = a.label_procs or max(1, min(3, (self.cpus - 1) // gpus, int((self.gpus[0]["mem"] - 2) // 6))) if self.gpus else 1
         shards = gpus * per_gpu
-        threads = max(1, self.cpus // shards) if not self.gpus else max(1, min(4, self.cpus // shards))
+        threads = max(1, self.cpus // shards) if not self.gpus else max(1, min(2, self.cpus // shards))
         stage = f"label_{name}"
         cmds, envs = [], []
         for k in range(shards):
             cmds.append([self.py, "-m", "metamon.recurrent.label", traj, labels, "--cache", self.cache, "--batch", str(a.label_batch or (256 if self.gpus else 64)),
                          "--device", self.device, "--threads", str(threads), "--precision", self.precision if self.gpus else "fp32", "--shard", f"{k}/{shards}"])
-            envs.append(self.env(HF_HUB_OFFLINE=1, **({"CUDA_VISIBLE_DEVICES": k % gpus} if self.gpus else {})))
+            envs.append(self.env(HF_HUB_OFFLINE=1, **({"CUDA_VISIBLE_DEVICES": k % gpus, "LABEL_SEQUENCE_ROWS": a.label_rows or 16384} if self.gpus else {})))
         self.run_parallel(stage, cmds, envs, lambda: f"{self.count_files(labels, '.npz')} of {n_traj} labelled")
         self.log(f"{name}: labelled {self.count_files(labels, '.npz')} trajectories")
 
@@ -440,7 +443,8 @@ def main() -> None:
     ap.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--parse-procs", type=int, default=0, help="parser processes (default: one per CPU)")
-    ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: one per core, 2 to 8)")
+    ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: 3 on a 24 GiB card, fewer with less memory or CPUs)")
+    ap.add_argument("--label-rows", type=int, default=0, help="game-turns per parallel forward on a GPU (default 16384; lower it if a card runs out of memory)")
     ap.add_argument("--label-batch", type=int, default=0, help="games labelled in lockstep per process (default 256 on a GPU, 64 on a CPU: the lanes of a lockstep batch that finished early still cost their share of the math, and a CPU gains little from larger batches)")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()
