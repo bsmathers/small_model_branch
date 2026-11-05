@@ -336,7 +336,7 @@ class Launcher:
         stage = f"label_{name}"
         cmds, envs = [], []
         for k in range(shards):
-            cmds.append([self.py, "-m", "metamon.recurrent.label", traj, labels, "--cache", self.cache, "--batch", str(a.label_batch),
+            cmds.append([self.py, "-m", "metamon.recurrent.label", traj, labels, "--cache", self.cache, "--batch", str(a.label_batch or (256 if self.gpus else 64)),
                          "--device", self.device, "--threads", str(threads), "--precision", self.precision if self.gpus else "fp32", "--shard", f"{k}/{shards}"])
             envs.append(self.env(HF_HUB_OFFLINE=1, **({"CUDA_VISIBLE_DEVICES": k % gpus} if self.gpus else {})))
         self.run_parallel(stage, cmds, envs, lambda: f"{self.count_files(labels, '.npz')} of {n_traj} labelled")
@@ -441,7 +441,7 @@ def main() -> None:
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--parse-procs", type=int, default=0, help="parser processes (default: one per CPU)")
     ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: one per core, 2 to 8)")
-    ap.add_argument("--label-batch", type=int, default=256, help="games labelled in lockstep per process")
+    ap.add_argument("--label-batch", type=int, default=0, help="games labelled in lockstep per process (default 256 on a GPU, 64 on a CPU: the lanes of a lockstep batch that finished early still cost their share of the math, and a CPU gains little from larger batches)")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()
     args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)

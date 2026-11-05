@@ -162,34 +162,54 @@ class Recorder:
         # value of EVERY action of a state. Computing that table for all games of the step at once, then reading the shortlist
         # rows, is the same arithmetic in one call per member instead of one per game and candidate.
         self._critic_tables: dict[int, tuple] = {}
+        self.row_mask = None  # [games, actions] bool, set by label_batch each step: the (game, action) pairs the router can ask about
         score_one = policy._score_candidates_with_critic
 
-        def critic_table(step) -> torch.Tensor:
-            entry = self._critic_tables.get(id(step))
-            if entry is not None and entry[0] is step:
-                return entry[1]
-            if len(self._critic_tables) > 64:
-                self._critic_tables.clear()
+        def critic_rows(step, rows: np.ndarray) -> torch.Tensor:
+            """The critic value of the given flat (game * actions + action) rows. The critic is a plain per-row network, so a row does
+            not depend on which other rows are evaluated with it."""
             member_policy = step["member"].policy
             traj_emb = step["traj_emb"]  # [games, 1, d]
-            games, actions = traj_emb.shape[0], policy.action_dim
+            actions = policy.action_dim
             device = traj_emb.device
             gammas = len(member_policy.gammas)
-            state = traj_emb.repeat_interleave(actions, dim=0)  # row g * actions + a: state of game g, action a
-            action_tensor = torch.arange(actions, device=device).repeat(games)
-            one_hot = F.one_hot(action_tensor, num_classes=actions).float().view(1, games * actions, 1, 1, actions)
+            index = torch.as_tensor(rows, device=device)
+            state = traj_emb[index // actions]  # [n, 1, d]
+            one_hot = F.one_hot(index % actions, num_classes=actions).float().view(1, len(rows), 1, 1, actions)
             critic_actions = member_policy.actor.policy_dist.action_from_buffer(one_hot.repeat(1, 1, 1, gammas, 1))
             values = member_policy.critics(state, critic_actions)
             if hasattr(member_policy.critics, "bin_dist_to_raw_vals"):
                 values = member_policy.critics.bin_dist_to_raw_vals(values)
             else:
                 values = member_policy.popart(values, normalized=False)
-            table = values.mean(dim=3)[0, :, 0, -1, 0].detach().view(games, actions).float().cpu()
-            self._critic_tables[id(step)] = (step, table)
-            return table
+            return values.mean(dim=3)[0, :, 0, -1, 0].detach().float().cpu()
+
+        def critic_table(step, batch_idx: int, shortlist) -> torch.Tensor:
+            games, actions = step["traj_emb"].shape[0], policy.action_dim
+            entry = self._critic_tables.get(id(step))
+            if entry is None or entry[0] is not step:
+                if len(self._critic_tables) > 64:
+                    self._critic_tables.clear()
+                table = torch.zeros(games, actions)
+                done = np.zeros((games, actions), bool)
+                mask = self.row_mask
+                rows = np.flatnonzero(mask.reshape(-1)) if mask is not None and mask.shape == (games, actions) else np.arange(games * actions)
+                if len(rows):
+                    table.view(-1)[torch.as_tensor(rows)] = critic_rows(step, rows)
+                    done.reshape(-1)[rows] = True
+                entry = (step, table, done)
+                self._critic_tables[id(step)] = entry
+            _, table, done = entry
+            wanted = np.asarray(shortlist, dtype=np.int64)
+            missing = wanted[~done[batch_idx, wanted]]
+            if len(missing):  # (not expected: the router asked about a pair outside the mask) computed on demand, never read as zero
+                rows = batch_idx * actions + missing
+                table.view(-1)[torch.as_tensor(rows)] = critic_rows(step, rows)
+                done[batch_idx, missing] = True
+            return table[batch_idx, wanted]
 
         def score_hook(step, batch_idx, shortlist):
-            return critic_table(step)[batch_idx, shortlist]
+            return critic_table(step, batch_idx, shortlist)
 
         self.exact_critic = score_one  # (the original, kept for the equivalence check)
         policy._score_candidates_with_critic = score_hook
@@ -266,6 +286,10 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
         rl2 = torch.as_tensor(np.concatenate([prev_reward[:, None], prev_action], axis=1)).view(lanes, 1, -1)
         time_idxs = torch.full((lanes, 1, 1), t, dtype=torch.long)
         recorder.record.clear()
+        recorder.row_mask = np.zeros((lanes, n_actions), bool)
+        for i in range(lanes):
+            if t < lengths[i] and len(legal_list[i]) > 1:  # (finished lanes and forced decisions never reach the critic)
+                recorder.row_mask[i, legal_list[i]] = True
         with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
             actions, hidden = policy.get_actions(batch, rl2, time_idxs, hidden_state=hidden, sample=False)
         actions = actions.reshape(lanes).tolist()

@@ -40,10 +40,36 @@ def _encode_independent(enc, text: torch.Tensor, nums: torch.Tensor, slots: torc
     return enc.pokemon_proj(latents)
 
 
+CONTENT_CACHE_MAX = 100_000  # rows per encoder; cleared when full (a row is a few KiB)
+
+
 def _patch(enc) -> None:
     cache = {"text": None, "nums": None, "emb": None}
     enc._pokemon_cache = cache
     slots_all = torch.arange(enc.NUM_POKEMON)
+    # A Pokemon's embedding is a function of its token row, its number row and its slot only. Across games the same rows come back
+    # again and again (a team member at full health, the same set of moves), so the finished embeddings are kept by content.
+    content: dict = {}
+    enc._pokemon_content_cache = content
+
+    def encode_rows(text: torch.Tensor, nums: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+        n = text.shape[0]
+        if n == 0:
+            return _encode_independent(enc, text, nums, slots)
+        if len(content) > CONTENT_CACHE_MAX:
+            content.clear()
+        t, u, sl = text.cpu().numpy(), nums.cpu().numpy(), slots.cpu().numpy()
+        keys = [(t[i].tobytes(), u[i].tobytes(), int(sl[i])) for i in range(n)]
+        missing: dict = {}
+        for i, key in enumerate(keys):
+            if key not in content and key not in missing:
+                missing[key] = i
+        if missing:
+            rows = torch.as_tensor(list(missing.values()), device=text.device)
+            fresh = _encode_independent(enc, text[rows], nums[rows], slots[rows])
+            for key, row in zip(missing, fresh.unbind(0)):
+                content[key] = row
+        return torch.stack([content[key] for key in keys])
 
     def pokemon_embeddings(text: torch.Tensor, nums: torch.Tensor) -> torch.Tensor:
         B, P = text.shape[:2]
@@ -52,7 +78,7 @@ def _patch(enc) -> None:
             same = (cache["text"] == text).all(-1) & (cache["nums"] == nums).all(-1)  # [B, P]
         changed = torch.ones(B, P, dtype=torch.bool, device=text.device) if same is None else ~same
         idx = changed.nonzero(as_tuple=True)
-        fresh = _encode_independent(enc, text[idx], nums[idx], slots_all.to(text.device)[idx[1]])
+        fresh = encode_rows(text[idx], nums[idx], slots_all.to(text.device)[idx[1]])
         if same is None:
             emb = fresh.new_empty(B, P, fresh.shape[-1])
         else:

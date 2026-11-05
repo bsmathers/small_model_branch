@@ -62,8 +62,14 @@ def test_independent_pokemon_encoding_reuses_unchanged_pokemon():
         assert calls == [6, 1]
         assert torch.equal(second[0], first[0]) and torch.equal(second[1, :2], first[1, :2]) and not torch.equal(second[1, 2], first[1, 2])
         fast_tstep.reset(SimpleNamespace(members=[SimpleNamespace(policy=SimpleNamespace(tstep_encoder=enc))]))
-        pokemon_embeddings(text2, nums)
-        assert calls == [6, 1, 6]  # a new batch of games starts from nothing
+        again = pokemon_embeddings(text2, nums)
+        # a new batch of games starts from nothing in the step cache, but rows seen before are served by content
+        assert calls == [6, 1] and torch.equal(again[1, 2], second[1, 2]) and torch.equal(again[0], first[0])
+        text3 = torch.cat([text2[:1], text2[:1]], dim=0)  # two identical games: every row is the same as in the other game
+        fast_tstep.reset(SimpleNamespace(members=[SimpleNamespace(policy=SimpleNamespace(tstep_encoder=enc))]))
+        enc._pokemon_content_cache.clear()
+        pokemon_embeddings(text3, nums[:1].repeat(2, 1, 1))
+        assert calls == [6, 1, 3]  # 6 rows in the call, 3 distinct ones encoded
     finally:
         fast_tstep._encode_independent = original
 
