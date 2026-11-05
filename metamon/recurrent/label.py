@@ -166,17 +166,26 @@ class Recorder:
         score_one = policy._score_candidates_with_critic
 
         def critic_values(member_policy, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-            """Critic value of each (state [n, 1, d], action [n]) row. The critic is a plain per-row network, so a row does not depend on
-            which other rows are evaluated with it."""
+            """Critic value of each (state [n, 1, d], action [n]) row at the test-time discount (the last gamma). The critic network treats
+            every (row, gamma) pair as its own input, so evaluating the one gamma that is read gives its value alone: the other gammas
+            (2 for the large members, 7 for the small ones) were computed and thrown away."""
+            from amago.nets.utils import symlog
+
+            critics = member_policy.critics
             actions = policy.action_dim
-            gammas = len(member_policy.gammas)
-            one_hot = F.one_hot(action, num_classes=actions).float().view(1, len(action), 1, 1, actions)
-            critic_actions = member_policy.actor.policy_dist.action_from_buffer(one_hot.repeat(1, 1, 1, gammas, 1))
-            values = member_policy.critics(state, critic_actions)
-            if hasattr(member_policy.critics, "bin_dist_to_raw_vals"):
-                values = member_policy.critics.bin_dist_to_raw_vals(values)
-            else:
-                values = member_policy.popart(values, normalized=False)
+            n = len(action)
+            one_hot = F.one_hot(action, num_classes=actions).float().view(1, n, 1, 1, actions)
+            critic_actions = member_policy.actor.policy_dist.action_from_buffer(one_hot)  # [1, n, 1, 1, D]
+            if not hasattr(critics, "bin_dist_to_raw_vals") or not hasattr(critics, "net"):  # (another critic head: the generic path)
+                gammas = len(member_policy.gammas)
+                values = critics(state, member_policy.actor.policy_dist.action_from_buffer(one_hot.repeat(1, 1, 1, gammas, 1)))
+                values = critics.bin_dist_to_raw_vals(values) if hasattr(critics, "bin_dist_to_raw_vals") else member_policy.popart(values, normalized=False)
+                return values.mean(dim=3)[0, :, 0, -1, 0].detach().float().cpu()
+            gamma = symlog(1.0 / (1.0 - critics.gammas[-1:]).clamp(1e-6, 1.0)).to(state.device, state.dtype).view(1, 1, 1).expand(n, 1, 1)
+            inp = torch.cat((state, gamma, critic_actions.clamp(-0.999, 0.999).reshape(n, 1, -1)), dim=-1)
+            outputs, _ = critics.net(inp)  # [n, 1, critics, bins]
+            dist = torch.distributions.Categorical(logits=outputs.unsqueeze(0).unsqueeze(4))  # [1, n, 1, critics, 1 gamma, bins]
+            values = critics.bin_dist_to_raw_vals(dist)  # [1, n, 1, critics, 1, 1]
             return values.mean(dim=3)[0, :, 0, -1, 0].detach().float().cpu()
 
         def critic_rows(step, rows: np.ndarray) -> torch.Tensor:
@@ -367,11 +376,16 @@ def member_sequence_outputs(policy, steps):
         mp = member.policy
         device = member.device
         chunk = max(1, SEQUENCE_ROWS // horizon)
+        encoder = mp.tstep_encoder
         embs, probs = [], []
         for a in range(0, lanes, chunk):
             member_obs = {k: v[a : a + chunk].to(device) for k, v in obs.items()}
-            with torch._dynamo.config.patch(disable=True):  # (the compiled parallel path recompiles per shape; metamon's own scoring turns it off too)
-                emb, _ = mp.get_state_embedding(obs=member_obs, rl2s=rl2[a : a + chunk].to(device), time_idxs=time_idxs[a : a + chunk].to(device), hidden_state=None)
+            encoder._sequence_length = horizon  # (the fast encoder reads whole games in time order: see fast_tstep.sequence_embeddings)
+            try:
+                with torch._dynamo.config.patch(disable=True):  # (the compiled parallel path recompiles per shape; metamon's own scoring turns it off too)
+                    emb, _ = mp.get_state_embedding(obs=member_obs, rl2s=rl2[a : a + chunk].to(device), time_idxs=time_idxs[a : a + chunk].to(device), hidden_state=None)
+            finally:
+                encoder._sequence_length = 0
             dist = mp.actor(emb, straight_from_obs={k: member_obs[k] for k in mp.pass_obs_keys_to_actor})
             embs.append(emb.detach())
             probs.append(dist.probs.detach())  # [chunk, T, gammas, actions]
@@ -470,9 +484,15 @@ def main() -> None:
         pick_encoder(spec, policy, recorder, [load_trajectory(f) for f in files[len(files) // 2 : len(files) // 2 + args.batch]], half)
     done = decisions = 0
     start = time.time()
-    for b in range(0, len(files), args.batch):
-        group = files[b : b + args.batch]
-        trajectories = [load_trajectory(f) for f in group]
+    from concurrent.futures import ThreadPoolExecutor
+
+    groups = [files[b : b + args.batch] for b in range(0, len(files), args.batch)]
+    loader = ThreadPoolExecutor(max_workers=1)  # reads (decompresses, parses) the next group while this one is labelled
+    pending = loader.submit(lambda g: [load_trajectory(f) for f in g], groups[0]) if groups else None
+    for gi, group in enumerate(groups):
+        trajectories = pending.result()
+        if gi + 1 < len(groups):
+            pending = loader.submit(lambda g: [load_trajectory(f) for f in g], groups[gi + 1])
         results = label_batch(spec, policy, recorder, trajectories, half=half)
         for f, r in zip(group, results):
             np.savez_compressed(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"), **r)

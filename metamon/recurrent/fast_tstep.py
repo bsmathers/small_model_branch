@@ -71,7 +71,29 @@ def _patch(enc) -> None:
                 content[key] = row
         return torch.stack([content[key] for key in keys])
 
+    def sequence_embeddings(text: torch.Tensor, nums: torch.Tensor, length: int) -> torch.Tensor:
+        """Rows laid out as [games * length, P, ...] (whole games in time order): only a Pokemon whose tokens or numbers differ from the
+        previous turn of the same game is looked up / encoded; the others copy the previous turn's embedding."""
+        N, P = text.shape[:2]
+        games = N // length
+        t = text.view(games, length, P, -1)
+        u = nums.view(games, length, P, -1)
+        changed = torch.ones(games, length, P, dtype=torch.bool, device=text.device)
+        changed[:, 1:] = ~((t[:, 1:] == t[:, :-1]).all(-1) & (u[:, 1:] == u[:, :-1]).all(-1))
+        idx = changed.nonzero(as_tuple=True)  # (game, turn, slot)
+        fresh = encode_rows(t[idx], u[idx], slots_all.to(text.device)[idx[2]])
+        emb = fresh.new_zeros(games, length, P, fresh.shape[-1])
+        emb[idx] = fresh
+        turn = torch.arange(length, device=text.device).view(1, length, 1).expand(games, length, P)
+        source = torch.where(changed, turn, torch.full_like(turn, -1)).cummax(dim=1).values  # the latest changed turn at or before this one
+        emb = torch.gather(emb, 1, source.unsqueeze(-1).expand(-1, -1, -1, emb.shape[-1]))
+        cache["text"] = None  # (the step cache belongs to step-by-step use)
+        return emb.view(N, P, -1)
+
     def pokemon_embeddings(text: torch.Tensor, nums: torch.Tensor) -> torch.Tensor:
+        length = getattr(enc, "_sequence_length", 0)
+        if length > 1 and text.shape[0] % length == 0:
+            return sequence_embeddings(text, nums, length)
         B, P = text.shape[:2]
         same = None
         if cache["text"] is not None and cache["text"].shape == text.shape and cache["nums"].shape == nums.shape and cache["text"].device == text.device:

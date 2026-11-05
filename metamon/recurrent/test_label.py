@@ -17,6 +17,7 @@ class FakePolicy:
 
     def __init__(self):
         self.actor = FakeActor()
+        self.tstep_encoder = SimpleNamespace(_sequence_length=0)
         self.calls = 0
 
     def get_state_embedding(self, obs, rl2s, time_idxs, hidden_state=None):

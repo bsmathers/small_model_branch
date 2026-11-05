@@ -74,6 +74,41 @@ def test_independent_pokemon_encoding_reuses_unchanged_pokemon():
         fast_tstep._encode_independent = original
 
 
+def test_sequence_embeddings_copy_unchanged_pokemon_from_the_previous_turn():
+    calls = []
+
+    class Enc(nn.Module):
+        NUM_POKEMON = 3
+        _pokemon_role_emb = None
+
+    enc = Enc()
+    original = fast_tstep._encode_independent
+    fast_tstep._encode_independent = lambda e, text, nums, slots: (calls.append(len(text)), text.float().sum(-1, keepdim=True) * 10 + nums.sum(-1, keepdim=True) + slots[:, None].float())[1]
+    try:
+        for name in ("extra_emb", "entity_type_emb", "fusion", "fusion_out_norm"):
+            setattr(enc, name, nn.Identity())
+        enc._entity_type_ids = torch.zeros(1)
+        enc._encode_global = lambda *a, **k: None
+        fast_tstep._patch(enc)
+        pokemon_embeddings = [c.cell_contents for c in enc._fast_impl.__closure__ if callable(c.cell_contents) and getattr(c.cell_contents, "__name__", "") == "pokemon_embeddings"][0]
+        games, length, P = 2, 4, 3
+        text = torch.randint(0, 50, (games, length, P, 2))
+        nums = torch.zeros(games, length, P, 1)
+        text[:, 1:] = text[:, :1]  # nothing changes after the first turn ...
+        text[0, 3, 1] += 1  # ... except one Pokemon of game 0 on its last turn
+        flat_t, flat_n = text.reshape(games * length, P, 2), nums.reshape(games * length, P, 1)
+        enc._sequence_length = length
+        fast = pokemon_embeddings(flat_t, flat_n)
+        enc._sequence_length = 0
+        enc._pokemon_content_cache.clear()
+        reference = pokemon_embeddings(flat_t, flat_n)  # the plain path: every row looked up on its own
+        assert torch.equal(fast, reference)
+        # (each of the 6 first-turn Pokemon, plus the one that changed: 7 rows, fewer than the 24 in the batch)
+        assert calls[0] <= 7
+    finally:
+        fast_tstep._encode_independent = original
+
+
 def test_cache_mirror_rolls_exactly_like_the_original_update():
     from amago.nets import transformer
 
