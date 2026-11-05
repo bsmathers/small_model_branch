@@ -499,7 +499,14 @@ def main() -> None:
     )
     ap.add_argument("--shard", default="0/1", help="i/n: label every n-th file starting at i")
     args = ap.parse_args()
+    import signal
+
     import torch
+
+    # Ctrl-C reaches every process of the run; stop at once (the loader thread and CUDA calls would otherwise hold the exit up).
+    # Nothing is lost: finished games are on disk, and each file is renamed into place only when complete.
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: os._exit(130))
 
     files = sorted(glob.glob(os.path.join(args.input, "**", "*.json.lz4"), recursive=True))
     i, n = map(int, args.shard.split("/"))
@@ -536,7 +543,10 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # (games of different lengths leave differently sized blocks cached: each process would only ever grow)
         for f, r in zip(group, results):
-            np.savez_compressed(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"), **r)
+            final = os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz")
+            with open(final + ".part", "wb") as handle:  # (written aside and renamed: a stop in the middle never leaves a half file that a rerun would skip)
+                np.savez_compressed(handle, **r)
+            os.replace(final + ".part", final)
         done += len(group)
         decisions += sum(len(r["chosen"]) for r in results)
         print(f"labelled {done}/{len(files)} games, {time.time() - start:.0f}s ({decisions / max(time.time() - start, 1e-9):.0f} decisions/s)", flush=True)

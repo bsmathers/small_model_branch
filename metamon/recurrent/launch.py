@@ -56,6 +56,24 @@ class Launcher:
         env.update({k: str(v) for k, v in extra.items()})
         return env
 
+    @staticmethod
+    def stop(procs, grace: float = 15.0) -> None:
+        """Stops the children (Ctrl-C, or one of them failed): ask, wait a little, then kill what is left. Returns when none is running."""
+        for p, _ in procs:
+            if p.poll() is None:
+                p.terminate()
+        deadline = time.time() + grace
+        try:
+            for p, _ in procs:
+                while p.poll() is None and time.time() < deadline:
+                    time.sleep(0.1)
+        except KeyboardInterrupt:  # (a second Ctrl-C: do not wait)
+            pass
+        for p, _ in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+
     def run_parallel(self, stage: str, commands: list[list[str]], envs: list[dict], progress=None) -> None:
         """Runs the commands at once, one log file each, and stops everything if one fails."""
         start = time.time()
@@ -65,8 +83,7 @@ class Launcher:
             try:
                 procs.append((subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT), handle))
             except BlockingIOError as e:
-                for p, _ in procs:
-                    p.terminate()
+                self.stop(procs)
                 raise RuntimeError(
                     f"{stage}: the container refused to start process {i + 1} of {len(commands)} ({e}); it limits processes or memory. "
                     f"Re-run with fewer, e.g. --parse-procs 4 --label-procs 1."
@@ -82,9 +99,7 @@ class Launcher:
                 if failed:
                     raise RuntimeError(f"{stage} shard {failed[0]} failed; see {self.logs}/{stage}_{failed[0]}.txt")
         except BaseException:
-            for p, _ in procs:
-                if p.poll() is None:
-                    p.terminate()
+            self.stop(procs)
             raise
         finally:
             for _, h in procs:
@@ -332,6 +347,7 @@ class Launcher:
         # cores (hyperthreads count half) and by memory: a process holds ~1 GiB of weights plus activations (one process reached 5.9 GiB at 16384 rows; 8192 rows is a guess at about half) and the
         # caching allocator grows with the longest game it meets (expandable segments and a cache release after each batch keep that in check).
         # A 24 GiB card gets 5 with 10 or more CPUs. Still a guess: the GPU memory in nvidia-smi and the labelled count over a few minutes tell.
+        gpus = max(1, len(self.gpus))
         per_gpu = a.label_procs or max(1, min(self.cpus // 2 // gpus, int((self.gpus[0]["mem"] - 2) // 4))) if self.gpus else 1
         shards = gpus * per_gpu
         threads = max(1, self.cpus // shards) if not self.gpus else max(1, min(2, self.cpus // shards))
@@ -454,6 +470,13 @@ def main() -> None:
         args.steps, args.val_every, args.save_every, args.val_batches = min(args.steps, 150), 75, 150, 20
         args.val_fraction = min(args.val_fraction, 5)
         args.work = args.work.rstrip("/") + "_smoke"
+    import signal
+
+    def interrupt(*_):  # (Ctrl-C and `kill`/`pkill` both stop the workers: the stage loop handles the interrupt)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, interrupt)  # (also when started in the background, where SIGINT begins ignored)
+    signal.signal(signal.SIGTERM, interrupt)
     Launcher(args).main()
 
 
