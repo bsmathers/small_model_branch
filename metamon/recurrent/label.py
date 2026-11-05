@@ -194,28 +194,34 @@ class Recorder:
             index = torch.as_tensor(rows, device=traj_emb.device)
             return critic_values(step["member"].policy, traj_emb[index // policy.action_dim], index % policy.action_dim)
 
-        def critic_table(step, batch_idx: int, shortlist) -> torch.Tensor:
+        def critic_numbers(step, batch_idx: int, wanted: np.ndarray) -> np.ndarray:
+            """The step's critic values of `wanted` actions of one game (the table is built for the whole step at the first read)."""
             games, actions = step["traj_emb"].shape[0], policy.action_dim
-            wanted = np.asarray(shortlist, dtype=np.int64)
             entry = self._critic_tables.get(id(step))
             if entry is None or entry[0] is not step:
                 if len(self._critic_tables) > 64:
                     self._critic_tables.clear()
-                table = torch.zeros(games, actions)
+                table = np.zeros((games, actions), np.float32)
                 done = np.zeros((games, actions), bool)
                 mask = self.row_mask
                 rows = np.flatnonzero(mask.reshape(-1)) if mask is not None and mask.shape == (games, actions) else np.arange(games * actions)
                 if len(rows):
-                    table.view(-1)[torch.as_tensor(rows)] = critic_rows(step, rows)
+                    table.reshape(-1)[rows] = critic_rows(step, rows).numpy()
                     done.reshape(-1)[rows] = True
                 entry = (step, table, done)
                 self._critic_tables[id(step)] = entry
             _, table, done = entry
             missing = wanted[~done[batch_idx, wanted]]
             if len(missing):  # (not expected: the router asked about a pair outside the mask) computed on demand, never read as zero
-                table.view(-1)[torch.as_tensor(batch_idx * actions + missing)] = critic_rows(step, batch_idx * actions + missing)
+                table.reshape(-1)[batch_idx * actions + missing] = critic_rows(step, batch_idx * actions + missing).numpy()
                 done[batch_idx, missing] = True
             return table[batch_idx, wanted]
+
+        def critic_table(step, batch_idx: int, shortlist) -> torch.Tensor:
+            return torch.from_numpy(critic_numbers(step, batch_idx, np.asarray(shortlist, dtype=np.int64)))
+
+        self.critic_list = lambda step, batch_idx, shortlist: critic_numbers(step, batch_idx, np.asarray(shortlist, dtype=np.int64)).tolist()
+        self.n_slots = N_SLOTS
 
         def score_hook(step, batch_idx, shortlist):
             return critic_table(step, batch_idx, shortlist)
@@ -226,6 +232,38 @@ class Recorder:
         policy._build_proposer_variants = build_hook
         policy._judge_shortlist = judge_hook
         policy._choose_action_for_batch = choose_hook
+        self.exact_hooks = choose_hook
+        if FAST_ROUTER:
+            from metamon.recurrent import fast_router
+
+            fast_router.install(policy, self)
+            fast_choose = policy._choose_action_for_batch
+
+            def fast_hook(**kw):
+                chosen = fast_choose(**kw)
+                idx = kw["batch_idx"]
+                rec = {"chosen": int(chosen), "judge_calls": self.judge_calls}
+                mask = np.zeros(N_SLOTS)
+                mask[[a for a in kw["legal_actions"] if a < N_SLOTS]] = 1.0
+                blend = np.zeros(N_SLOTS, np.float64)
+                for weight, row in zip(self.last_weights, self.last_rows):
+                    if weight <= 0:
+                        continue
+                    p = np.asarray(row[:N_SLOTS], np.float64) * mask
+                    blend += weight * p / max(p.sum(), 1e-12)
+                if blend.sum() > 0:
+                    rec["blend"] = blend / blend.sum()
+                shortlist, scores = self.last_judge
+                z = np.asarray(scores, np.float64)
+                e = np.exp(z - z.max())
+                e /= e.sum()
+                judge_p = np.zeros(N_SLOTS, np.float64)
+                judge_p[shortlist] = e
+                rec["judge"] = judge_p
+                self.record[idx] = rec
+                return chosen
+
+            policy._choose_action_for_batch = fast_hook
 
 
 def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> list[dict]:
@@ -353,6 +391,7 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
 
 
 SEQUENCE = os.environ.get("LABEL_SEQUENCE", "1") == "1"
+FAST_ROUTER = os.environ.get("LABEL_FAST_ROUTER", "1") == "1"  # the plain-Python router decision (fast_router.py); 0 runs the router's own
 # Longer games run step by step. A game longer than the KV cache (128) is fine in one pass: the attention window is 32 steps, so
 # everything the rolled cache drops is out of reach anyway (checked: same labels as the step-by-step rollout).
 SEQUENCE_LIMIT = int(os.environ.get("LABEL_SEQUENCE_LIMIT", "400"))
@@ -494,6 +533,8 @@ def main() -> None:
         if gi + 1 < len(groups):
             pending = loader.submit(lambda g: [load_trajectory(f) for f in g], groups[gi + 1])
         results = label_batch(spec, policy, recorder, trajectories, half=half)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # (games of different lengths leave differently sized blocks cached: each process would only ever grow)
         for f, r in zip(group, results):
             np.savez_compressed(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"), **r)
         done += len(group)
