@@ -14,7 +14,7 @@ its last checkpoint, so a stopped run is continued by starting the same command 
 text in WORK/logs (one file per stage and shard) and in WORK/logs/launch.txt.
 
 Layout under WORK: hf/ (downloaded zips), raw/<source>/ (logs), metamon-cache/ (checkpoints, usage stats),
-<source>/{trajectories,labels,built}, tables/, run/ (checkpoints; weights_<step>.pt is the model).
+<source>/{trajectories,labels,built}, tables/, run/ (policy stage) and run_value/ (value stage; weights_<step>.pt is the model).
 """
 
 from __future__ import annotations
@@ -409,22 +409,37 @@ class Launcher:
         self.counts[name] = (wanted, n_traj)
 
     def train(self) -> None:
+        """Two stages: the policy (distillation and imitation; the win head gets no gradient), then the win head, with the backbone held
+        near the first stage's policy by a KL penalty (--anchor-weight). --value-steps 0 trains both at once in a single stage."""
         a = self.args
         out = os.path.join(self.work, "run")
+        if a.value_steps <= 0:
+            self.train_stage(out, a.steps, ["--stage", "joint"])
+            return
+        self.train_stage(out, a.steps, ["--stage", "policy"])
+        weights = os.path.join(out, f"weights_{a.steps}.pt")
+        if not os.path.exists(weights):
+            raise RuntimeError(f"the policy stage left no {weights}")
+        self.train_stage(os.path.join(self.work, "run_value"), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight), "--lr", str(a.value_lr)])
+
+    def train_stage(self, out: str, steps: int, extra: list[str]) -> None:
+        a = self.args
         cmd = [self.py, "-m", "metamon.recurrent.train", out]
         for name, weight in self.mix.items():
             cmd += ["--source", f"{name}={os.path.join(self.work, name, 'built')}:{weight}"]
-        cmd += ["--steps", str(a.steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
+        cmd += ["--steps", str(steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
                 "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--bc-weight", str(a.bc_weight), "--lr", str(a.lr), "--ckpt-every", str(a.ckpt_every),
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
-        self.log(f"training {a.steps} steps; progress in {out}/log.txt")
-        self.run_one("train", cmd, self.env(HF_HUB_OFFLINE=1))
+        cmd += extra  # (later flags win: the value stage's --lr replaces the default one)
+        stage = extra[1]
+        self.log(f"training ({stage} stage) {steps} steps; progress in {out}/log.txt")
+        self.run_one("train" if stage != "value" else "train_value", cmd, self.env(HF_HUB_OFFLINE=1))
 
     def summary(self) -> None:
         a = self.args
-        out = os.path.join(self.work, "run")
+        out = os.path.join(self.work, "run_value" if a.value_steps > 0 else "run")
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_")), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
@@ -447,8 +462,8 @@ class Launcher:
             t = sum(v for k, v in self.timings.items() if k.startswith(stage + "_"))
             work = max(t - startup[stage] * len(sources), 0.3 * t)
             parts.append((stage, work * scale_games))
-        t_train = self.timings.get("train", 0.0)
-        parts.append((f"train ({a.full_steps} steps)", t_train / max(1, a.steps) * a.full_steps))
+        t_train = self.timings.get("train", 0.0) + self.timings.get("train_value", 0.0)
+        parts.append((f"train ({a.full_steps} steps)", t_train / max(1, a.steps + a.value_steps) * (a.full_steps + a.value_steps)))
         self.log(f"projected for --games {a.full_games} per source and {a.full_steps} steps (hours, rough): " + ", ".join(f"{k} {v / 3600:.1f}" for k, v in parts) + f"; total {sum(v for _, v in parts) / 3600:.1f}")
 
     def main(self) -> None:
@@ -493,6 +508,9 @@ def main() -> None:
     ap.add_argument("--mix", action="append", help="name=weight, e.g. human=0.4 (default human=0.4 strong=0.6; weight 0 skips a source)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
+    ap.add_argument("--value-steps", type=int, default=4000, help="steps of the second stage that trains the win head with the backbone anchored (0: one joint stage)")
+    ap.add_argument("--anchor-weight", type=float, default=5.0, help="(second stage) weight of KL(first-stage policy || current policy)")
+    ap.add_argument("--value-lr", type=float, default=3e-4, help="(second stage) learning rate")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")
     ap.add_argument("--bc-weight", type=float, default=1.0, help="weight of the imitation term on the imitated bots' games")
     ap.add_argument("--bc-players", default="Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3", help="usernames whose played actions are imitated")
@@ -516,6 +534,7 @@ def main() -> None:
         args.cache = args.cache or os.path.join(args.work, "metamon-cache")  # shared with the full run
         args.games = min(args.games, 150)
         args.steps, args.val_every, args.save_every, args.val_batches = min(args.steps, 150), 75, 150, 20
+        args.value_steps = min(args.value_steps, 75)
         args.val_fraction = min(args.val_fraction, 5)
         args.work = args.work.rstrip("/") + "_smoke"
     import signal
