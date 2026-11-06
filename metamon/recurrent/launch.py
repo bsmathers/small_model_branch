@@ -109,17 +109,43 @@ class Launcher:
             raise RuntimeError(f"{stage} shard {bad[0]} failed; see {self.logs}/{stage}_{bad[0]}.txt")
         self.timings[stage] = self.timings.get(stage, 0.0) + time.time() - start
 
-    def run_one(self, stage: str, cmd: list[str], env: dict) -> None:
-        def last_line() -> str:  # (the stage writes to its own log file: show its newest line, so a long stage is not silent)
-            try:
-                with open(os.path.join(self.logs, f"{stage}_0.txt"), "rb") as f:
-                    f.seek(0, os.SEEK_END)
-                    f.seek(max(0, f.tell() - 400))
-                    lines = f.read().decode("utf-8", "replace").strip().splitlines()
-                return lines[-1][:150] if lines else "(no output yet)"
-            except OSError:
-                return "(no log yet)"
+    def start_background(self, stage: str, cmd: list[str], env: dict) -> None:
+        handle = open(os.path.join(self.logs, f"{stage}_0.txt"), "w")
+        self.background.append((stage, subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT), handle, time.time()))
+        self.log(f"{stage}: started in the background (log {self.logs}/{stage}_0.txt)")
 
+    def finish_background(self) -> None:
+        """Waits for the background stages (the builds), showing their newest log line every 30 s."""
+        last = 0.0
+        while any(p.poll() is None for _, p, _, _ in self.background):
+            time.sleep(2)
+            for stage, p, _, _ in self.background:
+                if p.poll() not in (None, 0):
+                    raise RuntimeError(f"{stage} failed; see {self.logs}/{stage}_0.txt")
+            if time.time() - last > 30:
+                last = time.time()
+                for stage, p, _, start in self.background:
+                    if p.poll() is None:
+                        self.log(f"{stage}: {self.newest_line(stage)} ({time.time() - start:.0f}s)")
+        for stage, p, handle, start in self.background:
+            handle.close()
+            if p.returncode != 0:
+                raise RuntimeError(f"{stage} failed; see {self.logs}/{stage}_0.txt")
+            self.log(f"{stage}: done ({time.time() - start:.0f}s): {self.newest_line(stage)}")
+        self.background = []
+
+    def newest_line(self, stage: str) -> str:
+        try:
+            with open(os.path.join(self.logs, f"{stage}_0.txt"), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 400))
+                lines = f.read().decode("utf-8", "replace").strip().splitlines()
+            return lines[-1][:150] if lines else "(no output yet)"
+        except OSError:
+            return "(no log yet)"
+
+    def run_one(self, stage: str, cmd: list[str], env: dict) -> None:
+        last_line = lambda: self.newest_line(stage)  # (a stage writes to its own log file: show its newest line, so a long stage is not silent)
         self.run_parallel(stage, [cmd], [env], last_line)
 
     # ---- stages ----
@@ -370,10 +396,14 @@ class Launcher:
         self.run_parallel(stage, cmds, envs, lambda: f"{self.count_files(labels, '.npz')} of {n_traj} labelled")
         self.log(f"{name}: labelled {self.count_files(labels, '.npz')} trajectories")
 
-        # build
+        # build. It only reads this source's labels, so it runs in the background while the next source downloads and labels (the GPU
+        # is the idle part of labelling, the CPU the busy one: the build slows labelling a little but the two together finish sooner).
         stage = f"build_{name}"
-        self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
-        self.log(f"{name}: built {self.count_files(built, '.npz')} games")
+        if a.smoke or self.args.no_overlap:
+            self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
+            self.log(f"{name}: built {self.count_files(built, '.npz')} games")
+        else:
+            self.start_background(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
         self.counts = getattr(self, "counts", {})
         self.counts[name] = (wanted, n_traj)
 
@@ -429,9 +459,15 @@ class Launcher:
         self.prefetch()
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
         raw = self.fetch_data() if a.from_raw or a.raw_human or a.raw_strong else {}
-        for name in SOURCES:
-            if float(self.mix.get(name, 0)) > 0:
-                self.prepare(name, raw.get(name), a.games)
+        self.background = []
+        try:
+            for name in SOURCES:
+                if float(self.mix.get(name, 0)) > 0:
+                    self.prepare(name, raw.get(name), a.games)
+            self.finish_background()
+        except BaseException:
+            self.stop([(p, h) for _, p, h, _ in self.background])  # (Ctrl-C or a failure: no build is left running)
+            raise
         self.mix = {k: v for k, v in self.mix.items() if float(v) > 0}
         self.train()
         self.summary()
@@ -471,6 +507,7 @@ def main() -> None:
     ap.add_argument("--label-procs", type=int, default=0, help="labelling processes per GPU (default: 5 on a 24 GiB card with 10+ CPUs, fewer with less memory or CPUs)")
     ap.add_argument("--label-rows", type=int, default=0, help="game-turns per parallel forward on a GPU (default 8192; lower it if a card runs out of memory)")
     ap.add_argument("--label-batch", type=int, default=0, help="games labelled in lockstep per process (default 256 on a GPU, 64 on a CPU: the lanes of a lockstep batch that finished early still cost their share of the math, and a CPU gains little from larger batches)")
+    ap.add_argument("--no-overlap", action="store_true", help="build a source after labelling it, instead of in the background while the next source is prepared")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
     args = ap.parse_args()
     args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)
