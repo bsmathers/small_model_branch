@@ -110,7 +110,17 @@ class Launcher:
         self.timings[stage] = self.timings.get(stage, 0.0) + time.time() - start
 
     def run_one(self, stage: str, cmd: list[str], env: dict) -> None:
-        self.run_parallel(stage, [cmd], [env])
+        def last_line() -> str:  # (the stage writes to its own log file: show its newest line, so a long stage is not silent)
+            try:
+                with open(os.path.join(self.logs, f"{stage}_0.txt"), "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - 400))
+                    lines = f.read().decode("utf-8", "replace").strip().splitlines()
+                return lines[-1][:150] if lines else "(no output yet)"
+            except OSError:
+                return "(no log yet)"
+
+        self.run_parallel(stage, [cmd], [env], last_line)
 
     # ---- stages ----
 
