@@ -412,7 +412,7 @@ class Launcher:
         """Two stages: the policy (distillation and imitation; the win head gets no gradient), then the win head, with the backbone held
         near the first stage's policy by a KL penalty (--anchor-weight). --value-steps 0 trains both at once in a single stage."""
         a = self.args
-        out = os.path.join(self.work, "run")
+        out = os.path.join(self.work, a.policy_run)
         if a.value_steps <= 0:
             self.train_stage(out, a.steps, ["--stage", "joint"])
             return
@@ -420,7 +420,7 @@ class Launcher:
         weights = os.path.join(out, "weights_final.pt")
         if not os.path.exists(weights):
             raise RuntimeError(f"the policy stage left no {weights}")
-        self.train_stage(os.path.join(self.work, "run_value"), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight), "--lr", str(a.value_lr)])
+        self.train_stage(os.path.join(self.work, a.value_run), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight), "--lr", str(a.value_lr)])
 
     def train_stage(self, out: str, steps: int, extra: list[str]) -> None:
         a = self.args
@@ -432,8 +432,9 @@ class Launcher:
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
-        if extra[1] != "value":
-            cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
+        cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
+        if a.init and extra[1] != "value":
+            cmd += ["--init", a.init]  # (the first stage starts from these weights; a later restart of the same command resumes from the run's own latest.pt instead)
         cmd += extra  # (later flags win: the value stage's --lr replaces the default one)
         stage = extra[1]
         self.log(f"training ({stage} stage) {steps} steps; progress in {out}/log.txt")
@@ -441,7 +442,7 @@ class Launcher:
 
     def summary(self) -> None:
         a = self.args
-        out = os.path.join(self.work, "run_value" if a.value_steps > 0 else "run")
+        out = os.path.join(self.work, a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
@@ -474,18 +475,24 @@ class Launcher:
         os.makedirs(os.path.join(self.work, "tables"), exist_ok=True)
         if not os.path.exists(os.path.join(self.work, "tables", "species_ids.json")):
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
-        self.prefetch()
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
-        raw = self.fetch_data() if a.from_raw or a.raw_human or a.raw_strong else {}
         self.background = []
-        try:
-            for name in SOURCES:
-                if float(self.mix.get(name, 0)) > 0:
-                    self.prepare(name, raw.get(name), a.games)
-            self.finish_background()
-        except BaseException:
-            self.stop([(p, h) for _, p, h, _ in self.background])  # (Ctrl-C or a failure: no build is left running)
-            raise
+        if a.train_only:  # (the built games of an earlier run are used as they are: no download, labelling or build)
+            for name, weight in self.mix.items():
+                built = os.path.join(self.work, name, "built")
+                if float(weight) > 0 and not (os.path.isdir(built) and any(f.endswith(".npz") for f in os.listdir(built))):
+                    raise SystemExit(f"--train-only: no built games in {built}")
+        else:
+            self.prefetch()
+            raw = self.fetch_data() if a.from_raw or a.raw_human or a.raw_strong else {}
+            try:
+                for name in SOURCES:
+                    if float(self.mix.get(name, 0)) > 0:
+                        self.prepare(name, raw.get(name), a.games)
+                self.finish_background()
+            except BaseException:
+                self.stop([(p, h) for _, p, h, _ in self.background])  # (Ctrl-C or a failure: no build is left running)
+                raise
         self.mix = {k: v for k, v in self.mix.items() if float(v) > 0}
         self.train()
         self.summary()
@@ -511,8 +518,12 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
     ap.add_argument("--value-steps", type=int, default=4000, help="steps of the second stage that trains the win head with the backbone anchored (0: one joint stage)")
-    ap.add_argument("--patience", type=int, default=10, help="(policy or joint stage) stop after this many validations without progress (0: run all --steps)")
-    ap.add_argument("--min-delta", type=float, default=1e-4, help="the smallest drop of the validation KL that counts as progress")
+    ap.add_argument("--patience", type=int, default=10, help="stop a stage after this many validations without progress (0: run all its steps)")
+    ap.add_argument("--min-delta", type=float, default=1e-4, help="the smallest drop of the validation loss that counts as progress (KL in the first stage, win BCE in the second)")
+    ap.add_argument("--train-only", action="store_true", help="skip every data stage and train on the games already built under WORK")
+    ap.add_argument("--init", default=None, help="weights or a checkpoint (e.g. an earlier run's latest.pt) that the first training stage starts from")
+    ap.add_argument("--policy-run", default="run", help="folder under WORK for the first stage's checkpoints and log")
+    ap.add_argument("--value-run", default="run_value", help="folder under WORK for the second stage's")
     ap.add_argument("--anchor-weight", type=float, default=5.0, help="(second stage) weight of KL(first-stage policy || current policy)")
     ap.add_argument("--value-lr", type=float, default=3e-4, help="(second stage) learning rate")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")

@@ -413,6 +413,9 @@ def main() -> None:
         best, bad = resume_state.get("best", math.inf), resume_state.get("bad", 0)
         log(f"resumed at step {step}")
         del resume_state
+        best_path = os.path.join(args.out, "weights_best.pt")
+        if os.path.exists(best_path):
+            best_state = torch.load(best_path, map_location="cpu")
     checkpointer = Checkpointer(latest)
     snapshot_args = vars(args)
 
@@ -424,7 +427,7 @@ def main() -> None:
     running = {"loss": 0.0, "kl": 0.0, "bc": 0.0, "bce": 0.0, "top1": 0.0, "anchor": 0.0, "n": 0}
     try:
         for batch in train_loader:
-            if step >= args.steps:
+            if step >= args.steps or (args.patience > 0 and bad >= args.patience):  # (also on a restart after an early stop)
                 break
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             for g in opt.param_groups:
