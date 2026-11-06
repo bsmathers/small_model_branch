@@ -312,6 +312,7 @@ def main() -> None:
                     help="policy: the win head gets no gradient (distillation and imitation only). value: starts from --init, trains the win head and lets the "
                          "backbone move only as far as --anchor-weight allows, with no policy loss of its own. joint: everything at once")
     ap.add_argument("--init", default=None, help="weights (weights_<step>.pt or a checkpoint) to start from; required for --stage value, and the frozen reference of its anchor")
+    ap.add_argument("--keep-value-head", action="store_true", help="(--stage value) keep the win head of --init instead of re-initialising it")
     ap.add_argument("--value-weight", type=float, default=None, help="weight of the win BCE (default: 0 in the policy stage, else 1)")
     ap.add_argument("--anchor-weight", type=float, default=None, help="weight of KL(first-stage policy || current policy) (default: 5 in the value stage, else 0)")
     ap.add_argument("--target", choices=("mix", "blend", "judge"), default="blend")
@@ -366,6 +367,11 @@ def main() -> None:
         init = torch.load(args.init, map_location="cpu")
         model.load_state_dict(init["model"] if "model" in init else init)
         log(f"initialised from {args.init}")
+        if args.stage == "value" and not args.keep_value_head:
+            for module in model.win.modules():  # (fresh random weights: whatever the first stage's win head learned is discarded)
+                if hasattr(module, "reset_parameters"):
+                    module.reset_parameters()
+            log("win head re-initialised")
     if args.anchor_weight > 0:
         init = torch.load(args.init, map_location="cpu")
         ref = PolicyValueModel().to(device)
