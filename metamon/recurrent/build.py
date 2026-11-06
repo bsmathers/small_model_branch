@@ -167,12 +167,18 @@ def main() -> None:
     args = ap.parse_args()
     os.makedirs(args.output, exist_ok=True)
     jobs = []
+    # one walk of the trajectories (a glob per label is quadratic: 200k labels x 200k files took hours); the first file of a name wins
+    trajectories = {}
+    for root, _, names in sorted(os.walk(args.trajectories)):
+        for name in sorted(names):
+            if name.endswith(".json.lz4"):
+                trajectories.setdefault(name[: -len(".json.lz4")], os.path.join(root, name))
+    built = {n[: -len(".npz")] for n in os.listdir(args.output) if n.endswith(".npz")}
     for label in sorted(glob.glob(os.path.join(args.labels, "*.npz"))):
         stem = os.path.basename(label)[: -len(".npz")]
-        traj = glob.glob(os.path.join(args.trajectories, "**", stem + ".json.lz4"), recursive=True)
-        out = os.path.join(args.output, stem + ".npz")
-        if traj and not os.path.exists(out):
-            jobs.append((traj[0], label, out))
+        if stem in trajectories and stem not in built:
+            jobs.append((trajectories[stem], label, os.path.join(args.output, stem + ".npz")))
+    print(f"{len(jobs)} games to build ({len(built)} already built)", flush=True)
     done = failed = 0
     bc_players = tuple(x for x in args.bc_players.split(",") if x)
     _init(args.tables, bc_players)  # fail here, not in a worker that the pool would respawn forever
