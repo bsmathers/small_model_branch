@@ -417,7 +417,7 @@ class Launcher:
             self.train_stage(out, a.steps, ["--stage", "joint"])
             return
         self.train_stage(out, a.steps, ["--stage", "policy"])
-        weights = os.path.join(out, f"weights_{a.steps}.pt")
+        weights = os.path.join(out, "weights_final.pt")
         if not os.path.exists(weights):
             raise RuntimeError(f"the policy stage left no {weights}")
         self.train_stage(os.path.join(self.work, "run_value"), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight), "--lr", str(a.value_lr)])
@@ -432,6 +432,8 @@ class Launcher:
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
+        if extra[1] != "value":
+            cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
         cmd += extra  # (later flags win: the value stage's --lr replaces the default one)
         stage = extra[1]
         self.log(f"training ({stage} stage) {steps} steps; progress in {out}/log.txt")
@@ -440,10 +442,10 @@ class Launcher:
     def summary(self) -> None:
         a = self.args
         out = os.path.join(self.work, "run_value" if a.value_steps > 0 else "run")
-        weights = sorted((f for f in os.listdir(out) if f.startswith("weights_")), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
+        weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
-            self.log(f"final weights: {os.path.join(out, weights[-1])}")
+            self.log(f"final weights: {os.path.join(out, 'weights_final.pt')}")
         for line in open(os.path.join(out, "log.txt")).read().splitlines()[-6:] if os.path.exists(os.path.join(out, "log.txt")) else []:
             self.log("  " + line)
         if a.smoke:
@@ -509,6 +511,8 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
     ap.add_argument("--value-steps", type=int, default=4000, help="steps of the second stage that trains the win head with the backbone anchored (0: one joint stage)")
+    ap.add_argument("--patience", type=int, default=10, help="(policy or joint stage) stop after this many validations without progress (0: run all --steps)")
+    ap.add_argument("--min-delta", type=float, default=1e-4, help="the smallest drop of the validation KL that counts as progress")
     ap.add_argument("--anchor-weight", type=float, default=5.0, help="(second stage) weight of KL(first-stage policy || current policy)")
     ap.add_argument("--value-lr", type=float, default=3e-4, help="(second stage) learning rate")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")

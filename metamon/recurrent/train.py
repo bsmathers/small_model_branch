@@ -319,6 +319,8 @@ def main() -> None:
     ap.add_argument("--mix", type=float, default=0.5, help="share of the proposer blend in the mixed target")
     ap.add_argument("--val-fraction", type=int, default=20, help="hold out 1 game in N")
     ap.add_argument("--val-every", type=int, default=2000)
+    ap.add_argument("--patience", type=int, default=0, help="stop after this many validations in a row without an improvement of --min-delta (0: run all --steps)")
+    ap.add_argument("--min-delta", type=float, default=1e-4, help="the smallest drop of the monitored validation loss that counts as progress (KL; the win BCE in the value stage)")
     ap.add_argument("--val-batches", type=int, default=0, help="limit validation to N batches (0 = all)")
     ap.add_argument("--save-every", type=int, default=5000, help="steps between numbered weights_<step>.pt snapshots")
     ap.add_argument("--ckpt-every", type=int, default=1, help="steps between writes of latest.pt (model, optimizer, step); 1 = every iteration")
@@ -401,19 +403,21 @@ def main() -> None:
 
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and device.type == "cuda")
     step = 0
+    best, bad, best_state = math.inf, 0, None  # the monitored validation loss, validations since it improved, and the weights that had it
     if resume_state:
         model.load_state_dict(resume_state["model"])
         opt.load_state_dict(resume_state["opt"])
         if "scaler" in resume_state:
             scaler.load_state_dict(resume_state["scaler"])
         step = resume_state["step"]
+        best, bad = resume_state.get("best", math.inf), resume_state.get("bad", 0)
         log(f"resumed at step {step}")
         del resume_state
     checkpointer = Checkpointer(latest)
     snapshot_args = vars(args)
 
     def snapshot() -> dict:
-        return {"model": to_cpu(model.state_dict()), "opt": to_cpu(opt.state_dict()), "scaler": scaler.state_dict(), "step": step, "args": snapshot_args}
+        return {"model": to_cpu(model.state_dict()), "opt": to_cpu(opt.state_dict()), "scaler": scaler.state_dict(), "step": step, "args": snapshot_args, "best": best, "bad": bad}
 
     model.train()
     start, window_start = time.time(), time.time()
@@ -459,6 +463,7 @@ def main() -> None:
                 running = {k: 0.0 for k in running}
                 running["n"] = 0
                 window_start = time.time()
+            stop = False
             if step % args.val_every == 0 or step == args.steps:
                 result = validate(model, val_loader if not args.val_batches else _limit(val_loader, args.val_batches), args, device, ref)
                 log(f"validation step {step} decisions {int(result['decisions'])} kl {result['kl']:.4f} top1 {result['top1']:.3f} "
@@ -466,12 +471,27 @@ def main() -> None:
                     f"played-action nll {result['bc']:.4f} accuracy {result['bc_top1']:.3f}")
                 log("calibration " + " ".join(f"[{i / 10:.1f}-{(i + 1) / 10:.1f}) n={c} pred={p:.3f} won={w:.3f}" for i, (c, p, w) in enumerate(result["calibration"]) if c))
                 log("by source " + " ".join(f"{names[s]}: kl {k:.4f} bce {b:.4f}" for s, (k, b) in sorted(result["by_source"].items())))
+                monitored = result["bce"] if args.stage == "value" else result["kl"]
+                if monitored < best - args.min_delta:
+                    best, bad = monitored, 0
+                    best_state = to_cpu(model.state_dict())
+                    torch.save(best_state, os.path.join(args.out, "weights_best.pt"))
+                else:
+                    bad += 1
+                log(f"best validation {'bce' if args.stage == 'value' else 'kl'} {best:.4f}; {bad} validation(s) without progress of {args.min_delta:g}" + (f" (patience {args.patience})" if args.patience else ""))
+                stop = args.patience > 0 and bad >= args.patience
             if step % args.ckpt_every == 0 or step == args.steps:
                 checkpointer.submit(snapshot())
             if step % args.save_every == 0 or step == args.steps:
                 torch.save(to_cpu(model.state_dict()), os.path.join(args.out, f"weights_{step}.pt"))
+            if stop:
+                log(f"early stop at step {step}: no progress for {bad} validations; the final weights are the best ones (validation {best:.4f})")
+                break
     finally:
         checkpointer.close()  # the last submitted state reaches the disk even when the run is interrupted
+    # weights_final.pt: the best validated weights after an early stop, else the last step's
+    final = best_state if (args.patience > 0 and bad >= args.patience and best_state is not None) else to_cpu(model.state_dict())
+    torch.save(final, os.path.join(args.out, "weights_final.pt"))
     log(f"done at step {step}, {time.time() - start:.0f}s")
 
 
