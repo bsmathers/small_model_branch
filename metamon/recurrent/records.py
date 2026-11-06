@@ -48,6 +48,13 @@ def load_trajectory(path: str) -> dict:
     return data
 
 
+def load_for_labelling(path: str) -> dict:
+    """Only what the labeller reads (the original parser's states and actions): the corrected parser's states and the extras are about half
+    of a loaded trajectory's memory (about 64 KiB per decision is left)."""
+    data = load_trajectory(path)
+    return {"legacy_states": data["legacy_states"], "legacy_actions": data["legacy_actions"]}
+
+
 def _kind(summary: dict) -> str:
     kind = summary["kind"]
     if kind == "noop":

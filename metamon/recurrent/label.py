@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from metamon.recurrent.records import load_trajectory
+from metamon.recurrent.records import load_for_labelling, load_trajectory
 
 N_SLOTS = 9
 
@@ -283,6 +283,8 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     # Exeggcute reads what the ORIGINAL parser produced (it was trained on that); see merge_legacy.py
     # (from_dict rewrites the dicts it is given: the trajectories are consumed; the encoder timing passes copies)
     states = [[UniversalState.from_dict(s) for s in t["legacy_states"]] for t in trajectories]
+    for t in trajectories:
+        t["legacy_states"] = None  # (the dicts are no longer needed: a long game holds tens of MiB of them)
     lengths = [len(s) - 1 for s in states]  # a decision per state but the last
     horizon = max(lengths)
     for sp in spaces:
@@ -487,6 +489,7 @@ def main() -> None:
     ap.add_argument("output")
     ap.add_argument("--cache", default=os.environ.get("METAMON_CACHE_DIR", "."))
     ap.add_argument("--batch", type=int, default=256, help="games labelled in lockstep (the members' fixed per-step cost is shared by all of them; the caches take about 11 MiB per game)")
+    ap.add_argument("--group-mib", type=float, default=24.0, help="most compressed MiB of trajectories labelled in lockstep (a loaded game is ~100x its file; bounds memory)")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16", help="runs the members under CUDA autocast")
@@ -527,18 +530,31 @@ def main() -> None:
     # similar lengths together keep the lockstep padding small; the file size tracks the length closely and costs no decoding
     files.sort(key=os.path.getsize)
     if args.encoder == "auto" and files:
-        pick_encoder(spec, policy, recorder, [load_trajectory(f) for f in files[len(files) // 2 : len(files) // 2 + args.batch]], half)
+        pick_encoder(spec, policy, recorder, [load_for_labelling(f) for f in files[len(files) // 2 : len(files) // 2 + min(args.batch, 64)]], half)
     done = decisions = 0
     start = time.time()
     from concurrent.futures import ThreadPoolExecutor
 
-    groups = [files[b : b + args.batch] for b in range(0, len(files), args.batch)]
+    # A group is up to --batch games but also at most --group-mib of compressed files: a loaded game takes about 100x its file size in
+    # memory, so 256 long games would need tens of GiB (and the next group is loaded while this one is labelled, in every process).
+    # The long games at the end of the size order simply get fewer lanes.
+    limit = args.group_mib * 2**20
+    groups, current, current_bytes = [], [], 0
+    for f in files:
+        size = os.path.getsize(f)
+        if current and (len(current) >= args.batch or current_bytes + size > limit):
+            groups.append(current)
+            current, current_bytes = [], 0
+        current.append(f)
+        current_bytes += size
+    if current:
+        groups.append(current)
     loader = ThreadPoolExecutor(max_workers=1)  # reads (decompresses, parses) the next group while this one is labelled
-    pending = loader.submit(lambda g: [load_trajectory(f) for f in g], groups[0]) if groups else None
+    pending = loader.submit(lambda g: [load_for_labelling(f) for f in g], groups[0]) if groups else None
     for gi, group in enumerate(groups):
         trajectories = pending.result()
         if gi + 1 < len(groups):
-            pending = loader.submit(lambda g: [load_trajectory(f) for f in g], groups[gi + 1])
+            pending = loader.submit(lambda g: [load_for_labelling(f) for f in g], groups[gi + 1])
         results = label_batch(spec, policy, recorder, trajectories, half=half)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()  # (games of different lengths leave differently sized blocks cached: each process would only ever grow)
