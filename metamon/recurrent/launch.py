@@ -111,7 +111,8 @@ class Launcher:
 
     def start_background(self, stage: str, cmd: list[str], env: dict) -> None:
         handle = open(os.path.join(self.logs, f"{stage}_0.txt"), "w")
-        self.background.append((stage, subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT), handle, time.time()))
+        # low priority: labelling (the stage that matters) takes the cores it wants, the build uses what is left
+        self.background.append((stage, subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(15)), handle, time.time()))
         self.log(f"{stage}: started in the background (log {self.logs}/{stage}_0.txt)")
 
     def finish_background(self) -> None:
@@ -403,7 +404,7 @@ class Launcher:
             self.run_one(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
             self.log(f"{name}: built {self.count_files(built, '.npz')} games")
         else:
-            self.start_background(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(min(self.cpus, self.proc_cap)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
+            self.start_background(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(max(2, self.cpus // 2)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
         self.counts = getattr(self, "counts", {})
         self.counts[name] = (wanted, n_traj)
 
