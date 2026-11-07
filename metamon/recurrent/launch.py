@@ -1,7 +1,12 @@
-"""Runs the whole job on one machine: fetch the trajectories and Exeggcute's checkpoints, label, build, train.
+"""Runs the whole job on one machine: fetch the data, then (depending on --data) label, build, train.
 
-The trajectories are the finished two-parser files (bsmathers/labeled_gen1_retrajectories: one zip per source, unzipped
-into WORK/<source>/trajectories). `--from-raw` parses raw replay logs instead (bsmathers/raw_replays).
+--data built (the default): download the built training games (bsmathers/gen1ou-labels-backup: <source>_built.zip, unzipped
+into WORK/<source>/built) and train. No Exeggcute checkpoints, labelling or build: the zips are the output of those stages.
+--data labels: download the finished trajectories and their labels (<source>_labels.zip), then build and train (labelling
+skips every game that already has a label).
+--data trajectories: download the finished trajectories (bsmathers/labeled_gen1_retrajectories: one zip per source, unzipped
+into WORK/<source>/trajectories), label, build and train. `--from-raw` parses raw replay logs instead (bsmathers/raw_replays).
+The backup repo is private: log in once with `hf auth login`, or set HF_TOKEN.
 
 Normally started through `launch.sh`, which installs the requirements first:
 
@@ -24,6 +29,7 @@ import math
 import os
 import subprocess
 import sys
+import shutil
 import time
 import zipfile
 
@@ -265,6 +271,37 @@ class Launcher:
             raw[name] = dest
         return raw
 
+    def fetch_zip(self, name: str, kind: str, dest: str) -> int:
+        """Downloads <name>_<kind>.zip from --built-repo and extracts its .npz files (and nothing else) into dest, flat: the
+        basename only, so no member can write outside dest. Marks dest done, so a restart skips it; the zip is deleted after."""
+        a = self.args
+        marker = os.path.join(dest, f".{kind}_done")
+        if os.path.exists(marker):
+            count = open(marker).read().strip()
+            self.log(f"{name}: {kind} already extracted ({count} files)")
+            return int(count.split()[0])
+        from huggingface_hub import hf_hub_download
+
+        zip_name = f"{name}_{kind}.zip"
+        self.log(f"downloading {a.built_repo}/{zip_name}")
+        path = hf_hub_download(repo_id=a.built_repo, repo_type="dataset", filename=zip_name, local_dir=os.path.join(self.work, "hf"))
+        os.makedirs(dest, exist_ok=True)
+        count = 0
+        with zipfile.ZipFile(path) as z:
+            for info in z.infolist():
+                base = os.path.basename(info.filename)
+                if info.is_dir() or base.startswith(".") or not base.endswith(".npz") or info.filename.startswith("__MACOSX"):
+                    continue
+                with z.open(info) as src, open(os.path.join(dest, base), "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                count += 1
+        if count == 0:
+            raise RuntimeError(f"no .npz files in {a.built_repo}/{zip_name}")
+        open(marker, "w").write(f"{count}\n")
+        self.log(f"{name}: extracted {count} {kind} files")
+        os.remove(path)  # the zip is no longer needed
+        return count
+
     def count_files(self, directory: str, suffix: str) -> int:
         return sum(1 for n in os.listdir(directory) if n.endswith(suffix)) if os.path.isdir(directory) else 0
 
@@ -372,8 +409,12 @@ class Launcher:
             f.write(PARSER_VERSION)
 
         if raw_dir is None:
-            # the default: finished trajectories (made with this parser version), no parsing here
+            # finished trajectories (made with this parser version), no parsing here
             self.fetch_trajectories(name, games)
+            if a.data == "labels":
+                # labels made from these trajectories: the label stage then finds every game done (labels of games not kept are
+                # unused: the build only reads labels of trajectories present)
+                self.fetch_zip(name, "labels", labels)
             n_traj = self.count_files(traj, ".lz4")
             wanted = n_traj // 2
         else:
@@ -477,6 +518,11 @@ class Launcher:
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
         self.background = []
+        if a.data == "built" and not a.train_only and not (a.from_raw or a.raw_human or a.raw_strong or a.traj_human_dir or a.traj_strong_dir):
+            for name, weight in self.mix.items():
+                if float(weight) > 0:
+                    self.fetch_zip(name, "built", os.path.join(self.work, name, "built"))
+            a.train_only = True  # (the built games are the data: nothing to label or build)
         if a.train_only:  # (the built games of an earlier run are used as they are: no download, labelling or build)
             for name, weight in self.mix.items():
                 built = os.path.join(self.work, name, "built")
@@ -502,6 +548,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=os.environ.get("WORK", "/workspace/work" if os.path.isdir("/workspace") else os.path.expanduser("~/work")))
     ap.add_argument("--cache", default=None, help="metamon cache (default WORK/metamon-cache)")
+    ap.add_argument("--data", choices=("built", "labels", "trajectories"), default="built",
+                    help="what to download: built games (train at once), trajectories + labels (build, then train) or trajectories (label, build, train)")
+    ap.add_argument("--built-repo", default="bsmathers/gen1ou-labels-backup", help="dataset repo with <source>_built.zip and <source>_labels.zip (private: hf auth login or HF_TOKEN)")
     ap.add_argument("--traj-repo", default="bsmathers/labeled_gen1_retrajectories", help="dataset repo with the finished trajectories (one zip per source)")
     ap.add_argument("--traj-human-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'human' in its name)")
     ap.add_argument("--traj-strong-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'strong' in its name)")
@@ -513,7 +562,7 @@ def main() -> None:
     ap.add_argument("--strong-zip", default="strong_model_replays.zip")
     ap.add_argument("--raw-human", default=None, help="a folder of .log files, instead of downloading")
     ap.add_argument("--raw-strong", default=None)
-    ap.add_argument("--games", type=int, default=30000, help="games to take from each source (0: all)")
+    ap.add_argument("--games", type=int, default=30000, help="games to take from each source (0: all). --data built always uses every built game")
     ap.add_argument("--mix", action="append", help="name=weight, e.g. human=0.4 (default human=0.4 strong=0.6; weight 0 skips a source)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
