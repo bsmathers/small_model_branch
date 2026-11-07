@@ -280,11 +280,16 @@ class Launcher:
             count = open(marker).read().strip()
             self.log(f"{name}: {kind} already extracted ({count} files)")
             return int(count.split()[0])
-        from huggingface_hub import hf_hub_download
-
         zip_name = f"{name}_{kind}.zip"
-        self.log(f"downloading {a.built_repo}/{zip_name}")
-        path = hf_hub_download(repo_id=a.built_repo, repo_type="dataset", filename=zip_name, local_dir=os.path.join(self.work, "hf"))
+        path = os.path.join(self.work, "hf", zip_name)
+        if os.path.exists(path):
+            # copied here by hand (e.g. scp from a machine that can read the private repo): no download, no token
+            self.log(f"{name}: using {path}")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            self.log(f"downloading {a.built_repo}/{zip_name}")
+            path = hf_hub_download(repo_id=a.built_repo, repo_type="dataset", filename=zip_name, local_dir=os.path.join(self.work, "hf"))
         os.makedirs(dest, exist_ok=True)
         count = 0
         with zipfile.ZipFile(path) as z:
