@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import shutil
 import threading
 import time
 
@@ -212,6 +213,66 @@ class Checkpointer:
             raise RuntimeError(f"checkpoint writer failed: {self.error}")
 
 
+class Backup:
+    """Copies of the run on separate storage (a vast.ai local volume, say), for when the container disk is lost:
+    weights_<step>.pt (model only) at every backup, latest.pt (model, optimizer, step) overwritten at every backup,
+    and copies of weights_best.pt, weights_final.pt and log.txt. Every file is written to a temporary name and
+    renamed, so an interruption leaves the previous copy whole. A failed write is logged and training goes on
+    (the run on the container disk is unaffected); a nearly full volume skips the numbered weights first and
+    keeps latest.pt going."""
+
+    RESERVE = 200 * 2**20  # bytes kept free on the volume beyond a latest.pt's size
+
+    def __init__(self, directory: str):
+        self.dir = directory
+        os.makedirs(directory, exist_ok=True)
+        self.log = print
+        self.latest_size = 0
+        self.warned_full = False
+
+    def free_gib(self) -> float:
+        return shutil.disk_usage(self.dir).free / 2**30
+
+    def _write(self, name: str, write) -> bool:
+        path = os.path.join(self.dir, name)
+        tmp = path + ".tmp"
+        try:
+            write(tmp)
+            os.replace(tmp, path)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"BACKUP FAILED: {name} to {self.dir}: {type(exc).__name__}: {exc}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def copy(self, src: str) -> None:
+        if os.path.exists(src):
+            self._write(os.path.basename(src), lambda tmp: shutil.copyfile(src, tmp))
+
+    def save_step(self, step: int, state: dict) -> None:
+        free = shutil.disk_usage(self.dir).free
+        if free > 2 * self.latest_size + self.RESERVE:
+            self._write(f"weights_{step}.pt", lambda tmp: torch.save(state["model"], tmp))
+        elif not self.warned_full:
+            self.warned_full = True
+            self.log(f"backup volume {self.dir} nearly full ({free / 2**20:.0f} MiB free): numbered weights are no longer backed up; latest.pt still is")
+        if self._write("latest.pt", lambda tmp: torch.save(state, tmp)):
+            self.latest_size = os.path.getsize(os.path.join(self.dir, "latest.pt"))
+
+    def restore(self, out: str) -> str | None:
+        """Copies latest.pt, weights_best.pt, weights_final.pt and log.txt from the backup into OUT (which has no latest.pt)."""
+        if not os.path.exists(os.path.join(self.dir, "latest.pt")):
+            return None
+        names = [n for n in ("latest.pt", "weights_best.pt", "weights_final.pt", "log.txt")
+                 if os.path.exists(os.path.join(self.dir, n)) and (n == "latest.pt" or not os.path.exists(os.path.join(out, n)))]
+        for n in names:
+            shutil.copyfile(os.path.join(self.dir, n), os.path.join(out, n))
+        return f"restored {', '.join(names)} from the backup {self.dir} (no latest.pt in {out})"
+
+
 def lr_at(step: int, args) -> float:
     if step < args.warmup:
         return args.lr * (step + 1) / args.warmup
@@ -324,6 +385,11 @@ def main() -> None:
     ap.add_argument("--val-batches", type=int, default=0, help="limit validation to N batches (0 = all)")
     ap.add_argument("--save-every", type=int, default=5000, help="steps between numbered weights_<step>.pt snapshots")
     ap.add_argument("--ckpt-every", type=int, default=1, help="steps between writes of latest.pt (model, optimizer, step); 1 = every iteration")
+    ap.add_argument("--backup-dir", default=None,
+                    help="a second folder, on separate storage (e.g. a vast.ai local volume), that keeps weights_<step>.pt every --backup-every steps, "
+                         "latest.pt (overwritten each time), weights_best.pt, weights_final.pt and log.txt. With --resume and no latest.pt in OUT, "
+                         "the run restarts from the backup's")
+    ap.add_argument("--backup-every", type=int, default=100)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16", help="autocast on CUDA; fp16 uses loss scaling")
@@ -345,6 +411,10 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
+    backup = Backup(args.backup_dir) if args.backup_dir else None
+    restored = None
+    if backup and args.resume and not os.path.exists(os.path.join(args.out, "latest.pt")):
+        restored = backup.restore(args.out)  # (before log.txt is opened, so the restored log continues)
     log_file = open(os.path.join(args.out, "log.txt"), "a")
 
     def log(text: str) -> None:
@@ -353,6 +423,9 @@ def main() -> None:
         log_file.write(line + "\n")
         log_file.flush()
 
+    if backup:
+        backup.log = log
+
     train_sources = parse_sources(args.source, False, args.val_fraction)
     val_sources = parse_sources(args.source, True, args.val_fraction)
     names = [s.name for s in train_sources]
@@ -360,7 +433,9 @@ def main() -> None:
     log(f"validation {' '.join(f'{s.name}:{len(s.paths)}games' for s in val_sources)}")
 
     latest = os.path.join(args.out, "latest.pt")
-    resume_state = torch.load(latest, map_location="cpu") if args.resume and os.path.exists(latest) else None
+    if backup:
+        log(restored or f"backups every {args.backup_every} steps to {args.backup_dir} ({backup.free_gib():.1f} GiB free)")
+    resume_state =torch.load(latest, map_location="cpu") if args.resume and os.path.exists(latest) else None
     start_step = resume_state["step"] if resume_state else 0
 
     model = PolicyValueModel().to(device)
@@ -483,8 +558,15 @@ def main() -> None:
                     bad += 1
                 log(f"best validation {'bce' if args.stage == 'value' else 'kl'} {best:.4f}; {bad} validation(s) without progress of {args.min_delta:g}" + (f" (patience {args.patience})" if args.patience else ""))
                 stop = args.patience > 0 and bad >= args.patience
-            if step % args.ckpt_every == 0 or step == args.steps:
-                checkpointer.submit(snapshot())
+                if backup and bad == 0:
+                    backup.copy(os.path.join(args.out, "weights_best.pt"))
+            backup_now = backup is not None and (step % args.backup_every == 0 or step == args.steps or stop)
+            if step % args.ckpt_every == 0 or step == args.steps or backup_now:
+                state = snapshot()
+                checkpointer.submit(state)
+                if backup_now:
+                    backup.save_step(step, state)
+                    backup.copy(os.path.join(args.out, "log.txt"))
             if step % args.save_every == 0 or step == args.steps:
                 torch.save(to_cpu(model.state_dict()), os.path.join(args.out, f"weights_{step}.pt"))
             if stop:
@@ -496,6 +578,9 @@ def main() -> None:
     final = best_state if (args.patience > 0 and bad >= args.patience and best_state is not None) else to_cpu(model.state_dict())
     torch.save(final, os.path.join(args.out, "weights_final.pt"))
     log(f"done at step {step}, {time.time() - start:.0f}s")
+    if backup:
+        backup.copy(os.path.join(args.out, "weights_final.pt"))
+        backup.copy(os.path.join(args.out, "log.txt"))
 
 
 def _limit(loader, n):

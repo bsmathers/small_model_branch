@@ -6,6 +6,10 @@
 #
 #   ./launch.sh --steps 20000 --value-steps 20000 --init /path/to/latest.pt   # continue an earlier run's policy
 #
+#   With a vast.ai local volume attached (mounted at /data), backups go to /data/metamon-backup every 100 steps
+#   (--backup-every; --backup-dir PATH for another mount, none to turn off). Rerunning the same command on a new
+#   container with that volume resumes from it.
+#
 #   ./launch.sh --smoke        # a few minutes; prints timings and a projection for the full run
 #   ./launch.sh                # the full run
 #   ./launch.sh --games 60000 --steps 30000 --mix human=0.4 --mix strong=0.6

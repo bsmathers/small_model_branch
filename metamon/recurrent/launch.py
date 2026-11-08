@@ -219,8 +219,35 @@ class Launcher:
             self.precision = "fp32"
         free = __import__("shutil").disk_usage(self.work).free / 2**30
         self.log(f"hardware: {self.cpus} CPUs (worker cap {self.proc_cap}), " + (", ".join(f"{g['name']} {g['mem']:.0f} GiB (sm_{g['cc'][0]}{g['cc'][1]})" for g in self.gpus) or "no GPU") + f"; precision {self.precision}; {free:.0f} GiB free at {self.work}")
-        if free < 40 and not a.smoke:
+        if free < 40 and not a.smoke and a.data != "built":
             self.log("warning: under 40 GiB free; the default sample needs about 25 GiB with the downloads")
+        self.backup = self.find_backup()
+
+    def find_backup(self) -> str | None:
+        """--backup-dir auto: the vast.ai local volume, which the console mounts at /data (a template or `-v V.<id>:/path`
+        can mount it elsewhere: pass that path). Only a separate mount counts: a /data folder on the container disk
+        would vanish with it."""
+        a = self.args
+        if a.backup_dir == "none":
+            self.log("backups off (--backup-dir none): checkpoints are only on the container disk")
+            return None
+        path = "/data" if a.backup_dir == "auto" else a.backup_dir
+        if a.backup_dir == "auto" and not os.path.ismount(path):
+            self.log("WARNING: no local volume mounted at /data, so checkpoints are only on the container disk. Attach a vast.ai local volume "
+                     "(mounted at /data by default) or pass --backup-dir PATH")
+            return None
+        os.makedirs(path, exist_ok=True)
+        if os.stat(path).st_dev == os.stat(self.work).st_dev:
+            self.log(f"WARNING: --backup-dir {path} is on the same disk as {self.work}: it will not survive losing that disk")
+        root = os.path.join(path, "metamon-backup")
+        os.makedirs(root, exist_ok=True)
+        usage = __import__("shutil").disk_usage(root)
+        self.log(f"backups to {root} (volume {usage.total / 2**30:.0f} GiB, {usage.free / 2**30:.1f} GiB free): every {a.backup_every} steps "
+                 f"weights_<step>.pt (~5 MiB each) and latest.pt (overwritten), per stage")
+        need = (a.steps + a.value_steps) / max(a.backup_every, 1) * 5.3 / 1024 + 0.1
+        if need > usage.free / 2**30:
+            self.log(f"warning: the numbered weights need about {need:.1f} GiB; when the volume is nearly full they stop and latest.pt goes on")
+        return root
 
     def prefetch(self) -> None:
         """Downloads the usage statistics and Exeggcute's checkpoints once, before any parallel stage
@@ -479,12 +506,32 @@ class Launcher:
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
         cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
+        if self.backup:
+            cmd += ["--backup-dir", os.path.join(self.backup, os.path.basename(out)), "--backup-every", str(a.backup_every)]
         if a.init and extra[1] != "value":
-            cmd += ["--init", a.init]  # (the first stage starts from these weights; a later restart of the same command resumes from the run's own latest.pt instead)
+            cmd += ["--init", self.init_path()]  # (the first stage starts from these weights; a later restart of the same command resumes from the run's own latest.pt instead)
         cmd += extra  # (later flags win: the value stage's --lr replaces the default one)
         stage = extra[1]
         self.log(f"training ({stage} stage) {steps} steps; progress in {out}/log.txt")
         self.run_one("train" if stage != "value" else "train_value", cmd, self.env(HF_HUB_OFFLINE=1))
+
+    def init_path(self) -> str:
+        """--init, kept on the backup volume too (BACKUP/init/<name>): a new container that lost the file uses the volume's copy."""
+        a = self.args
+        if not self.backup:
+            return a.init
+        kept = os.path.join(self.backup, "init", os.path.basename(a.init))
+        if os.path.exists(a.init):
+            if not os.path.exists(kept) or os.path.getsize(kept) != os.path.getsize(a.init):
+                os.makedirs(os.path.dirname(kept), exist_ok=True)
+                __import__("shutil").copyfile(a.init, kept + ".tmp")
+                os.replace(kept + ".tmp", kept)
+                self.log(f"copied --init to {kept}")
+            return a.init
+        if os.path.exists(kept):
+            self.log(f"--init {a.init} is missing; using the backup's copy {kept}")
+            return kept
+        return a.init
 
     def summary(self) -> None:
         a = self.args
@@ -589,6 +636,12 @@ def main() -> None:
     ap.add_argument("--val-every", type=int, default=2000)
     ap.add_argument("--val-batches", type=int, default=0)
     ap.add_argument("--save-every", type=int, default=2000)
+    ap.add_argument("--backup-dir", default="auto",
+                    help="separate storage for backups that outlive the container disk: auto = the vast.ai local volume at /data when one is mounted; "
+                         "a path; or none. Holds metamon-backup/<run>/ (weights_<step>.pt every --backup-every steps, latest.pt overwritten each time, "
+                         "weights_best.pt, weights_final.pt, log.txt) and metamon-backup/init/ (a copy of --init). A run whose WORK lost its "
+                         "latest.pt resumes from the backup's")
+    ap.add_argument("--backup-every", type=int, default=100, help="steps between backups")
     ap.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     ap.add_argument("--parse-procs", type=int, default=0, help="parser processes (default: one per CPU)")
