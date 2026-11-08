@@ -6,7 +6,7 @@
 #
 #   ./launch.sh --steps 20000 --value-steps 20000 --init /path/to/latest.pt   # continue an earlier run's policy
 #
-#   With a vast.ai local volume attached (mounted at /data), backups go to /data/metamon-backup every 100 steps
+#   With a vast.ai local volume attached (at /data or /workspace), backups go to <volume>/metamon-backup every 100 steps
 #   (--backup-every; --backup-dir PATH for another mount, none to turn off). Rerunning the same command on a new
 #   container with that volume resumes from it.
 #
@@ -14,12 +14,12 @@
 #   ./launch.sh                # the full run
 #   ./launch.sh --games 60000 --steps 30000 --mix human=0.4 --mix strong=0.6
 #
-# Environment: WORK (default /workspace/work or ~/work), PYTHON (default python3), HF_TOKEN (the default built-games
+# Environment: WORK (default ~/work, on the container disk; never /workspace, which on vast.ai can be a small volume), PYTHON (default python3), HF_TOKEN (the default built-games
 # repo is private; or log in once with `hf auth login`), SKIP_INSTALL=1 to skip the install step.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-WORK="${WORK:-$([ -d /workspace ] && echo /workspace/work || echo "$HOME/work")}"
+WORK="${WORK:-$HOME/work}"
 export WORK
 PYTHON="${PYTHON:-python3}"
 mkdir -p "$WORK"

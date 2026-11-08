@@ -219,6 +219,10 @@ class Launcher:
             self.precision = "fp32"
         free = __import__("shutil").disk_usage(self.work).free / 2**30
         self.log(f"hardware: {self.cpus} CPUs (worker cap {self.proc_cap}), " + (", ".join(f"{g['name']} {g['mem']:.0f} GiB (sm_{g['cc'][0]}{g['cc'][1]})" for g in self.gpus) or "no GPU") + f"; precision {self.precision}; {free:.0f} GiB free at {self.work}")
+        total = __import__("shutil").disk_usage(self.work).total / 2**30
+        if total < 25 and not a.smoke:
+            raise SystemExit(f"WORK {self.work} is on a {total:.0f} GiB disk (a vast.ai volume?): the data needs the container disk. "
+                             f"Use the default WORK (~/work) or another folder on the big disk")
         if free < 40 and not a.smoke and a.data != "built":
             self.log("warning: under 40 GiB free; the default sample needs about 25 GiB with the downloads")
         self.backup = self.find_backup()
@@ -231,11 +235,14 @@ class Launcher:
         if a.backup_dir == "none":
             self.log("backups off (--backup-dir none): checkpoints are only on the container disk")
             return None
-        path = "/data" if a.backup_dir == "auto" else a.backup_dir
-        if a.backup_dir == "auto" and not os.path.ismount(path):
-            self.log("WARNING: no local volume mounted at /data, so checkpoints are only on the container disk. Attach a vast.ai local volume "
-                     "(mounted at /data by default) or pass --backup-dir PATH")
-            return None
+        if a.backup_dir == "auto":
+            path = next((p for p in ("/data", "/workspace") if os.path.ismount(p)), None)
+            if path is None:
+                self.log("WARNING: no local volume mounted at /data or /workspace, so checkpoints are only on the container disk. "
+                         "Attach a vast.ai local volume or pass --backup-dir PATH")
+                return None
+        else:
+            path = a.backup_dir
         os.makedirs(path, exist_ok=True)
         if os.stat(path).st_dev == os.stat(self.work).st_dev:
             self.log(f"WARNING: --backup-dir {path} is on the same disk as {self.work}: it will not survive losing that disk")
@@ -598,7 +605,7 @@ class Launcher:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--work", default=os.environ.get("WORK", "/workspace/work" if os.path.isdir("/workspace") else os.path.expanduser("~/work")))
+    ap.add_argument("--work", default=os.environ.get("WORK", os.path.expanduser("~/work")), help="data and runs; on the container disk (never a small volume such as a vast.ai /workspace)")
     ap.add_argument("--cache", default=None, help="metamon cache (default WORK/metamon-cache)")
     ap.add_argument("--data", choices=("built", "labels", "trajectories"), default="built",
                     help="what to download: built games (train at once), trajectories + labels (build, then train) or trajectories (label, build, train)")
