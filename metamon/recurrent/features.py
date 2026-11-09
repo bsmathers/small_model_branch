@@ -49,6 +49,33 @@ FIELD_WIDTH = 39  # damage 8, speed 2, turn 8, party 2, forced 2, screens 6, tra
 SCREENS = ("reflect", "lightscreen", "mist")
 SPEED_SCALE = 500.0
 
+# The layout of the built games: change it whenever the features or the policy slots change meaning, so that games built by
+# older code are never mixed in (build.py stamps its output folder with it; dataset.scan refuses a folder with another stamp).
+#   (none)                   the first layout: reserves sorted with the fainted ones, opponent in first-appearance order,
+#                            and labels whose moves were mapped through the stored move order (scrambled)
+#   2-exeggcute-order        Exeggcute's (Metamon's) order everywhere, from the current state only; slots = its action indices
+ENCODING_VERSION = "2-exeggcute-order"
+ENCODING_STAMP = ".encoding_version"
+
+
+def encoding_of(directory: str) -> Optional[str]:
+    """The encoding stamp of a folder of built games (None: no stamp)."""
+    import os
+
+    path = os.path.join(directory, ENCODING_STAMP)
+    return open(path).read().strip() if os.path.exists(path) else None
+
+
+def check_encoding(directory: str) -> None:
+    """Refuses built games from another encoding version (or from before the stamps), with the way out in the message."""
+    found = encoding_of(directory)
+    if found != ENCODING_VERSION:
+        raise ValueError(
+            f"{directory} holds games built with encoding {found or 'from before encoding stamps'}, the code uses {ENCODING_VERSION!r}: "
+            f"rebuild them (python -m metamon.recurrent.build, or the launcher with --data labels) into an empty folder, after "
+            f"moving this one away"
+        )
+
 
 @dataclass
 class LastTurn:
@@ -261,12 +288,18 @@ def _one_hot(index: int, size: int) -> np.ndarray:
     return out
 
 
-def canonical_own(state, own_party: Sequence) -> tuple[list, object]:
-    """The observer's party in the order the policy outputs refer to.
+def _alive(pokemon) -> bool:
+    return pokemon.hp_pct > 0 and pokemon.status != "fnt"
 
-    Slot 0 is the active Pokemon; slots 1-5 are the others sorted by species name, fainted ones included.
-    Every Pokemon's moves are sorted by name. Policy logit j < 4 is then the active's j-th move (slot 0's
-    move j) and logit 4 + i is reserve slot 1 + i. Returns (party in slot order, the active Pokemon).
+
+def canonical_own(state, own_party: Sequence) -> tuple[list, object]:
+    """The observer's party in Exeggcute's (Metamon's) order, which depends only on the current state.
+
+    Slot 0 is the active Pokemon; then the living reserves sorted by species name (interface.consistent_pokemon_order,
+    the order of Metamon's switch actions); then the fainted ones, sorted the same way. Every Pokemon's moves are sorted
+    by name (interface.consistent_move_order, the order of Metamon's move actions). The policy slots are then Metamon's
+    action indices: logit j < 4 is the active's j-th move, logit 4 + k is the k-th living reserve, which is party slot
+    1 + k. Returns (party in slot order, the active Pokemon).
     """
     import copy
 
@@ -276,9 +309,11 @@ def canonical_own(state, own_party: Sequence) -> tuple[list, object]:
     active = [p for p in own_party if p.name == active_name]
     if not active:  # the party list should always hold the active; fall back to the state's own copy
         active = [state.player_active_pokemon]
-    others = sorted((p for p in own_party if p.name != active_name), key=lambda p: pokemon_name(p.name))
+    others = [p for p in own_party if p.name != active_name]
+    living = sorted((p for p in others if _alive(p)), key=lambda p: pokemon_name(p.name))
+    fainted = sorted((p for p in others if not _alive(p)), key=lambda p: pokemon_name(p.name))
     ordered = []
-    for p in active + others:
+    for p in active + living + fainted:
         q = copy.copy(p)
         q.moves = sorted(p.moves, key=lambda m: move_name(m.name))
         ordered.append(q)
@@ -287,18 +322,44 @@ def canonical_own(state, own_party: Sequence) -> tuple[list, object]:
     return ordered, active_copy
 
 
+def canonical_opponent(state, opp_revealed: Sequence) -> tuple[list, object]:
+    """The opponent's revealed Pokemon sorted by species name (interface.consistent_pokemon_order's key) and the
+    opponent's active, each with its revealed moves sorted by name. Returns (revealed in slot order, the active)."""
+    import copy
+
+    from metamon.interface import move_name, pokemon_name
+
+    def with_sorted_moves(p):
+        q = copy.copy(p)
+        q.moves = sorted(p.moves, key=lambda m: move_name(m.name))
+        return q
+
+    revealed = [with_sorted_moves(p) for p in sorted(opp_revealed, key=lambda p: pokemon_name(p.name))]
+    return revealed, with_sorted_moves(state.opponent_active_pokemon)
+
+
+def policy_options(ordered_party: Sequence) -> tuple[list[str], list[str]]:
+    """What the policy slots mean for a party in canonical_own order: (move names of slots 0-3, species of slots 4-8), as
+    interface.move_name / pokemon_name keys. Slot 4 + k is the k-th living reserve (party slot 1 + k), as in Metamon."""
+    from metamon.interface import move_name, pokemon_name
+
+    moves = [move_name(m.name) for m in ordered_party[0].moves[:N_MOVES]]
+    reserves = [pokemon_name(p.name) for p in ordered_party[1:] if _alive(p)][: N_ACTIONS - N_MOVES]
+    return moves, reserves
+
+
 def action_slot_map(state, ordered_party: Sequence) -> np.ndarray:
     """For each action index of Metamon's action space (moves 0-3, then the alive reserves in sorted
-    species order), the policy slot of this model: moves keep their index; the k-th alive reserve maps to
-    4 + (its position among the party's non-active members in sorted order). -1 where there is no match."""
+    species order), the policy slot of this model. The slots follow the same order, so this is the identity
+    wherever the state's switch list and the party agree; matching is by species, and -1 marks no match."""
     from metamon.interface import pokemon_name
 
     mapping = np.full(N_ACTIONS, -1, dtype=np.int64)
     mapping[:N_MOVES] = np.arange(N_MOVES)
-    reserve_names = [p.name for p in ordered_party[1:]]
+    _, reserves = policy_options(ordered_party)
     for k, p in enumerate(sorted(state.available_switches, key=lambda p: pokemon_name(p.name))):
-        if 4 + k < N_ACTIONS and p.name in reserve_names:
-            mapping[4 + k] = 4 + reserve_names.index(p.name)
+        if 4 + k < N_ACTIONS and pokemon_name(p.name) in reserves:
+            mapping[4 + k] = 4 + reserves.index(pokemon_name(p.name))
     return mapping
 
 
@@ -313,11 +374,12 @@ def label_slot_map(label_state, ordered_party: Sequence) -> np.ndarray:
     from metamon.interface import move_name, pokemon_name
 
     mapping = np.full(N_ACTIONS, -1, dtype=np.int64)
-    active_moves = [move_name(m.name) for m in ordered_party[0].moves[:N_MOVES]]
-    for j, m in enumerate(label_state.player_active_pokemon.moves[:N_MOVES]):
+    active_moves, reserves = policy_options(ordered_party)
+    # Exeggcute's move action j is the j-th move in Metamon's consistent order (interface.consistent_move_order: sorted by
+    # move_name), not in the order the state stores them (the parser's order, which differs in most states)
+    for j, m in enumerate(sorted(label_state.player_active_pokemon.moves, key=lambda m: move_name(m.name))[:N_MOVES]):
         if move_name(m.name) in active_moves:
             mapping[j] = active_moves.index(move_name(m.name))
-    reserves = [pokemon_name(p.name) for p in ordered_party[1:]]
     for k, p in enumerate(sorted(label_state.available_switches, key=lambda p: pokemon_name(p.name))):
         if 4 + k < N_ACTIONS and pokemon_name(p.name) in reserves:
             mapping[4 + k] = 4 + reserves.index(pokemon_name(p.name))
@@ -339,16 +401,20 @@ def encode_observer(
                    reserves, conditions, forced-switch flag, opponents_remaining).
     own_party    : the observer's full party (6 entries; fainted members included), in any order; it is
                    put in policy order by canonical_own.
-    opp_revealed : the opponent's revealed Pokemon in order of first appearance (max 6), from history.
+    opp_revealed : the opponent's revealed Pokemon (max 6), in any order.
     last         : the public record of the previous turn.
     turn         : the battle turn number of this decision.
     extras       : the parser's extras for this state (trapped flags, all side conditions). Without
                    them the trapped flags are 0 and the screens come from the effect field only.
+
+    Every list is put in Exeggcute's (Metamon's) order, which depends only on the current state: the own party as in
+    canonical_own, the opponent's revealed Pokemon sorted by species name, and every Pokemon's moves (the opponent's
+    revealed ones too) sorted by name.
     """
     if len(own_party) > N_OWN or len(opp_revealed) > N_OPP:
         raise ValueError("a party has at most six Pokemon")
     own_party, own_active = canonical_own(state, own_party)
-    opp_active = state.opponent_active_pokemon
+    opp_revealed, opp_active = canonical_opponent(state, opp_revealed)
     ids: dict[str, np.ndarray] = {
         "own_species": np.zeros(N_OWN, dtype=np.int64),
         "own_status": np.zeros(N_OWN, dtype=np.int64),

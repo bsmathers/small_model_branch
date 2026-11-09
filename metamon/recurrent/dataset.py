@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
+from metamon.recurrent.features import check_encoding
 from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS
 
 
@@ -44,7 +45,8 @@ def is_validation(path: str, fraction: int = 20) -> bool:
 
 
 def scan(name: str, directory: str, weight: float, validation: bool, fraction: int = 20) -> Source:
-    paths = [p for p in sorted(glob.glob(os.path.join(directory, "**", "*.npz"), recursive=True)) if is_validation(p, fraction) == validation]
+    check_encoding(directory)  # (games built by code with another feature layout must not be trained on)
+    paths =[p for p in sorted(glob.glob(os.path.join(directory, "**", "*.npz"), recursive=True)) if is_validation(p, fraction) == validation]
     if not paths:
         raise ValueError(f"source {name}: no {'validation' if validation else 'training'} games in {directory}")
     lengths = np.array([_length(p) for p in paths])

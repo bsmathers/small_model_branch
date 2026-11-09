@@ -15,8 +15,9 @@ One `<name>.npz` per game with
     bc_game        bool scalar  the observer is one of the `--bc-players` (strong bots whose play is imitated)
 
 Exeggcute's action indices (moves 0-3 by sorted name, then the alive reserves by sorted species) are
-mapped to this model's slots (the active's sorted moves, then the five reserve slots by sorted species,
-fainted ones included) with `features.action_slot_map`.
+this model's slots too (features.canonical_own uses the same order); `features.label_slot_map` still
+matches them by identity, because the labels follow the original parser's state and the features the
+corrected one, whose guessed moves and reserves can differ.
 
     python -m metamon.recurrent.build TRAJ_DIR LABEL_DIR OUT_DIR TABLES_DIR [--workers N]
 """
@@ -34,6 +35,7 @@ import numpy as np
 from metamon.recurrent.tables import Tables
 from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS
 from metamon.recurrent.records import iter_decisions
+from metamon.recurrent.features import ENCODING_STAMP, ENCODING_VERSION, check_encoding
 
 _TABLES = None
 _BC_PLAYERS: set[str] = set()
@@ -166,6 +168,14 @@ def main() -> None:
     ap.add_argument("--bc-players", default=DEFAULT_BC_PLAYERS, help="comma-separated usernames whose own actions are imitated")
     args = ap.parse_args()
     os.makedirs(args.output, exist_ok=True)
+    # games are skipped when already built, so a folder from another encoding would be silently mixed in: refuse it
+    if any(n.endswith(".npz") for n in os.listdir(args.output)):
+        try:
+            check_encoding(args.output)
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+    with open(os.path.join(args.output, ENCODING_STAMP), "w") as f:
+        f.write(ENCODING_VERSION)
     jobs = []
     # one walk of the trajectories (a glob per label is quadratic: 200k labels x 200k files took hours); the first file of a name wins
     trajectories = {}

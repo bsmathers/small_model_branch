@@ -1,9 +1,10 @@
 """Runs the whole job on one machine: fetch the data, then (depending on --data) label, build, train.
 
---data built (the default): download the built training games (bsmathers/gen1ou-labels-backup: <source>_built.zip, unzipped
-into WORK/<source>/built) and train. No Exeggcute checkpoints, labelling or build: the zips are the output of those stages.
---data labels: download the finished trajectories and their labels (<source>_labels.zip), then build and train (labelling
-skips every game that already has a label).
+--data labels (the default): download the finished trajectories and their labels (<source>_labels.zip), then build and train
+(labelling skips every game that already has a label).
+--data built: download the built training games (bsmathers/gen1ou-labels-backup: <source>_built.zip, unzipped into
+WORK/<source>/built) and train. No Exeggcute checkpoints, labelling or build: the zips are the output of those stages. Only
+zips built with the current features.ENCODING_VERSION can be trained on (the ones uploaded before it are refused).
 --data trajectories: download the finished trajectories (bsmathers/labeled_gen1_retrajectories: one zip per source, unzipped
 into WORK/<source>/trajectories), label, build and train. `--from-raw` parses raw replay logs instead (bsmathers/raw_replays).
 The backup repo is private: log in once with `hf auth login`, or set HF_TOKEN.
@@ -607,7 +608,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--work", default=os.environ.get("WORK", os.path.expanduser("~/work")), help="data and runs; on the container disk (never a small volume such as a vast.ai /workspace)")
     ap.add_argument("--cache", default=None, help="metamon cache (default WORK/metamon-cache)")
-    ap.add_argument("--data", choices=("built", "labels", "trajectories"), default="built",
+    ap.add_argument("--data", choices=("built", "labels", "trajectories"), default="labels",
                     help="what to download: built games (train at once), trajectories + labels (build, then train) or trajectories (label, build, train)")
     ap.add_argument("--built-repo", default="bsmathers/gen1ou-labels-backup", help="dataset repo with <source>_built.zip and <source>_labels.zip (private: hf auth login or HF_TOKEN)")
     ap.add_argument("--traj-repo", default="bsmathers/labeled_gen1_retrajectories", help="dataset repo with the finished trajectories (one zip per source)")

@@ -4,7 +4,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 
-from metamon.recurrent.features import action_slot_map, canonical_own, counter_fraction, CANT_REASONS, FIELD_WIDTH, KINDS, LAST_SIDE_WIDTH, LastTurn, encode_observer, N_MOVES, N_OPP, N_OWN
+from metamon.recurrent.features import action_slot_map, canonical_own, counter_fraction, CANT_REASONS, FIELD_WIDTH, KINDS, LAST_SIDE_WIDTH, LastTurn, encode_observer, N_MOVES, N_OPP, N_OWN, policy_options
 from metamon.recurrent.tables import Tables
 
 
@@ -145,8 +145,8 @@ def test_trapped_and_effect_values_come_from_the_extras():
 
 
 def test_party_is_in_policy_order():
-    """Slot 0 is the active; the reserves follow by species name; each Pokemon's moves are sorted by name.
-    The action slot map sends Metamon's k-th alive reserve to its slot among the sorted reserves."""
+    """Exeggcute's order: slot 0 is the active; the living reserves follow by species name, then the fainted ones;
+    each Pokemon's moves are sorted by name. Metamon's action indices are then the policy slots (the identity map)."""
     own = [
         _mon("tauros", active=False, moves=("tackle", "bodyslam")),
         _mon("snorlax", active=True, moves=("tackle", "bodyslam")),
@@ -158,12 +158,52 @@ def test_party_is_in_policy_order():
     state = _state(own[1], _mon("starmie", active=True))
     state.available_switches = [own[0], own[3], own[4], own[5]]  # chansey fainted
     ordered, active = canonical_own(state, own)
-    assert [p.name for p in ordered] == ["snorlax", "alakazam", "chansey", "exeggutor", "tauros", "zapdos"]
+    assert [p.name for p in ordered] == ["snorlax", "alakazam", "exeggutor", "tauros", "zapdos", "chansey"]
     assert [m.name for m in active.moves] == ["bodyslam", "tackle"]
     assert [m.name for m in ordered[0].moves] == ["bodyslam", "tackle"]
+    assert policy_options(ordered) == (["bodyslam", "tackle"], ["alakazam", "exeggutor", "tauros", "zapdos"])
     mapping = action_slot_map(state, ordered)
-    # alive reserves in name order: alakazam, exeggutor, tauros, zapdos -> slots (reserve index 0, 2, 3, 4) + 4
-    assert list(mapping) == [0, 1, 2, 3, 4, 6, 7, 8, -1][:9]
+    # Metamon's k-th alive reserve (alakazam, exeggutor, tauros, zapdos) is slot 4 + k: the identity
+    assert list(mapping) == [0, 1, 2, 3, 4, 5, 6, 7, -1]
+
+
+def _more_tables() -> Tables:
+    t = _tables()
+    for i, name in enumerate(("snorlax", "starmie", "zapdos"), start=3):
+        t.species_ids[name] = i
+        t.base[name] = {"hp": 100, "atk": 100, "def": 100, "spe": 100, "spa": 100}
+    return t
+
+
+def test_opponent_is_sorted_by_species_with_sorted_moves():
+    """The opponent's revealed Pokemon go by species name and their revealed moves by name, whatever order they were seen in."""
+    tables = _more_tables()
+    own = [_mon("tauros", active=True, moves=("bodyslam", "tackle"))]
+    opp_active = _mon("snorlax", active=True, moves=("tackle", "bodyslam"))
+    revealed = [_mon("tauros", moves=("tackle",)), opp_active, _mon("chansey", moves=("tackle",))]
+    enc = encode_observer(_state(own[0], opp_active), own, revealed, LastTurn(), 3, tables)
+    assert list(enc.ids["opp_species"][:3]) == [tables.species_id(n) for n in ("chansey", "snorlax", "tauros")]
+    assert list(enc.floats["opp"][:3, 2]) == [0.0, 1.0, 0.0]  # the active flag follows the Pokemon
+    assert list(enc.ids["opp_moves"][1, :2]) == [tables.move_id("bodyslam"), tables.move_id("tackle")]
+
+
+def test_features_do_not_depend_on_the_order_of_the_inputs():
+    """Only the current state decides the layout: shuffling the party lists or the move lists changes nothing."""
+    tables = _more_tables()
+    def party(order):
+        mons = {"tauros": _mon("tauros", active=True, moves=("tackle", "bodyslam")), "chansey": _mon("chansey", hp=0.0),
+                "snorlax": _mon("snorlax", moves=("tackle", "bodyslam")), "starmie": _mon("starmie")}
+        return [mons[n] for n in order]
+    opp = lambda order: [{"zapdos": _mon("zapdos"), "snorlax": _mon("snorlax", active=True, moves=("tackle", "bodyslam"))}[n] for n in order]
+    a_own, b_own = party(["tauros", "chansey", "snorlax", "starmie"]), party(["starmie", "snorlax", "chansey", "tauros"])
+    a_opp, b_opp = opp(["zapdos", "snorlax"]), opp(["snorlax", "zapdos"])
+    b_opp[0].moves = list(reversed(b_opp[0].moves))
+    a = encode_observer(_state(a_own[0], a_opp[1]), a_own, a_opp, LastTurn(), 2, tables)
+    b = encode_observer(_state(b_own[3], b_opp[0]), b_own, b_opp, LastTurn(), 2, tables)
+    for k in a.ids:
+        assert (a.ids[k] == b.ids[k]).all(), k
+    for k in a.floats:
+        assert np.allclose(a.floats[k], b.floats[k]), k
 
 
 def _counter_tables() -> Tables:
@@ -258,6 +298,19 @@ def test_label_slots_follow_the_original_states_actions_by_identity():
     # a move the original state lists but the corrected one lacks (a different guess for an unrevealed move)
     legacy.player_active_pokemon = _mon("snorlax", active=True, moves=("bodyslam", "earthquake"))
     assert list(label_slot_map(legacy, party)[:2]) == [0, -1]
+
+
+def test_label_move_actions_follow_metamons_alphabetical_order_not_the_stored_order():
+    """Exeggcute's labels index moves by Metamon's action space (consistent_move_order: alphabetical). The parsed
+    state usually stores them in another order; the label for "thunderwave" must still land on thunderwave's slot."""
+    from metamon.recurrent.features import label_slot_map
+
+    party = [_mon("jolteon", active=True, moves=("pinmissile", "rest", "thunderbolt", "thunderwave")), _mon("chansey")]
+    legacy = _state(_mon("jolteon", active=True, moves=("thunderbolt", "thunderwave", "pinmissile", "rest")), _mon("chansey"))
+    legacy.available_switches = [_mon("chansey")]
+    m = label_slot_map(legacy, party)
+    # action j is the j-th move alphabetically (pinmissile, rest, thunderbolt, thunderwave); the model's slots use the same order
+    assert list(m[:4]) == [0, 1, 2, 3]
 
 
 if __name__ == "__main__":
