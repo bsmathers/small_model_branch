@@ -37,6 +37,15 @@ def _loads(raw: bytes):
     return json.loads(raw)
 
 
+# Every extras field the features and labels read (parse.PARSER_VERSION 3). Trajectories carry no version of their own, and
+# several of these are read with .get (a missing lock reads as no lock), so a trajectory from an older parser is refused here.
+REQUIRED_EXTRAS = frozenset({
+    "action_reason", "counter_selected", "forced_switch", "last_damage", "last_move", "last_opponent_action", "last_player_action",
+    "next_player_action", "opponent_cant", "opponent_conditions_all", "opponent_effects", "opponent_lock", "opponent_team",
+    "opponent_trapped", "player_cant", "player_conditions_all", "player_effects", "player_lock", "player_team", "player_trapped",
+})
+
+
 def load_trajectory(path: str) -> dict:
     """A trajectory written by metamon.recurrent.parse: states, actions and extras."""
     with lz4.frame.open(path, "rb") as f:
@@ -45,6 +54,10 @@ def load_trajectory(path: str) -> dict:
         raise ValueError(f"{os.path.basename(path)} has no extras: parse the raw log with metamon.recurrent.parse")
     if "legacy_states" not in data:
         raise ValueError(f"{os.path.basename(path)} has no legacy_states: run metamon.recurrent.merge_legacy (see its docstring)")
+    # (extras derived from the official parsed states by upgrade.py are marked "derived" and hold fewer fields)
+    missing = REQUIRED_EXTRAS - set(data["extras"][0]) if data["extras"] and not data["extras"][0].get("derived") else set()
+    if missing:
+        raise ValueError(f"{os.path.basename(path)} lacks extras {sorted(missing)}: made by an older parser (see parse.PARSER_VERSION); parse it again")
     return data
 
 
@@ -66,6 +79,16 @@ def _status(name: str) -> str:
     return name if name in STATUS_IDS else "nostatus"
 
 
+def _no_move_if_cant(kind: str, name: str, cant: Optional[str]) -> tuple[str, str]:
+    """A side that could not act ran no move. Logs with |choice| lines (about a fifth of the human games, none of the bots')
+    make the parser fall back to the CHOSEN move when none ran, giving "move X" together with the reason it failed; every other
+    log, and the duel server, give "none" with the reason. One convention: the chosen move is dropped. (A switch keeps its reason:
+    a replacement after a faint carries the faint's.)"""
+    if kind == "move" and cant is not None:
+        return "none", ""
+    return kind, name
+
+
 def last_turn_from_extras(prev_state: Optional[dict], state: dict, extras: dict) -> LastTurn:
     """The record of the turn that produced `state`, from the previous state and this state's extras."""
     if prev_state is None:
@@ -83,13 +106,17 @@ def last_turn_from_extras(prev_state: Optional[dict], state: dict, extras: dict)
     opp_hp, opp_status, opp_fainted = change(opp_prev, opp_now)
     own, opp = extras["last_player_action"], extras["last_opponent_action"]
     own_cant, opp_cant = extras["player_cant"], extras["opponent_cant"]
+    own_cant = own_cant if own_cant in CANT_REASONS else None
+    opp_cant = opp_cant if opp_cant in CANT_REASONS else None
+    own_kind, own_name = _no_move_if_cant(_kind(own), own["name"], own_cant)
+    opp_kind, opp_name = _no_move_if_cant(_kind(opp), opp["name"], opp_cant)
     return LastTurn(
-        own_kind=_kind(own),
-        own_name=own["name"],
-        own_cant=own_cant if own_cant in CANT_REASONS else None,
-        opp_kind=_kind(opp),
-        opp_name=opp["name"],
-        opp_cant=opp_cant if opp_cant in CANT_REASONS else None,
+        own_kind=own_kind,
+        own_name=own_name,
+        own_cant=own_cant,
+        opp_kind=opp_kind,
+        opp_name=opp_name,
+        opp_cant=opp_cant,
         own_hp_change=own_hp,
         opp_hp_change=opp_hp,
         own_status_inflicted=own_status,
@@ -115,6 +142,7 @@ class Decision:
     lock_shape: Optional[str]  # the lock on the observer's active Pokemon: "full", "semi" or None (see lock_shape)
     disabled_move: Optional[str]  # the move Disable took away from the observer's active Pokemon
     struggling: bool  # every move is out of PP, so the only move is Struggle
+    unusable_moves: tuple = ()  # policy move slots (0-3) the player cannot pick: out of PP or disabled (see unusable_move_slots)
 
 
 def result_from_filename(path: str) -> float:
@@ -168,6 +196,19 @@ def decision_facts(states: list[dict], actions: list[int], extras: list[dict], t
     )
 
 
+def unusable_move_slots(active, lock: Optional[dict]) -> tuple:
+    """The policy move slots of `active` (a Pokemon of canonical_own's party, moves in slot order) that the engine does not
+    offer: a move with no PP left, or the disabled move. Metamon's legal set (and so the labels' legal mask) lists every move.
+    A trapping move keeps going at 0 PP while its trap lasts (Gen 1), so PP is not checked while the player is trapping."""
+    disabled = _norm((lock or {}).get("disabled") or "")
+    trapping = (lock or {}).get("lock") == "trap_user"
+    return tuple(
+        j
+        for j, m in enumerate(active.moves[:4])
+        if (m.current_pp == 0 and m.max_pp and not trapping) or (disabled and _norm(m.name) == disabled)
+    )
+
+
 def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
     traj = load_trajectory(path)
     win = result_from_filename(path)
@@ -187,6 +228,7 @@ def iter_decisions(path: str, tables: Tables) -> Iterator[Decision]:
             win=win,
             slot_map=action_slot_map(state, ordered_party),
             label_slots=label_slot_map(interface.UniversalState.from_dict(copy.deepcopy(traj["legacy_states"][t])), ordered_party),
+            unusable_moves=unusable_move_slots(ordered_party[0], e.get("player_lock")),
             **decision_facts(states, actions, extras, t),
         )
         prev = s

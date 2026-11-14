@@ -56,6 +56,7 @@ NORMAL, FIGHT_OR_SWITCH, FORCED_RECHARGE, NO_CHOICE = 0, 1, 2, 4
 FORCED_LOCK = FORCED_RECHARGE  # a full lock: recharging, the second turn of a charge move, Thrash, Rage
 FORCED = (FORCED_LOCK, NO_CHOICE)
 FIGHT = 9  # `played` code: some move, which one is unknown or does not matter
+TMP_SUFFIX = ".partial"  # a game being written (see build_game)
 
 
 def decision_kind(d) -> int:
@@ -83,6 +84,32 @@ def adjust(kind: int, legal: np.ndarray, blend: np.ndarray, judge: np.ndarray):
         for row in (blend, judge):
             row[:4] = moves * (row[:4].sum() / moves.sum())
     return legal, blend, judge
+
+
+MAX_UNUSABLE_MASS = 0.5  # a target that put more than this on moves the player could not pick is not trained on
+
+
+def drop_unusable(kind: int, unusable, legal: np.ndarray, blend: np.ndarray, judge: np.ndarray):
+    """Removes the moves the engine did not offer (out of PP, disabled: records.unusable_move_slots) from a normal decision's
+    legal slots, and renormalises the targets over what is left. Exeggcute saw Metamon's legal set, which lists every move, so
+    its targets can hold mass there. Returns (legal, blend, judge, usable): usable is False when a target lost more than
+    MAX_UNUSABLE_MASS. (In the other kinds the moves are interchangeable or the slot is a no-op, so nothing is removed.)"""
+    if kind != NORMAL or not len(unusable):
+        return legal, blend, judge, True
+    legal, blend, judge = legal.copy(), blend.copy(), judge.copy()
+    cut = list(unusable)
+    usable = True
+    for row in (blend, judge):
+        total = row.sum()
+        removed = row[cut].sum()
+        row[cut] = 0
+        if total > 0:
+            if removed > MAX_UNUSABLE_MASS * total or row.sum() <= 0:
+                usable = False
+            elif removed > 0:
+                row *= total / row.sum()
+    legal[cut] = 0
+    return legal, blend, judge, usable
 
 
 def played_code(d, kind: int, legal_row: np.ndarray) -> int:
@@ -113,6 +140,10 @@ def build_game(args) -> tuple[str, int] | tuple[str, str]:
         n = len(labels["chosen"])
         decisions = []
         for d in iter_decisions(traj_path, _TABLES):
+            # the labeller labels every state but the last (the game is over there: label.py), so a trajectory of
+            # n + 1 states goes with n labels; anything else is a stale or partial label file
+            if d.length != n + 1:
+                return traj_path, f"{d.length} states but {n} labels (expected {d.length - 1})"
             if len(decisions) == n:
                 break
             decisions.append(d)
@@ -136,6 +167,10 @@ def build_game(args) -> tuple[str, int] | tuple[str, str]:
         kinds = np.array([decision_kind(d) for d in decisions], np.uint8)
         for t in range(n):
             mapped["legal"][t], mapped["blend"][t], mapped["judge"][t] = adjust(kinds[t], mapped["legal"][t], mapped["blend"][t], mapped["judge"][t])
+            mapped["legal"][t], mapped["blend"][t], mapped["judge"][t], usable = drop_unusable(
+                kinds[t], decisions[t].unusable_moves, mapped["legal"][t], mapped["blend"][t], mapped["judge"][t]
+            )
+            lost[t] |= not usable
         out["blend"] = mapped["blend"].astype(np.float16)
         out["judge"] = mapped["judge"].astype(np.float16)
         out["legal"] = mapped["legal"].astype(np.uint8)
@@ -146,7 +181,12 @@ def build_game(args) -> tuple[str, int] | tuple[str, str]:
         out["win"] = np.float32(decisions[0].win)
         out["played"] = np.array([played_code(d, kinds[t], mapped["legal"][t]) for t, d in enumerate(decisions)], np.int8)
         out["bc_game"] = np.bool_(observer_name(traj_path) in _BC_PLAYERS)
-        np.savez_compressed(out_path, **out)
+        # written under a temporary name and renamed when complete: an interrupted build never leaves a partial
+        # archive under the final name (which a restart would skip as built)
+        tmp = out_path + TMP_SUFFIX
+        with open(tmp, "wb") as f:
+            np.savez_compressed(f, **out)
+        os.replace(tmp, out_path)
         return traj_path, n
     except Exception as exc:  # report and keep going
         return traj_path, f"{type(exc).__name__}: {exc}"
@@ -166,6 +206,7 @@ def main() -> None:
     ap.add_argument("tables")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--bc-players", default=DEFAULT_BC_PLAYERS, help="comma-separated usernames whose own actions are imitated")
+    ap.add_argument("--max-failed", type=float, default=0.05, help="exit with an error when more than this share of the games fails (stale labels or trajectories)")
     args = ap.parse_args()
     os.makedirs(args.output, exist_ok=True)
     # games are skipped when already built, so a folder from another encoding would be silently mixed in: refuse it
@@ -190,6 +231,7 @@ def main() -> None:
             jobs.append((trajectories[stem], label, os.path.join(args.output, stem + ".npz")))
     print(f"{len(jobs)} games to build ({len(built)} already built)", flush=True)
     done = failed = 0
+    reasons: dict[str, int] = {}
     bc_players = tuple(x for x in args.bc_players.split(",") if x)
     _init(args.tables, bc_players)  # fail here, not in a worker that the pool would respawn forever
     with Pool(args.workers, initializer=_init, initargs=(args.tables, bc_players)) as pool:
@@ -197,11 +239,18 @@ def main() -> None:
             if isinstance(result, str):
                 failed += 1
                 print(f"failed {os.path.basename(path)}: {result}", flush=True)
+                kind = re.sub(r"[0-9]+", "N", result)[:120]
+                reasons[kind] = reasons.get(kind, 0) + 1
             else:
                 done += 1
             if (done + failed) % 100 == 0:
                 print(f"built {done}, failed {failed} of {len(jobs)}", flush=True)
     print(f"built {done}, failed {failed} of {len(jobs)}", flush=True)
+    for kind, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5]:
+        print(f"  {n} failed: {kind}", flush=True)
+    # (failed games are retried by the next run, which skips only the built ones)
+    if jobs and failed > args.max_failed * len(jobs):
+        raise SystemExit(f"{failed} of {len(jobs)} games failed to build (more than {args.max_failed:.0%}): the labels and trajectories do not match")
 
 
 if __name__ == "__main__":

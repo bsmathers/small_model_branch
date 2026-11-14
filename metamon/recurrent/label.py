@@ -518,6 +518,9 @@ def main() -> None:
         files = files[: args.limit]
     os.makedirs(args.output, exist_ok=True)
     files = [f for f in files if not os.path.exists(os.path.join(args.output, os.path.basename(f).split(".json")[0] + ".npz"))]
+    if not files:  # (e.g. --data labels: every game came labelled) no need to load the ensemble
+        print("labelled 0/0 games: every game already has its label", flush=True)
+        return
     spec, policy = load_ensemble(args.cache, args.device, args.threads, args.attention)
     half = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(args.precision)
     recorder = Recorder(policy)

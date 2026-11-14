@@ -1,12 +1,14 @@
 """Training windows from built games (see build.py), mixed across sources.
 
-A source is a directory of built games with a mixing weight. The weight is a share of decisions: a
-window is drawn by picking a source with that probability, then a game inside it with probability
-proportional to its length, then a window start uniformly. A game shorter than the window is padded
-(and the padding is masked out of every loss).
+A source is a directory of built games with a mixing weight. The weight is a share of the scored decisions,
+and inside a source every decision is scored equally often (see plan_window and draw_weights).
 
-A window has `burn_in + chunk` steps. When it starts mid-game, the first `burn_in` steps only build the
-recurrent state and carry no loss; a window that starts at the first decision of the game scores every step.
+A window has `burn_in + chunk` steps. A game that fits in one window is scored whole (padded at the end, the
+padding masked out of every loss). A longer game is scored a chunk at a time: the chunk's first decision c is
+uniform over [-(chunk - 1), n - 1], the chunk is cut to the game, and up to `burn_in` decisions before it only
+build the recurrent state and carry no loss. Every decision of the game is then in `chunk` of the n + chunk - 1
+possible chunks, the first and last ones included (a chunk start drawn among the full windows alone would score
+the beginning and the end of a long game only a few times).
 """
 
 from __future__ import annotations
@@ -95,6 +97,24 @@ def window(game: dict, start: int, size: int) -> dict[str, np.ndarray]:
     return out
 
 
+def plan_window(n: int, burn_in: int, chunk: int, rng) -> tuple[int, int, int]:
+    """A training window of a game of n decisions: (start in the game, scored steps [lo, hi) within the window)."""
+    if n <= burn_in + chunk:
+        return 0, 0, n
+    c = int(rng.integers(-(chunk - 1), n))  # the chunk's first decision; before the game start, the chunk is cut
+    first, last = max(c, 0), min(c + chunk, n)
+    start = max(first - burn_in, 0)
+    return start, first - start, last - start
+
+
+def draw_weights(lengths: np.ndarray, burn_in: int, chunk: int) -> np.ndarray:
+    """How often each game is drawn (unnormalised), so that each of its decisions is scored equally often: a game that fits
+    in a window is scored whole in every draw, a longer one scores `chunk` of its decisions in n + chunk - 1 equally likely
+    chunks, so it is drawn (n + chunk - 1) / chunk times as often."""
+    lengths = np.asarray(lengths, float)
+    return np.where(lengths <= burn_in + chunk, 1.0, (lengths + chunk - 1) / chunk)
+
+
 class Windows(IterableDataset):
     """An endless stream of windows (training), or one pass over fixed windows (validation)."""
 
@@ -109,15 +129,18 @@ class Windows(IterableDataset):
             yield from self._validation(wid, nworkers)
             return
         rng = np.random.default_rng([self.seed, wid])
-        weights = np.array([s.weight for s in self.sources], float)
+        games = [draw_weights(s.lengths, self.burn_in, self.chunk) for s in self.sources]
+        # a draw from a source scores (its decisions / its total draw weight) decisions on average: the source is picked
+        # in inverse proportion to that, so that its share of the scored decisions is its weight
+        weights = np.array([s.weight * g.sum() / s.lengths.sum() for s, g in zip(self.sources, games)], float)
         weights /= weights.sum()
+        games = [g / g.sum() for g in games]
         while True:
-            src = self.sources[rng.choice(len(self.sources), p=weights)]
-            i = rng.choice(len(src.paths), p=src.lengths / src.lengths.sum())
-            game = load_game(src.paths[i])
-            n = src.lengths[i]
-            start = int(rng.integers(0, max(n - self.size, 0) + 1))
-            yield self._item(game, start, self.sources.index(src))
+            k = rng.choice(len(self.sources), p=weights)
+            src = self.sources[k]
+            i = rng.choice(len(src.paths), p=games[k])
+            start, lo, hi = plan_window(int(src.lengths[i]), self.burn_in, self.chunk, rng)
+            yield self._item(load_game(src.paths[i]), start, lo, hi, k)
 
     def _validation(self, wid: int, nworkers: int):
         """Every game, covered by consecutive windows that score each decision once."""
@@ -129,15 +152,16 @@ class Windows(IterableDataset):
                 n = int(src.lengths[i])
                 start = 0
                 while True:
-                    yield self._item(game, start, src_idx)
+                    yield self._item(game, start, 0 if start == 0 else self.burn_in, self.size, src_idx)
                     if start + self.size >= n:
                         break
                     start += self.chunk
 
-    def _item(self, game: dict, start: int, source: int) -> dict:
+    def _item(self, game: dict, start: int, lo: int, hi: int, source: int) -> dict:
         w = window(game, start, self.size)
-        # steps that only build the recurrent state carry no loss unless the game starts here
-        w["scored"] = w["valid"] & ((np.arange(self.size) >= self.burn_in) | (start == 0))
+        # the steps before lo only build the recurrent state (lo is 0 when the window starts the game)
+        steps = np.arange(self.size)
+        w["scored"] = w["valid"] & (steps >= lo) & (steps < hi)
         w["source"] = np.array(source)
         return w
 

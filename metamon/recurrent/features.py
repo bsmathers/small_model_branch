@@ -54,7 +54,9 @@ SPEED_SCALE = 500.0
 #   (none)                   the first layout: reserves sorted with the fainted ones, opponent in first-appearance order,
 #                            and labels whose moves were mapped through the stored move order (scrambled)
 #   2-exeggcute-order        Exeggcute's (Metamon's) order everywhere, from the current state only; slots = its action indices
-ENCODING_VERSION = "2-exeggcute-order"
+#   3-usable-moves-no-move-if-cant   as 2; moves out of PP or disabled are not legal (build.drop_unusable); a side that could
+#                            not act ran no move in the last-turn record (records._no_move_if_cant)
+ENCODING_VERSION = "3-usable-moves-no-move-if-cant"
 ENCODING_STAMP = ".encoding_version"
 
 

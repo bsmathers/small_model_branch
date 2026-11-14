@@ -1,7 +1,7 @@
 """One-command preparation and training for the recurrent model. Every step is resumable: finished
 games are skipped, so an interrupted run can be started again with the same arguments.
 
-    # per source (raw Showdown logs -> trajectories -> Exeggcute labels -> built games);
+    # per source (raw Showdown logs -> trajectories (+ the original parser's states) -> Exeggcute labels -> built games);
     # add --input-format parsed when the input is official parsed files (e.g. pac-tauros)
     python -m metamon.recurrent.pipeline prepare --name human --raw /data/raw/human --work /data/work \
         --cache /data/metamon-cache --device cuda --label-batch 64 [--shard 0/4] [--limit N]
@@ -20,6 +20,8 @@ import argparse
 import os
 import subprocess
 import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # (tools/ is not part of the package)
 
 
 def run(*cmd: str) -> None:
@@ -40,10 +42,14 @@ def prepare(args) -> None:
         # raw Showdown logs go through the full parser; files already in the official parsed format (no raw
         # log exists) get their extras derived from the states, with less information (see upgrade.py)
         module = "metamon.recurrent.parse" if args.input_format == "raw" else "metamon.recurrent.upgrade"
-        cmd = [py, "-m", module, args.raw, traj, "--shard", args.shard]
-        if args.limit:
-            cmd += ["--limit", str(args.limit)]
-        run(*cmd)
+        limit = ["--limit", str(args.limit)] if args.limit else []
+        run(py, "-m", module, args.raw, traj, "--shard", args.shard, *limit)
+        if args.input_format == "raw":
+            # the labeller runs Exeggcute on the ORIGINAL parser's states (it was trained on them): parse the same logs with
+            # it and fold its states into the trajectories (merge_legacy.py; upgrade.py copies the official states itself)
+            legacy = os.path.join(work, "legacy")
+            run(py, os.path.join(REPO, "tools", "legacy_parse.py"), args.raw, legacy, "--shard", args.shard, *limit)
+            run(py, "-m", "metamon.recurrent.merge_legacy", traj, legacy, "--shard", args.shard)
     if only in (None, "label"):
         cmd = [py, "-m", "metamon.recurrent.label", traj, labels, "--cache", args.cache, "--batch", str(args.label_batch),
                "--device", args.device, "--threads", str(args.threads), "--shard", args.shard,
