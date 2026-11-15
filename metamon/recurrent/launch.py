@@ -15,6 +15,17 @@ Normally started through `launch.sh`, which installs the requirements first:
     ./launch.sh --smoke            # a few minutes: tiny sample of every stage, prints timings and projections
     ./launch.sh --games 60000 --steps 30000 --mix human=0.5 --mix strong=0.5
 
+Checks (each one stops the run when it fails; --skip-checks turns the last two off):
+    launch.sh   network (Hugging Face API and a 16 MB test download from its file storage, PyPI and GitHub before the install),
+                a Hugging Face token, and that this checkout is not behind origin
+    preflight   the dataset repos can be listed with the token and hold every zip this run downloads
+    labels      (--data labels, after the download, before any build) at most --max-unlabelled of the trajectories lack a label,
+                and random whole games per source (--check-decisions decisions), relabelled here by Exeggcute's own code (verify_labels reference,
+                CPU, fp32), match the downloaded labels within bf16 noise (verify_labels compare --preset bf16)
+    built       (after the build, before training) --check-built-games random built games per source match their labels and
+                trajectories by option name, with none of the build's code (verify_built)
+--check-only stops after the built check, before training.
+
 Every stage is resumable: games already parsed, labelled or built are skipped, and training continues from
 its last checkpoint, so a stopped run is continued by starting the same command again. Progress is plain
 text in WORK/logs (one file per stage and shard) and in WORK/logs/launch.txt.
@@ -426,7 +437,141 @@ class Launcher:
 
         return n_traj, wanted
 
+    def preflight(self) -> None:
+        """Before any download: the repos are reachable with this token and hold the files this run needs (a missing file or a bad
+        token otherwise shows up an hour in, after the first source's download)."""
+        a = self.args
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        try:
+            user = api.whoami().get("name", "?")
+        except Exception as e:
+            user = None
+            self.log(f"preflight: not logged in to Hugging Face ({type(e).__name__}); fine for public repos only")
+        needed = []  # (repo, file or None for 'a zip with the source in its name')
+        sources = [n for n in SOURCES if float(self.mix.get(n, 0)) > 0]
+        if a.data == "built":
+            needed += [(a.built_repo, f"{n}_built.zip") for n in sources]
+        elif not (a.from_raw or a.raw_human or a.raw_strong):
+            for n in sources:  # (what an earlier start of this run already extracted is not needed again)
+                if not {"human": a.traj_human_dir, "strong": a.traj_strong_dir}[n] and not os.path.exists(os.path.join(self.work, n, ".trajectories_done")):
+                    needed.append((a.traj_repo, {"human": a.traj_human_zip, "strong": a.traj_strong_zip}[n]))
+                if a.data == "labels" and not os.path.exists(os.path.join(self.work, "hf", f"{n}_labels.zip")) \
+                        and not os.path.exists(os.path.join(self.work, n, "labels", ".labels_done")):
+                    needed.append((a.built_repo, f"{n}_labels.zip"))
+        listed = {}
+        for repo, f in needed:
+            if repo not in listed:
+                try:
+                    listed[repo] = set(api.list_repo_files(repo, repo_type="dataset"))
+                except Exception as e:
+                    raise SystemExit(f"preflight: cannot list the dataset repo {repo} ({type(e).__name__}: {e}). "
+                                     f"Check HF_TOKEN (logged in as {user}) and the network") from e
+            if f is not None and f not in listed[repo]:
+                raise SystemExit(f"preflight: {repo} has no {f} (it has {sorted(x for x in listed[repo] if x.endswith('.zip'))})")
+        self.log(f"preflight: Hugging Face user {user}; " + ("found " + ", ".join(f"{r}/{f or '<zip per source>'}" for r, f in needed) if needed else "nothing left to download"))
+
+    def check_labels(self) -> None:
+        """--data labels: the downloaded labels are trained on as they are, so before the build: (1) nearly every trajectory has one
+        (the label stage would label the rest on the GPU), (2) a random sample of games, relabelled here by metamon's own ensemble
+        step by step (verify_labels reference, fp32 on the CPU), matches the downloaded labels within bf16 noise (verify_labels
+        compare --preset bf16): the same actions, the same probabilities on the same slots, labels of the right games."""
+        a = self.args
+        sources = [n for n in SOURCES if float(self.mix.get(n, 0)) > 0]
+        marker = os.path.join(self.work, "check", ".labels_ok")
+        if os.path.exists(marker):
+            self.log(f"label check: passed before ({open(marker).read().strip()})")
+            return
+        import random
+
+        import numpy as np
+
+        cmds, envs, picked = [], [], {}
+        for name in sources:
+            traj, labels = os.path.join(self.work, name, "trajectories"), os.path.join(self.work, name, "labels")
+            stems = sorted(f[: -len(".json.lz4")] for f in os.listdir(traj) if f.endswith(".json.lz4"))
+            have = {f[: -len(".npz")] for f in os.listdir(labels) if f.endswith(".npz")} if os.path.isdir(labels) else set()
+            missing = [s for s in stems if s not in have]
+            self.log(f"label check {name}: {len(stems) - len(missing)} of {len(stems)} trajectories have a downloaded label")
+            if len(missing) > a.max_unlabelled * len(stems):
+                raise SystemExit(f"label check: {len(missing)} of {len(stems)} {name} trajectories have no label (more than "
+                                 f"{a.max_unlabelled:.0%}): the label zip does not belong to these trajectories, or is incomplete. "
+                                 f"First missing: {missing[:3]}")
+            # random games until they hold --check-decisions decisions (a fixed number of games can be a handful of short ones)
+            pool = sorted(have & set(stems))
+            random.Random(f"{a.check_seed}-{name}").shuffle(pool)
+            sample, total = [], 0
+            for s in pool:
+                if total >= a.check_decisions:
+                    break
+                sample.append(s)
+                total += len(np.load(os.path.join(labels, s + ".npz"))["chosen"])
+            picked[name] = sample
+            self.log(f"label check {name}: {len(sample)} random games, {total} decisions")
+            ref_in, ref_out = os.path.join(self.work, "check", name, "trajectories"), os.path.join(self.work, "check", name, "reference")
+            os.makedirs(ref_in, exist_ok=True)
+            for s in sample:
+                link = os.path.join(ref_in, s + ".json.lz4")
+                if not os.path.lexists(link):
+                    os.symlink(os.path.join(traj, s + ".json.lz4"), link)
+            threads = max(1, self.cpus // len(sources))
+            cmds.append([self.py, "-m", "metamon.recurrent.verify_labels", "reference", ref_in, ref_out, "--cache", self.cache,
+                         "--device", "cpu", "--precision", "fp32", "--threads", str(threads)])
+            envs.append(self.env(HF_HUB_OFFLINE=1, OMP_NUM_THREADS=threads))
+        self.log(f"label check: relabelling {sum(map(len, picked.values()))} random games with Exeggcute's own code (CPU, fp32) "
+                 f"to compare with the downloaded labels; progress in {self.logs}/check_labels_N.txt")
+        self.run_parallel("check_labels", cmds, envs, lambda: " ".join(self.newest_line_of(f"check_labels_{i}") for i in range(len(cmds))))
+        results = []
+        for name in sources:
+            cmd = [self.py, "-m", "metamon.recurrent.verify_labels", "compare", os.path.join(self.work, "check", name, "reference"),
+                   os.path.join(self.work, name, "labels"), "--preset", "bf16", "--min-decisions", str(min(a.check_decisions, 1000))]
+            r = subprocess.run(cmd, env=self.env(HF_HUB_OFFLINE=1), capture_output=True, text=True)
+            text = (r.stdout + r.stderr).strip()
+            with open(os.path.join(self.logs, f"check_labels_compare_{name}.txt"), "w") as f:
+                f.write(text + "\n")
+            for line in text.splitlines():
+                if not line.startswith("  "):
+                    self.log(f"label check {name}: {line}")
+            if r.returncode != 0:
+                reason = (text.splitlines() or ["?"])[-1]
+                raise SystemExit(f"label check FAILED for {name}: {reason} (details in {self.logs}/check_labels_compare_{name}.txt). "
+                                 f"Stopping before the build and training")
+            results.append(f"{name}: {len(picked[name])} games")
+        open(marker, "w").write(", ".join(results) + "\n")
+        self.log("label check: PASSED")
+
+    def newest_line_of(self, log: str) -> str:
+        try:
+            with open(os.path.join(self.logs, f"{log}.txt"), "rb") as f:
+                lines = f.read()[-400:].decode("utf-8", "replace").strip().splitlines()
+            return f"[{lines[-1][:90]}]" if lines else "[starting]"
+        except OSError:
+            return "[no log]"
+
+    def check_built(self) -> None:
+        """After the build, before training: a random sample of built games against their labels and trajectories by option name,
+        with none of the build's code (verify_built): the mapping from Exeggcute's actions to this model's slots, the slot meaning
+        the features show, and the played action. A wrong mapping (the bug that sank an earlier run) fails here."""
+        a = self.args
+        for name in self.mix:
+            if float(self.mix[name]) <= 0:
+                continue
+            src = os.path.join(self.work, name)
+            cmd = [self.py, "-m", "metamon.recurrent.verify_built", os.path.join(src, "trajectories"), os.path.join(src, "labels"),
+                   os.path.join(src, "built"), os.path.join(self.work, "tables"), "--games", str(a.check_built_games), "--seed", str(a.check_seed)]
+            r = subprocess.run(cmd, env=self.env(HF_HUB_OFFLINE=1), capture_output=True, text=True)
+            text = (r.stdout + r.stderr).strip()
+            with open(os.path.join(self.logs, f"check_built_{name}.txt"), "w") as f:
+                f.write(text + "\n")
+            for line in text.splitlines()[:3] + text.splitlines()[-1:]:
+                self.log(f"built check {name}: {line}")
+            if r.returncode != 0:
+                raise SystemExit(f"built check FAILED for {name} (details in {self.logs}/check_built_{name}.txt). Stopping before training")
+        self.log("built check: PASSED")
+
     def prepare(self, name: str, raw_dir: str | None, games: int) -> None:
+        """Gets one source's trajectories (and, with --data labels, their labels) on disk."""
         a = self.args
         src = os.path.join(self.work, name)
         traj, labels, built = (os.path.join(src, d) for d in ("trajectories", "labels", "built"))
@@ -459,6 +604,15 @@ class Launcher:
             wanted = n_traj // 2
         else:
             n_traj, wanted = self.parse_raw(name, raw_dir, games, src, traj)
+        self.counts = getattr(self, "counts", {})
+        self.counts[name] = (wanted, n_traj)
+
+    def label_and_build(self, name: str) -> None:
+        """Labels what has no label yet (with --data labels, only games the label zip lacks), then builds the training games."""
+        a = self.args
+        src = os.path.join(self.work, name)
+        traj, labels, built = (os.path.join(src, d) for d in ("trajectories", "labels", "built"))
+        n_traj = self.counts[name][1]
 
         # label, several processes per GPU. The members run once per game as a few big GPU calls; what is left is the router's per-game Python and
         # building observations, one core each, and measured on a 3090 the card sat idle most of the time with 3 processes. So the count is set by
@@ -486,8 +640,6 @@ class Launcher:
             self.log(f"{name}: built {self.count_files(built, '.npz')} games")
         else:
             self.start_background(stage, [self.py, "-m", "metamon.recurrent.build", traj, labels, built, os.path.join(self.work, "tables"), "--workers", str(max(2, self.cpus // 2)), "--bc-players", a.bc_players], self.env(HF_HUB_OFFLINE=1, **self.SINGLE_THREAD))
-        self.counts = getattr(self, "counts", {})
-        self.counts[name] = (wanted, n_traj)
 
     def train(self) -> None:
         """Two stages: the policy (distillation and imitation; the win head gets no gradient), then the win head, with the backbone held
@@ -579,6 +731,7 @@ class Launcher:
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
         self.background = []
         if a.data == "built" and not a.train_only and not (a.from_raw or a.raw_human or a.raw_strong or a.traj_human_dir or a.traj_strong_dir):
+            self.preflight()
             for name, weight in self.mix.items():
                 if float(weight) > 0:
                     self.fetch_zip(name, "built", os.path.join(self.work, name, "built"))
@@ -589,17 +742,27 @@ class Launcher:
                 if float(weight) > 0 and not (os.path.isdir(built) and any(f.endswith(".npz") for f in os.listdir(built))):
                     raise SystemExit(f"--train-only: no built games in {built}")
         else:
+            self.preflight()
             self.prefetch()
             raw = self.fetch_data() if a.from_raw or a.raw_human or a.raw_strong else {}
+            sources = [n for n in SOURCES if float(self.mix.get(n, 0)) > 0]
+            for name in sources:
+                self.prepare(name, raw.get(name), a.games)
+            if a.data == "labels" and not a.skip_checks:
+                self.check_labels()
             try:
-                for name in SOURCES:
-                    if float(self.mix.get(name, 0)) > 0:
-                        self.prepare(name, raw.get(name), a.games)
+                for name in sources:
+                    self.label_and_build(name)
                 self.finish_background()
             except BaseException:
                 self.stop([(p, h) for _, p, h, _ in self.background])  # (Ctrl-C or a failure: no build is left running)
                 raise
         self.mix = {k: v for k, v in self.mix.items() if float(v) > 0}
+        if not a.skip_checks and not a.train_only:
+            self.check_built()
+        if a.check_only:
+            self.log("--check-only: data downloaded and checked; stopping before training")
+            return
         self.train()
         self.summary()
 
@@ -658,6 +821,12 @@ def main() -> None:
     ap.add_argument("--label-batch", type=int, default=0, help="games labelled in lockstep per process (default 256 on a GPU, 64 on a CPU: the lanes of a lockstep batch that finished early still cost their share of the math, and a CPU gains little from larger batches)")
     ap.add_argument("--no-overlap", action="store_true", help="build a source after labelling it, instead of in the background while the next source is prepared")
     ap.add_argument("--smoke", action="store_true", help="tiny sample of every stage, prints timings and a projection")
+    ap.add_argument("--check-only", action="store_true", help="download, check the labels, build, check the built games, then stop before training")
+    ap.add_argument("--skip-checks", action="store_true", help="skip the label check and the built-game check (not recommended)")
+    ap.add_argument("--max-unlabelled", type=float, default=0.01, help="(--data labels) stop when more than this share of the trajectories has no downloaded label")
+    ap.add_argument("--check-decisions", type=int, default=2500, help="(--data labels) decisions per source (random whole games) relabelled from scratch to check the downloaded labels")
+    ap.add_argument("--check-built-games", type=int, default=300, help="built games per source checked against their labels by name")
+    ap.add_argument("--check-seed", type=int, default=0, help="seed of the checks' random samples")
     args = ap.parse_args()
     args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)
     if args.smoke:
@@ -666,6 +835,7 @@ def main() -> None:
         args.steps, args.val_every, args.save_every, args.val_batches = min(args.steps, 150), 75, 150, 20
         args.value_steps = min(args.value_steps, 75)
         args.val_fraction = min(args.val_fraction, 5)
+        args.check_decisions, args.check_built_games = min(args.check_decisions, 300), min(args.check_built_games, 50)
         args.work = args.work.rstrip("/") + "_smoke"
     import signal
 

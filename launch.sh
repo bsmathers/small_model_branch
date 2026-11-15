@@ -10,7 +10,11 @@
 #   (--backup-every; --backup-dir PATH for another mount, none to turn off). Rerunning the same command on a new
 #   container with that volume resumes from it.
 #
+#   It first checks the network (Hugging Face, and PyPI/GitHub before the install), the HF token and that this checkout is
+#   current; the launcher then checks the repos, the downloaded labels and the built games before training (see its docstring).
+#
 #   ./launch.sh --smoke        # a few minutes; prints timings and a projection for the full run
+#   ./launch.sh --check-only   # download, check the labels, build, check the built games; stop before training
 #   ./launch.sh                # the full run
 #   ./launch.sh --games 60000 --steps 30000 --mix human=0.4 --mix strong=0.6
 #
@@ -25,6 +29,40 @@ PYTHON="${PYTHON:-python3}"
 mkdir -p "$WORK"
 
 log() { echo "$(date +%H:%M:%S) launch.sh: $*"; }
+
+# ---- first checks: network, credentials, code version (a few seconds; each failure stops here, before anything is downloaded) ----
+reach() {  # URL: any HTTP answer below 400 within 20 s
+  local code
+  code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || echo 000)
+  if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then log "network: $1 ok ($code)"; else log "network: cannot reach $1 (HTTP $code). This host cannot download the data (blocked region or no internet): use another machine"; exit 1; fi
+}
+command -v curl >/dev/null 2>&1 || { log "curl is missing (apt-get install -y curl)"; exit 1; }
+reach https://huggingface.co/api/datasets/bsmathers/labeled_gen1_retrajectories
+# the zips come from Hugging Face's file CDN, another host: download the first 16 MB of one and report the speed
+probe=$(curl -sS -m 60 -L -r 0-16777215 -o /dev/null -w '%{http_code} %{size_download} %{speed_download}' \
+  https://huggingface.co/datasets/bsmathers/labeled_gen1_retrajectories/resolve/main/human.zip 2>/dev/null || echo "000 0 0")
+read -r p_code p_size p_speed <<< "$probe"
+if [ "$p_code" != "206" ] && [ "$p_code" != "200" ] || [ "${p_size%.*}" -lt 1000000 ]; then
+  log "network: cannot download from Hugging Face's file storage (HTTP $p_code, ${p_size%.*} bytes): use another machine"; exit 1
+fi
+log "network: Hugging Face download speed $(( ${p_speed%.*} / 1000000 )) MB/s"
+if [ -z "${SKIP_INSTALL:-}" ] && [ ! -f "$WORK/venv/.installed" ]; then
+  reach https://pypi.org/simple/pip/
+  reach https://github.com
+fi
+if [ -z "${HF_TOKEN:-}" ] && [ ! -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ]; then
+  log "no Hugging Face token: set HF_TOKEN=hf_... or run 'hf auth login' (the labels repo is private)"; exit 1
+fi
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  if git fetch -q origin 2>/dev/null; then
+    behind=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+    if [ "$behind" != "0" ]; then log "this checkout is $behind commits behind origin: run 'git pull' first"; exit 1; fi
+  else
+    log "warning: could not reach the git remote to check that this checkout is current"
+  fi
+  if ! git diff --quiet HEAD -- metamon launch.sh 2>/dev/null; then log "warning: local changes in metamon/ or launch.sh (git status)"; fi
+  log "code: $(git log -1 --format='%h %s')"
+fi
 
 if [ -z "${SKIP_INSTALL:-}" ]; then
   # A virtualenv that can see the system packages, so a preinstalled CUDA build of torch is reused.

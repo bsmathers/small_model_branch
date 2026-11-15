@@ -152,9 +152,13 @@ def compare(args) -> None:
     names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(args.reference, "*.npz")))
     if not names:
         raise SystemExit(f"no reference labels in {args.reference}")
+    if args.preset == "bf16":  # labels made in bf16 (as on vast) against the fp32 reference: near-ties flip, see PRESETS
+        for k, v in PRESETS["bf16"].items():
+            setattr(args, k, v)
     rows = []
-    totals = {"decisions": 0, "chosen_differs": 0, "missing": 0, "legal_differs": 0, "has_differs": 0}
+    totals = {"decisions": 0, "chosen_differs": 0, "missing": 0, "legal_differs": 0, "has_differs": 0, "permuted": 0}
     worst_blend = worst_judge = 0.0
+    blend_l1, blend_kl, judge_l1 = [], [], []
     for name in names:
         test_path = os.path.join(args.test, name)
         if not os.path.exists(test_path):
@@ -172,6 +176,15 @@ def compare(args) -> None:
         db = np.abs(r["blend"].astype(np.float64) - s["blend"]).max(1)
         dj = np.abs(r["judge"].astype(np.float64) - s["judge"]).max(1)
         worst_blend, worst_judge = max(worst_blend, float(db.max())), max(worst_judge, float(dj.max()))
+        rb, sb = r["blend"].astype(np.float64), s["blend"].astype(np.float64)
+        both = r["has_blend"] & s["has_blend"]
+        blend_l1 += list(np.abs(rb - sb).sum(1)[both])
+        blend_kl += list((rb * (np.log(np.maximum(rb, 1e-12)) - np.log(np.maximum(sb, 1e-12)))).sum(1)[both])
+        both_j = r["has_judge"] & s["has_judge"]
+        judge_l1 += list(np.abs(r["judge"].astype(np.float64) - s["judge"]).sum(1)[both_j])
+        # the same probabilities on other slots (a reordering of the actions, the bug class that hides best): flagged on its own
+        far = both & (np.abs(rb - sb).sum(1) > 0.2)
+        totals["permuted"] += int((far & (np.abs(np.sort(rb, 1) - np.sort(sb, 1)).sum(1) < 0.05)).sum())
         for t in range(n):
             if differs[t] or db[t] > args.blend_tol or dj[t] > args.judge_tol:
                 rows.append((name, t, int(r["chosen"][t]), int(s["chosen"][t]), float(db[t]), float(dj[t])))
@@ -179,14 +192,38 @@ def compare(args) -> None:
     print(f"{len(names)} games, {totals['decisions']} decisions ({totals['missing']} games missing from {args.test})")
     print(f"chosen differs: {totals['chosen_differs']} ({totals['chosen_differs'] / d:.4%}); legal differs: {totals['legal_differs']}; "
           f"has_blend/has_judge differ: {totals['has_differs']}")
+    mean = lambda xs: float(np.mean(xs)) if xs else 0.0
     print(f"largest |blend difference| {worst_blend:.2e}, largest |judge difference| {worst_judge:.2e}")
+    print(f"mean blend L1 {mean(blend_l1):.2e}, mean KL(reference || labels) {mean(blend_kl):.2e}, mean judge L1 {mean(judge_l1):.2e}; "
+          f"decisions whose blend looks reordered: {totals['permuted']}")
     for row in sorted(rows, key=lambda r: -max(r[4], r[5]))[:15]:
         print(f"  {row[0]} t={row[1]} chosen {row[2]} vs {row[3]}, blend diff {row[4]:.3e}, judge diff {row[5]:.3e}")
-    bad = (totals["missing"] or totals["legal_differs"] or totals["has_differs"] or totals["chosen_differs"] > args.chosen_tol * d
-           or worst_blend > args.blend_tol or worst_judge > args.judge_tol)
-    if bad:
-        raise SystemExit("the labels differ from the reference beyond the tolerances")
+    problems = []
+    if totals["missing"]:
+        problems.append(f"{totals['missing']} games have no label")
+    if totals["legal_differs"] or totals["has_differs"]:
+        problems.append("the legal actions or the label presence differ (labels of another state or game)")
+    if totals["permuted"]:
+        problems.append(f"{totals['permuted']} decisions have the reference's probabilities on other actions (reordered)")
+    if totals["chosen_differs"] > args.chosen_tol * d:
+        problems.append(f"chosen action differs in {totals['chosen_differs'] / d:.2%} (allowed {args.chosen_tol:.2%})")
+    if worst_blend > args.blend_tol or worst_judge > args.judge_tol:
+        problems.append(f"largest difference blend {worst_blend:.3f} / judge {worst_judge:.3f} (allowed {args.blend_tol} / {args.judge_tol})")
+    if mean(blend_l1) > args.mean_blend_tol or mean(blend_kl) > args.mean_kl_tol or mean(judge_l1) > args.mean_judge_tol:
+        problems.append(f"mean differences blend L1 {mean(blend_l1):.4f} / KL {mean(blend_kl):.5f} / judge L1 {mean(judge_l1):.4f} "
+                        f"(allowed {args.mean_blend_tol} / {args.mean_kl_tol} / {args.mean_judge_tol})")
+    if totals["decisions"] < args.min_decisions:
+        problems.append(f"only {totals['decisions']} decisions compared (at least {args.min_decisions})")
+    if problems:
+        raise SystemExit("the labels differ from the reference: " + "; ".join(problems))
     print("labels match the reference within the tolerances")
+
+
+# Measured on 24 games (6,375 decisions): labeller in bf16 against the fp32 reference. Chosen differs 0.39% (all near-ties), largest blend
+# difference 0.044, largest judge difference 0.71 (a near-tie flips the router's pick, and the judge then scores another shortlist), mean blend
+# L1 and KL as printed by `compare`. The limits are several times those, and far below what a wrong label set gives (a reordering moves most of
+# the mass: L1 near 1 on most decisions).
+PRESETS = {"bf16": {"chosen_tol": 0.02, "blend_tol": 0.25, "judge_tol": 1.0, "mean_blend_tol": 0.03, "mean_kl_tol": 2e-3, "mean_judge_tol": 0.15}}
 
 
 def main() -> None:
@@ -205,6 +242,11 @@ def main() -> None:
     c.add_argument("--blend-tol", type=float, default=1e-3, help="largest allowed |difference| of a blend probability")
     c.add_argument("--judge-tol", type=float, default=1e-3)
     c.add_argument("--chosen-tol", type=float, default=0.0, help="largest allowed share of decisions with another chosen action")
+    c.add_argument("--mean-blend-tol", type=float, default=1e-3, help="largest allowed mean L1 distance of the blends")
+    c.add_argument("--mean-kl-tol", type=float, default=1e-4, help="largest allowed mean KL(reference blend || tested blend)")
+    c.add_argument("--mean-judge-tol", type=float, default=1e-3, help="largest allowed mean L1 distance of the judge distributions")
+    c.add_argument("--min-decisions", type=int, default=1)
+    c.add_argument("--preset", choices=("exact", "bf16"), default="exact", help="bf16: the tolerances for bf16 labels against the fp32 reference (overrides the others)")
     args = ap.parse_args()
     {"reference": reference, "compare": compare}[args.command](args)
 
