@@ -7,7 +7,7 @@ WORK/<source>/built) and train. No Exeggcute checkpoints, labelling or build: th
 zips built with the current features.ENCODING_VERSION can be trained on (the ones uploaded before it are refused).
 --data trajectories: download the finished trajectories (bsmathers/labeled_gen1_retrajectories: one zip per source, unzipped
 into WORK/<source>/trajectories), label, build and train. `--from-raw` parses raw replay logs instead (bsmathers/raw_replays).
-The backup repo is private: log in once with `hf auth login`, or set HF_TOKEN.
+Both dataset repos are public: no Hugging Face token is needed.
 
 Normally started through `launch.sh`, which installs the requirements first:
 
@@ -17,8 +17,8 @@ Normally started through `launch.sh`, which installs the requirements first:
 
 Checks (each one stops the run when it fails; --skip-checks turns the last two off):
     launch.sh   network (Hugging Face API and a 16 MB test download from its file storage, PyPI and GitHub before the install),
-                a Hugging Face token, and that this checkout is not behind origin
-    preflight   the dataset repos can be listed with the token and hold every zip this run downloads
+                and that this checkout is not behind origin
+    preflight   the dataset repos can be listed and hold every zip this run downloads
     labels      (--data labels, after the download, before any build) at most --max-unlabelled of the trajectories lack a label,
                 and random whole games per source (--check-decisions decisions), relabelled here by Exeggcute's own code (verify_labels reference,
                 CPU, fp32), match the downloaded labels within bf16 noise (verify_labels compare --preset bf16)
@@ -31,7 +31,7 @@ its last checkpoint, so a stopped run is continued by starting the same command 
 text in WORK/logs (one file per stage and shard) and in WORK/logs/launch.txt.
 
 Layout under WORK: hf/ (downloaded zips), raw/<source>/ (logs), metamon-cache/ (checkpoints, usage stats),
-<source>/{trajectories,labels,built}, tables/, run/ (policy stage) and run_value/ (value stage; weights_<step>.pt is the model).
+<source>/{trajectories,labels,built}, tables/, run_v3/ (policy stage) and run_v3_value/ (value stage; weights_final.pt is the model).
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ class Launcher:
         os.makedirs(self.logs, exist_ok=True)
         self.cache = os.path.abspath(args.cache or os.path.join(self.work, "metamon-cache"))
         self.timings: dict[str, float] = {}
+        self.dataset_games: dict[str, int] = {}  # games per source in the downloaded dataset (for the smoke run's projection)
         self.py = sys.executable
 
     # ---- small helpers ----
@@ -365,7 +366,10 @@ class Launcher:
         traj, labels = os.path.join(src, "trajectories"), os.path.join(src, "labels")
         marker = os.path.join(src, ".trajectories_done")
         if os.path.exists(marker):
-            self.log(f"{name}: trajectories already extracted ({open(marker).read().strip()})")
+            note = open(marker).read().strip()
+            self.log(f"{name}: trajectories already extracted ({note})")
+            if " of " in note:
+                self.dataset_games[name] = int(note.rsplit(" of ", 1)[1])
             return
         local = {"human": a.traj_human_dir, "strong": a.traj_strong_dir}[name]
         opened = None
@@ -409,7 +413,8 @@ class Launcher:
             opened.close()
             os.remove(opened.filename)  # the zip is no longer needed
         self.log(f"{name}: extracted {count} trajectories")
-        open(marker, "w").write(f"{count} trajectories, every {every}th game\n")
+        open(marker, "w").write(f"{count} trajectories, every {every}th game of {len(ids)}\n")
+        self.dataset_games[name] = len(ids)
 
     def parse_raw(self, name: str, raw_dir: str, games: int, src: str, traj: str):
         """--from-raw: parse the .log files here (corrected parser + original parser + merge)."""
@@ -710,7 +715,12 @@ class Launcher:
         at full size, so the projection errs high."""
         a = self.args
         sources = [n for n in SOURCES if n in self.counts]
-        scale_games = a.full_games * len(sources) / max(1, sum(w for w, _ in self.counts.values()))
+        # --games 0 means every game: scale up to the dataset's size
+        full = sum(a.full_games or self.dataset_games.get(n, 0) for n in sources)
+        if not full:
+            self.log("projection: the dataset size is unknown (local folders?); pass --games N for a projection")
+            return
+        scale_games = full / max(1, sum(w for w, _ in self.counts.values()))
         # each stage's fixed startup (loading the ensemble takes about a minute per label process) happens once, not per game
         startup = {"label": 60.0, "parse": 5.0, "legacy": 5.0, "merge": 1.0, "build": 3.0}
         parts = []
@@ -719,8 +729,9 @@ class Launcher:
             work = max(t - startup[stage] * len(sources), 0.3 * t)
             parts.append((stage, work * scale_games))
         t_train = self.timings.get("train", 0.0) + self.timings.get("train_value", 0.0)
-        parts.append((f"train ({a.full_steps} steps)", t_train / max(1, a.steps + a.value_steps) * (a.full_steps + a.value_steps)))
-        self.log(f"projected for --games {a.full_games} per source and {a.full_steps} steps (hours, rough): " + ", ".join(f"{k} {v / 3600:.1f}" for k, v in parts) + f"; total {sum(v for _, v in parts) / 3600:.1f}")
+        parts.append((f"train ({a.full_steps} + {a.full_value_steps} steps)", t_train / max(1, a.steps + a.value_steps) * (a.full_steps + a.full_value_steps)))
+        games = a.full_games or "0 (all: " + ", ".join(f"{n} {self.dataset_games.get(n, '?')}" for n in sources) + ")"
+        self.log(f"projected for --games {games} per source (hours, rough; training at most, it stops early without progress): " + ", ".join(f"{k} {v / 3600:.1f}" for k, v in parts) + f"; total {sum(v for _, v in parts) / 3600:.1f}")
 
     def main(self) -> None:
         a = self.args
@@ -773,7 +784,7 @@ def main() -> None:
     ap.add_argument("--cache", default=None, help="metamon cache (default WORK/metamon-cache)")
     ap.add_argument("--data", choices=("built", "labels", "trajectories"), default="labels",
                     help="what to download: built games (train at once), trajectories + labels (build, then train) or trajectories (label, build, train)")
-    ap.add_argument("--built-repo", default="bsmathers/gen1ou-labels-backup", help="dataset repo with <source>_built.zip and <source>_labels.zip (private: hf auth login or HF_TOKEN)")
+    ap.add_argument("--built-repo", default="bsmathers/gen1ou-labels-backup", help="dataset repo with <source>_built.zip and <source>_labels.zip (public)")
     ap.add_argument("--traj-repo", default="bsmathers/labeled_gen1_retrajectories", help="dataset repo with the finished trajectories (one zip per source)")
     ap.add_argument("--traj-human-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'human' in its name)")
     ap.add_argument("--traj-strong-zip", default=None, help="zip name in --traj-repo (default: the only zip with 'strong' in its name)")
@@ -785,21 +796,21 @@ def main() -> None:
     ap.add_argument("--strong-zip", default="strong_model_replays.zip")
     ap.add_argument("--raw-human", default=None, help="a folder of .log files, instead of downloading")
     ap.add_argument("--raw-strong", default=None)
-    ap.add_argument("--games", type=int, default=30000, help="games to take from each source (0: all). --data built always uses every built game")
+    ap.add_argument("--games", type=int, default=0, help="games to take from each source (0: all, the default). --data built always uses every built game")
     ap.add_argument("--mix", action="append", help="name=weight, e.g. human=0.4 (default human=0.4 strong=0.6; weight 0 skips a source)")
-    ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--batch", default="auto", help="training batch: a number or auto (largest that fits in GPU memory)")
-    ap.add_argument("--value-steps", type=int, default=4000, help="steps of the second stage that trains the win head with the backbone anchored (0: one joint stage)")
+    ap.add_argument("--steps", type=int, default=100000, help="first-stage steps at most (it stops earlier after --patience validations without progress)")
+    ap.add_argument("--batch", default="256", help="training batch: a number or auto (largest that fits in GPU memory); the learning rate is set for 256")
+    ap.add_argument("--value-steps", type=int, default=20000, help="steps of the second stage that trains the win head with the backbone anchored (0: one joint stage)")
     ap.add_argument("--patience", type=int, default=10, help="stop a stage after this many validations without progress (0: run all its steps)")
     ap.add_argument("--min-delta", type=float, default=1e-4, help="the smallest drop of the validation loss that counts as progress (KL in the first stage, win BCE in the second)")
     ap.add_argument("--train-only", action="store_true", help="skip every data stage and train on the games already built under WORK")
     ap.add_argument("--init", default=None, help="weights or a checkpoint (e.g. an earlier run's latest.pt) that the first training stage starts from")
-    ap.add_argument("--policy-run", default="run", help="folder under WORK for the first stage's checkpoints and log")
-    ap.add_argument("--value-run", default="run_value", help="folder under WORK for the second stage's")
+    ap.add_argument("--policy-run", default="run_v3", help="folder under WORK for the first stage's checkpoints and log")
+    ap.add_argument("--value-run", default="run_v3_value", help="folder under WORK for the second stage's")
     ap.add_argument("--anchor-weight", type=float, default=5.0, help="(second stage) weight of KL(first-stage policy || current policy)")
     ap.add_argument("--value-lr", type=float, default=3e-4, help="(second stage) learning rate")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")
-    ap.add_argument("--bc-weight", type=float, default=1.0, help="weight of the imitation term on the imitated bots' games")
+    ap.add_argument("--bc-weight", type=float, default=0.0, help="weight of the imitation term on the imitated bots' games")
     ap.add_argument("--bc-players", default="Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3", help="usernames whose played actions are imitated")
     ap.add_argument("--ckpt-every", type=int, default=1, help="steps between writes of latest.pt (1: every iteration)")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -828,10 +839,10 @@ def main() -> None:
     ap.add_argument("--check-built-games", type=int, default=300, help="built games per source checked against their labels by name")
     ap.add_argument("--check-seed", type=int, default=0, help="seed of the checks' random samples")
     args = ap.parse_args()
-    args.full_games, args.full_steps = args.games, args.steps  # (the smoke run shrinks both; the projection scales back up)
+    args.full_games, args.full_steps, args.full_value_steps = args.games, args.steps, args.value_steps  # (the smoke run shrinks these; the projection scales back up)
     if args.smoke:
         args.cache = args.cache or os.path.join(args.work, "metamon-cache")  # shared with the full run
-        args.games = min(args.games, 150)
+        args.games = min(args.games, 150) if args.games else 150  # (0 is every game)
         args.steps, args.val_every, args.save_every, args.val_batches = min(args.steps, 150), 75, 150, 20
         args.value_steps = min(args.value_steps, 75)
         args.val_fraction = min(args.val_fraction, 5)

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# One-command launch for the recurrent policy/value model: installs the requirements, then runs
-# metamon.recurrent.launch. By default it downloads the built training games (bsmathers/gen1ou-labels-backup, private)
-# and trains; --data labels builds from downloaded trajectories + labels, --data trajectories labels them too, --from-raw
-# parses raw logs. Safe to run again: every stage resumes.
+# One-command launch for the recurrent policy/value model. After a fresh clone:
+#
+#   git clone https://github.com/bsmathers/small_model_branch.git && cd small_model_branch && ./launch.sh
+#
+# With no arguments that is the full run: network and code checks, install, download the trajectories and Exeggcute's
+# labels (bsmathers/labeled_gen1_retrajectories, bsmathers/gen1ou-labels-backup), check the labels against Exeggcute's own
+# code, build every game, check the built games, then train (policy stage up to 100k steps, value stage up to 20k; each stops
+# early without progress). The model ends up in ~/work/run_v3_value/weights_final.pt. Safe to run again: every stage resumes.
+# --data built trains on the uploaded built games instead, --data trajectories relabels everything, --from-raw parses raw logs.
 #
 #   ./launch.sh --steps 20000 --value-steps 20000 --init /path/to/latest.pt   # continue an earlier run's policy
 #
@@ -10,7 +15,7 @@
 #   (--backup-every; --backup-dir PATH for another mount, none to turn off). Rerunning the same command on a new
 #   container with that volume resumes from it.
 #
-#   It first checks the network (Hugging Face, and PyPI/GitHub before the install), the HF token and that this checkout is
+#   It first checks the network (Hugging Face, and PyPI/GitHub before the install), and that this checkout is
 #   current; the launcher then checks the repos, the downloaded labels and the built games before training (see its docstring).
 #
 #   ./launch.sh --smoke        # a few minutes; prints timings and a projection for the full run
@@ -18,8 +23,8 @@
 #   ./launch.sh                # the full run
 #   ./launch.sh --games 60000 --steps 30000 --mix human=0.4 --mix strong=0.6
 #
-# Environment: WORK (default ~/work, on the container disk; never /workspace, which on vast.ai can be a small volume), PYTHON (default python3), HF_TOKEN (the default built-games
-# repo is private; or log in once with `hf auth login`), SKIP_INSTALL=1 to skip the install step.
+# Environment: WORK (default ~/work, on the container disk; never /workspace, which on vast.ai can be a small volume), PYTHON (default python3),
+# SKIP_INSTALL=1 to skip the install step. No Hugging Face token is needed: both dataset repos are public.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -49,9 +54,6 @@ log "network: Hugging Face download speed $(( ${p_speed%.*} / 1000000 )) MB/s"
 if [ -z "${SKIP_INSTALL:-}" ] && [ ! -f "$WORK/venv/.installed" ]; then
   reach https://pypi.org/simple/pip/
   reach https://github.com
-fi
-if [ -z "${HF_TOKEN:-}" ] && [ ! -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ]; then
-  log "no Hugging Face token: set HF_TOKEN=hf_... or run 'hf auth login' (the labels repo is private)"; exit 1
 fi
 if git rev-parse --git-dir >/dev/null 2>&1; then
   if git fetch -q origin 2>/dev/null; then
