@@ -353,7 +353,8 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
     # Phase 2: the members, over the whole game at once when it fits in their context (the way metamon scores a replay: the
     # training-style parallel forward equals the step-by-step rollout with a KV cache while no cache slot is rolled out). A game longer
     # than the context runs step by step.
-    sequence = SEQUENCE and horizon <= SEQUENCE_LIMIT
+    chunkable = all(receptive_field(m.policy) is not None for m in policy.members)
+    sequence = SEQUENCE and (horizon <= SEQUENCE_LIMIT or chunkable)
     with torch.inference_mode(), torch.autocast(device.type, dtype=half or torch.bfloat16, enabled=half is not None and device.type in ("cuda", "cpu")):
         restore = member_sequence_outputs(policy, steps) if sequence else None
         try:
@@ -394,10 +395,32 @@ def label_batch(spec, policy, recorder, trajectories: list[dict], half=None) -> 
 
 SEQUENCE = os.environ.get("LABEL_SEQUENCE", "1") == "1"
 FAST_ROUTER = os.environ.get("LABEL_FAST_ROUTER", "1") == "1"  # the plain-Python router decision (fast_router.py); 0 runs the router's own
-# Longer games run step by step. A game longer than the KV cache (128) is fine in one pass: the attention window is 32 steps, so
-# everything the rolled cache drops is out of reach anyway (checked: same labels as the step-by-step rollout).
+# A game longer than the KV cache (128) is fine in one pass: the attention window is 32 steps, so everything the rolled cache drops
+# is out of reach anyway (checked: same labels as the step-by-step rollout). The parallel attention costs the square of the length,
+# so a group longer than SEQUENCE_CHUNK runs in chunks of that many steps, each preceded by the steps its outputs can see (the
+# members' receptive field: attention layers x window, see receptive_field). Members whose attention is not windowed cannot be
+# chunked: a group longer than SEQUENCE_LIMIT then runs step by step.
 SEQUENCE_LIMIT = int(os.environ.get("LABEL_SEQUENCE_LIMIT", "400"))
+SEQUENCE_CHUNK = int(os.environ.get("LABEL_SEQUENCE_CHUNK", "256"))
 SEQUENCE_ROWS = int(os.environ.get("LABEL_SEQUENCE_ROWS", "24576"))  # lane-steps per parallel forward (bounds the activation memory)
+
+
+def receptive_field(member_policy):
+    """How many earlier steps a member's output at one step can depend on: each windowed attention layer looks `window` steps back,
+    and everything else in the trajectory encoder works per step (positions come from time_idxs, not from places in the input).
+    None when some attention layer is not windowed (or is of a kind not known here): the member cannot be run in chunks."""
+    from amago.nets.transformer import SelfAttention
+
+    encoder = getattr(member_policy, "traj_encoder", None)
+    if encoder is None:
+        return None
+    layers = [m for m in encoder.modules() if isinstance(m, SelfAttention)]
+    if not layers or any(not isinstance(getattr(m, "window_size", None), (tuple, list)) for m in layers):
+        return None  # (no attention found, or one without a window: its output can depend on the whole game)
+    lefts = [int(m.window_size[0]) for m in layers]
+    if any(left < 0 for left in lefts) or any(int(m.window_size[1]) > 0 for m in layers):
+        return None
+    return len(layers) * max(lefts)
 
 
 def member_sequence_outputs(policy, steps):
@@ -416,22 +439,37 @@ def member_sequence_outputs(policy, steps):
     for member in policy.members:
         mp = member.policy
         device = member.device
-        chunk = max(1, SEQUENCE_ROWS // horizon)
         encoder = mp.tstep_encoder
-        embs, probs = [], []
-        for a in range(0, lanes, chunk):
-            member_obs = {k: v[a : a + chunk].to(device) for k, v in obs.items()}
-            encoder._sequence_length = horizon  # (the fast encoder reads whole games in time order: see fast_tstep.sequence_embeddings)
-            try:
-                with torch._dynamo.config.patch(disable=True):  # (the compiled parallel path recompiles per shape; metamon's own scoring turns it off too)
-                    emb, _ = mp.get_state_embedding(obs=member_obs, rl2s=rl2[a : a + chunk].to(device), time_idxs=time_idxs[a : a + chunk].to(device), hidden_state=None)
-            finally:
-                encoder._sequence_length = 0
-            dist = mp.actor(emb, straight_from_obs={k: member_obs[k] for k in mp.pass_obs_keys_to_actor})
-            embs.append(emb.detach())
-            probs.append(dist.probs.detach())  # [chunk, T, gammas, actions]
-        emb_all = embs[0] if len(embs) == 1 else torch.cat(embs)
-        probs_all = probs[0] if len(probs) == 1 else torch.cat(probs)
+        field = receptive_field(mp)
+        # time windows: (first input step, first output step, end); one window when the game is short or the member cannot be chunked
+        if horizon <= SEQUENCE_CHUNK or field is None:
+            windows = [(0, 0, horizon)]
+        else:
+            windows = [(max(0, t0 - field), t0, min(t0 + SEQUENCE_CHUNK, horizon)) for t0 in range(0, horizon, SEQUENCE_CHUNK)]
+        emb_parts, prob_parts = [], []
+        for start, keep, end in windows:
+            length = end - start
+            lane_chunk = max(1, SEQUENCE_ROWS // length)
+            embs, probs = [], []
+            for a in range(0, lanes, lane_chunk):
+                member_obs = {k: v[a : a + lane_chunk, start:end].to(device) for k, v in obs.items()}
+                encoder._sequence_length = length  # (the fast encoder reads whole games in time order: see fast_tstep.sequence_embeddings)
+                try:
+                    with torch._dynamo.config.patch(disable=True):  # (the compiled parallel path recompiles per shape; metamon's own scoring turns it off too)
+                        emb, _ = mp.get_state_embedding(
+                            obs=member_obs, rl2s=rl2[a : a + lane_chunk, start:end].to(device),
+                            time_idxs=time_idxs[a : a + lane_chunk, start:end].to(device), hidden_state=None,
+                        )
+                finally:
+                    encoder._sequence_length = 0
+                dist = mp.actor(emb, straight_from_obs={k: member_obs[k] for k in mp.pass_obs_keys_to_actor})
+                embs.append(emb[:, keep - start :].detach())  # (the context steps only feed the kept ones)
+                probs.append(dist.probs[:, keep - start :].detach())  # [lanes, steps, gammas, actions]
+            emb_parts.append(embs[0] if len(embs) == 1 else torch.cat(embs))
+            prob_parts.append(probs[0] if len(probs) == 1 else torch.cat(probs))
+        emb_all = emb_parts[0] if len(emb_parts) == 1 else torch.cat(emb_parts, dim=1)
+        probs_all = prob_parts[0] if len(prob_parts) == 1 else torch.cat(prob_parts, dim=1)
+        assert emb_all.shape[1] == horizon and probs_all.shape[1] == horizon
 
         def get_state_embedding(obs=None, rl2s=None, time_idxs=None, hidden_state=None, _mp=mp, _emb=emb_all):
             t = _mp._label_step
