@@ -20,6 +20,7 @@ import argparse
 import math
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -353,6 +354,27 @@ def probe_batch(model, args, device, candidates=(256, 192, 128, 96, 64, 48, 32),
     return candidates[-1]
 
 
+def rebalanced_sources(items: list[str], spec: str, validation: bool, fraction: int, seed: int):
+    """--rebalance bots=W1,human=W2,otherbots=W3 over --source human=DIR and strong=DIR: every strong game seen from an imitated
+    bot's side ("bots"), and fixed random subsets of the human games and of the other strong games sized so that the game counts
+    are in the ratio of the weights; each is sampled with its weight."""
+    from metamon.recurrent.dataset import select_games
+
+    dirs = {name: rest.rsplit(":", 1)[0] for name, rest in (item.split("=", 1) for item in items)}
+    weights = {k: float(v) for k, v in (kv.split("=") for kv in spec.split(","))}
+    if set(weights) != {"bots", "human", "otherbots"} or not {"human", "strong"} <= set(dirs):
+        raise SystemExit("--rebalance needs bots=,human=,otherbots= weights and --source human=... and strong=...")
+    bots = select_games(dirs["strong"], imitated=True)
+    if not bots:
+        raise SystemExit(f"--rebalance: no games by the imitated bots in {dirs['strong']}")
+    per = len(bots) / weights["bots"]
+    human = select_games(dirs["human"], count=round(per * weights["human"]), seed=seed)
+    other = select_games(dirs["strong"], imitated=False, count=round(per * weights["otherbots"]), seed=seed)
+    return [scan("bots", dirs["strong"], weights["bots"], validation, fraction, bots),
+            scan("human", dirs["human"], weights["human"], validation, fraction, human),
+            scan("otherbots", dirs["strong"], weights["otherbots"], validation, fraction, other)]
+
+
 def parse_sources(items: list[str], validation: bool, fraction: int):
     sources = []
     for item in items:
@@ -384,6 +406,9 @@ def main() -> None:
     ap.add_argument("--value-bc-weight", type=float, default=0.0,
                     help="(--stage value) weight of the imitation term on the imitated bots' games: the policy then moves toward their played "
                          "actions there, held near --init everywhere by the anchor (default 0: no policy loss of its own)")
+    ap.add_argument("--rebalance", default=None,
+                    help="bots=W1,human=W2,otherbots=W3: train on all games seen from the imitated bots' side plus random subsets of the human "
+                         "and other bot games, game counts in the ratio of the weights (see rebalanced_sources)")
     ap.add_argument("--freeze", choices=("none", "trunk"), default="none",
                     help="trunk: train only the win head MLP (embeddings, the recurrent transformer and the actor head stay as --init has them, "
                          "so the policy does not change)")
@@ -444,8 +469,12 @@ def main() -> None:
     if backup:
         backup.log = log
 
-    train_sources = parse_sources(args.source, False, args.val_fraction)
-    val_sources = parse_sources(args.source, True, args.val_fraction)
+    if args.rebalance:
+        train_sources = rebalanced_sources(args.source, args.rebalance, False, args.val_fraction, args.seed)
+        val_sources = rebalanced_sources(args.source, args.rebalance, True, args.val_fraction, args.seed)
+    else:
+        train_sources = parse_sources(args.source, False, args.val_fraction)
+        val_sources = parse_sources(args.source, True, args.val_fraction)
     names = [s.name for s in train_sources]
     log(f"sources {' '.join(f'{s.name}:{len(s.paths)}games/{int(s.lengths.sum())}decisions/weight{s.weight}' for s in train_sources)}")
     log(f"validation {' '.join(f'{s.name}:{len(s.paths)}games' for s in val_sources)}")
@@ -621,4 +650,22 @@ def _limit(loader, n):
 
 
 if __name__ == "__main__":
-    main()
+    import signal
+
+    # Ctrl-C, and the launcher's terminate (SIGTERM) when it stops a run, end training the same way: the step in progress is
+    # dropped, the last finished one is in latest.pt (the checkpoint writer flushes in main's finally), and a restart resumes there
+    def _interrupt(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"{time.strftime('%H:%M:%S')} interrupted: latest.pt holds the last finished step; run again with --resume to continue", flush=True)
+        # (the checkpoint is on disk: stop the data loader's workers and exit at once, instead of waiting for them to wind down,
+        # which can take long enough for the launcher to kill the process)
+        import multiprocessing
+
+        for worker in multiprocessing.active_children():
+            worker.kill()
+        os._exit(130)

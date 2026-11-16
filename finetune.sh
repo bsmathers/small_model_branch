@@ -3,7 +3,9 @@
 #
 #   A  actor        trunk + actor head (the win head gets no gradient): 0.5 x KL to Exeggcute's targets + 0.5 x imitation of the
 #                   strong bots' played moves (Tauros-v1/v2, SmallG1Online-v2/v3), anchored with weight 5 to the starting
-#                   policy; early stopping on that weighted validation loss                         -> WORK/run_ft_actor
+#                   policy; early stopping on that weighted validation loss. Data: every game seen from those bots' side
+#                   (1/2), and random subsets of the human (1/3) and other bot games (1/6), by games and by trained
+#                   decisions (--ft-actor-mix; none for the usual 40/60 human/strong mix)          -> WORK/run_ft_actor
 #   1  value head   only the win head MLP (fresh); embeddings, the recurrent transformer and the actor head frozen
 #                                                                                                   -> WORK/run_ft_value_head
 #   2  everything   the win BCE, anchored with weight 1 to stage A's policy                         -> WORK/run_ft_all

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import glob
 import os
+import random
 import zlib
 from dataclasses import dataclass
 
@@ -46,18 +47,41 @@ def is_validation(path: str, fraction: int = 20) -> bool:
     return zlib.crc32(battle_id(path).encode()) % fraction == 0
 
 
-def scan(name: str, directory: str, weight: float, validation: bool, fraction: int = 20) -> Source:
+def scan(name: str, directory: str, weight: float, validation: bool, fraction: int = 20, candidates: list[str] | None = None) -> Source:
+    """A source: the games of `directory` (or only `candidates`, a selection of them) on one side of the train/validation split."""
     check_encoding(directory)  # (games built by code with another feature layout must not be trained on)
-    paths =[p for p in sorted(glob.glob(os.path.join(directory, "**", "*.npz"), recursive=True)) if is_validation(p, fraction) == validation]
+    pool = candidates if candidates is not None else game_paths(directory)
+    paths = [p for p in pool if is_validation(p, fraction) == validation]
     if not paths:
         raise ValueError(f"source {name}: no {'validation' if validation else 'training'} games in {directory}")
-    lengths = np.array([_length(p) for p in paths])
+    lengths = np.array([_meta(p)[0] for p in paths])
     return Source(name, paths, lengths, weight)
 
 
-def _length(path: str) -> int:
-    with np.load(path) as z:
-        return int(z["legal"].shape[0])
+def game_paths(directory: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(directory, "**", "*.npz"), recursive=True))
+
+
+_META: dict[str, tuple[int, bool]] = {}
+
+
+def _meta(path: str) -> tuple[int, bool]:
+    """(decisions, whether the observer is one of the imitated bots), read once per file."""
+    if path not in _META:
+        with np.load(path) as z:
+            _META[path] = (int(z["legal"].shape[0]), bool(z["bc_game"]) if "bc_game" in z.files else False)
+    return _META[path]
+
+
+def select_games(directory: str, imitated: bool | None = None, count: int | None = None, seed: int = 0) -> list[str]:
+    """The games of `directory`: only those seen from an imitated bot's side (imitated=True), or only the others (False), and at
+    most `count` of them, a fixed random subset (taken before the train/validation split, so both sides use the same games)."""
+    paths = game_paths(directory)
+    if imitated is not None:
+        paths = [p for p in paths if _meta(p)[1] == imitated]
+    if count is not None and count < len(paths):
+        paths = sorted(random.Random(f"{seed}-{directory}-{imitated}").sample(paths, count))
+    return paths
 
 
 def load_game(path: str) -> dict[str, np.ndarray]:

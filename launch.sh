@@ -128,8 +128,16 @@ if command -v flock >/dev/null 2>&1; then
 fi
 child=""
 on_signal() {
-  log "stopping"
-  if [ -n "$child" ]; then kill -INT -- "-$child" 2>/dev/null || kill -INT "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
+  # Ctrl-C (or kill): only the launcher is told; it stops its stages in order (training finishes writing latest.pt), then
+  # whatever is left of this attempt's process group is killed. A second Ctrl-C does not wait for that.
+  trap 'log "stopping now"; [ -n "$child" ] && kill -KILL -- "-$child" 2>/dev/null; exit 130' INT TERM
+  if [ -n "$child" ]; then
+    log "stopping: letting the current stage save its checkpoint (Ctrl-C again to stop at once)"
+    kill -INT "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    kill -KILL -- "-$child" 2>/dev/null
+  fi
+  log "stopped; run the same command again to resume"
   exit 130
 }
 trap on_signal INT TERM

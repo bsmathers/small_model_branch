@@ -823,7 +823,8 @@ class Launcher:
     def finetune(self) -> None:
         """--finetune-from WEIGHTS (finetune.sh): three stages after policy distillation, each starting from the one before.
           A  actor: trunk and actor head (the win head gets no gradient) on 0.5 x KL to Exeggcute's targets + 0.5 x imitation of the
-             --bc-players' played moves, anchored with weight 5 to the policy of WEIGHTS; early stopping on that weighted loss
+             --bc-players' played moves, anchored with weight 5 to the policy of WEIGHTS; early stopping on that weighted loss. Data
+             (--ft-actor-mix): 1/2 games seen from the imitated bots' side (all of them), 1/3 human, 1/6 other bot games
           1  value head: only the win head MLP (fresh), everything else frozen, so the policy is A's
           2  everything: the win BCE, anchored with weight 1 to the policy of A (which stage 1 left unchanged)"""
         a = self.args
@@ -834,7 +835,8 @@ class Launcher:
         self.log(f"fine-tuning from {start}: stages in {', '.join(runs)}")
         self.train_stage(runs[0], a.ft_actor_steps, [
             "--stage", "policy", "--init", start, "--alpha", str(a.ft_kl_weight), "--bc-weight", str(a.ft_bc_weight),
-            "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"])
+            "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"]
+            + (["--rebalance", a.ft_actor_mix] if a.ft_actor_mix != "none" else []))
         actor = os.path.join(runs[0], "weights_final.pt")
         self.train_stage(runs[1], a.ft_value_head_steps, [
             "--stage", "value", "--init", actor, "--freeze", "trunk", "--anchor-weight", "0", "--lr", str(a.value_lr)])
@@ -1015,6 +1017,9 @@ def main() -> None:
     ap.add_argument("--finetune-run", default="run_ft", help="prefix of the fine-tuning stages' folders: <prefix>_actor, _value_head, _all")
     ap.add_argument("--ft-kl-weight", type=float, default=0.5, help="(fine-tune A) weight of the KL to Exeggcute's targets")
     ap.add_argument("--ft-bc-weight", type=float, default=0.5, help="(fine-tune A) weight of imitating the --bc-players' played moves")
+    ap.add_argument("--ft-actor-mix", default="bots=0.5,human=0.3333,otherbots=0.1667",
+                    help="(fine-tune A) the data: every game seen from the imitated bots' side, plus random subsets of the human and the "
+                         "other bot games; game counts and shares of the trained decisions in these ratios (none: the usual human/strong mix)")
     ap.add_argument("--ft-actor-anchor", type=float, default=5.0, help="(fine-tune A) weight of KL(--finetune-from policy || current policy)")
     ap.add_argument("--ft-all-anchor", type=float, default=1.0, help="(fine-tune 2) weight of KL(stage A policy || current policy)")
     ap.add_argument("--ft-lr", type=float, default=1e-4, help="(fine-tune A and 2) learning rate; stage 1 uses --value-lr")
@@ -1078,7 +1083,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, interrupt)  # (also when started in the background, where SIGINT begins ignored)
     signal.signal(signal.SIGTERM, interrupt)
-    Launcher(args).main()
+    launcher = Launcher(args)
+    try:
+        launcher.main()
+    except KeyboardInterrupt:
+        # (the stage loops have stopped their processes by now; training wrote its latest.pt)
+        launcher.log("stopped (interrupted). Every stage resumes where it stopped: run the same command again to continue")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
