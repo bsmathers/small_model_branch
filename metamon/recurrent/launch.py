@@ -24,21 +24,32 @@ Checks (each one stops the run when it fails; --skip-checks turns the last two o
                 CPU, fp32), match the downloaded labels within bf16 noise (verify_labels compare --preset bf16)
     built       (after the build, before training) --check-built-games random built games per source match their labels and
                 trajectories by option name, with none of the build's code (verify_built)
---check-only stops after the built check, before training.
+--check-only stops after the built check, before training. A failed check exits with code 3 (launch.sh does not restart then).
 
-Every stage is resumable: games already parsed, labelled or built are skipped, and training continues from
-its last checkpoint, so a stopped run is continued by starting the same command again. Progress is plain
-text in WORK/logs (one file per stage and shard) and in WORK/logs/launch.txt.
+In the background (SideJobs; a failure there is reported and the run goes on):
+    tournaments  every --tournament-every steps of each training stage, --tournament-games games of that checkpoint against
+                 TaurosV0 on the Zig duel harness (tournament.py; set up under WORK/duel while the data stages run). Each result
+                 is a TOURNAMENT line here and in WORK/tournaments/results.txt
+    upload       with HF_WRITE_TOKEN set, after the built check: the built games, one zip per source, to the public dataset repo
+                 --upload-repo (upload_built.py), in the layout --data built downloads
+
+Every stage is resumable: games already parsed, labelled or built are skipped, training continues from its latest.pt (written
+every step; weight files are written to a temporary name and renamed, so a crash never leaves a truncated one), uploads and
+tournaments already done are skipped. So a stopped run is continued by starting the same command again, and launch.sh does
+that by itself after a crash. Progress is plain text in WORK/logs (one file per stage and shard) and in WORK/logs/launch.txt.
 
 Layout under WORK: hf/ (downloaded zips), raw/<source>/ (logs), metamon-cache/ (checkpoints, usage stats),
-<source>/{trajectories,labels,built}, tables/, run_v3/ (policy stage) and run_v3_value/ (value stage; weights_final.pt is the model).
+<source>/{trajectories,labels,built}, tables/, run_v3/ (policy stage) and run_v3_value/ (value stage; weights_final.pt is the model),
+duel/ (the tournaments' harness), tournaments/, upload/.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -46,6 +57,131 @@ import time
 import zipfile
 
 SOURCES = ("human", "strong")
+ENCODING_STAMP = ".encoding_version"  # (features.ENCODING_STAMP; features is not imported here before the install is known to work)
+
+
+class SideJobs:
+    """What runs beside the main stages, at low priority, and never stops the run when it fails (it is reported instead):
+      - the tournament setup (tournament.py setup), started at the beginning;
+      - the upload of the built games (upload_built.py), started after the built check;
+      - a tournament of --tournament-games games against TaurosV0 for every weights_<step>.pt with step a multiple of
+        --tournament-every that training writes, one at a time, oldest first. Results go to the terminal and to
+        WORK/tournaments/results.txt; WORK/tournaments/<run>_<step>.json marks a checkpoint as played (a restart skips it)."""
+
+    def __init__(self, launcher):
+        self.l = launcher
+        self.a = launcher.args
+        self.dir = os.path.join(launcher.work, "tournaments")
+        os.makedirs(self.dir, exist_ok=True)
+        self.setup = None  # (Popen, log handle)
+        self.ready = False
+        self.upload = None
+        self.match = None  # (Popen, log handle, run name, step, result path)
+        self.watch: list[tuple[str, str]] = []  # (run name, folder) of the training stages so far
+
+    def popen(self, cmd: list[str], log: str):
+        handle = open(os.path.join(self.l.logs, log), "a")
+        p = subprocess.Popen(cmd, env=self.l.env(), stdout=handle, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(10))
+        return p, handle
+
+    def start_setup(self) -> None:
+        if self.a.tournament_every <= 0:
+            self.l.log("tournaments: off (--tournament-every 0)")
+            return
+        self.setup = self.popen([self.l.py, "-m", "metamon.recurrent.tournament", "setup", "--work", self.l.work, "--cache", self.l.cache], "tournament_setup.txt")
+        self.l.log(f"tournaments: setting up the duel harness and TaurosV0 in the background (log {self.l.logs}/tournament_setup.txt)")
+
+    def start_upload(self, sources: list[str]) -> None:
+        if self.a.smoke:
+            self.l.log("upload: skipped in a smoke run")
+            return
+        if not os.environ.get("HF_WRITE_TOKEN"):
+            self.l.log("upload: HF_WRITE_TOKEN is not set, so the built games are not uploaded (set it and run again to upload them)")
+            return
+        self.upload = self.popen([self.l.py, "-m", "metamon.recurrent.upload_built", self.l.work, self.a.upload_repo, *sources], "upload_built.txt")
+        self.l.log(f"upload: zipping and uploading the built games in the background (log {self.l.logs}/upload_built.txt)")
+
+    def last_line(self, log: str) -> str:
+        return self.l.newest_line_of(log)[1:-1]
+
+    def poll(self) -> None:
+        try:
+            self._poll()
+        except Exception as e:  # noqa: BLE001  (a side job never stops the run)
+            self.l.log(f"background jobs: {type(e).__name__}: {e} (the run goes on)")
+
+    def _poll(self) -> None:
+        if self.setup and self.setup[0].poll() is not None:
+            self.setup[1].close()
+            self.ready = os.path.exists(os.path.join(self.l.work, "duel", ".ready"))
+            self.l.log("tournaments: ready" if self.ready else
+                       f"tournaments OFF: the setup failed ({self.last_line('tournament_setup')}; see {self.l.logs}/tournament_setup.txt). Training goes on")
+            self.setup = None
+        if self.upload and self.upload[0].poll() is not None:
+            self.upload[1].close()
+            code = self.upload[0].returncode
+            self.l.log(f"upload: {'done' if code == 0 else 'FAILED (training goes on; run again to retry)'}: {self.last_line('upload_built')}")
+            self.upload = None
+        if self.match and self.match[0].poll() is not None:
+            p, handle, run, step, result = self.match
+            handle.close()
+            self.match = None
+            from metamon.recurrent.tournament import describe
+
+            if p.returncode == 0 and os.path.exists(result):
+                line = f"TOURNAMENT {run} step {step} vs TaurosV0: {describe(json.load(open(result)))}"
+            else:
+                line = f"TOURNAMENT {run} step {step}: FAILED ({self.last_line(f'tournament_{run}_{step}')}; see {self.l.logs}/tournament_{run}_{step}.txt)"
+                with open(result, "w") as f:  # (not retried: the same checkpoint would fail the same way)
+                    json.dump({"error": line}, f)
+            self.l.log(line)
+            with open(os.path.join(self.dir, "results.txt"), "a") as f:
+                f.write(f"{time.strftime('%F %T')} {line}\n")
+        if self.ready and self.match is None:
+            pending = self.pending()
+            if pending:
+                run, step, weights = pending[0]
+                result = os.path.join(self.dir, f"{run}_{step}.json")
+                procs = self.a.tournament_procs or max(1, min(4, self.l.cpus // 4))
+                cmd = [self.l.py, "-m", "metamon.recurrent.tournament", "play", weights, "--work", self.l.work, "--cache", self.l.cache,
+                       "--games", str(self.a.tournament_games), "--procs", str(procs), "--device", self.a.tournament_device,
+                       "--temperature", str(self.a.tournament_temperature), "--out", result,
+                       "--log-dir", os.path.join(self.l.logs, f"tournament_{run}_{step}")]
+                p, handle = self.popen(cmd, f"tournament_{run}_{step}.txt")
+                self.match = (p, handle, run, step, result)
+                self.l.log(f"tournament {run} step {step}: {self.a.tournament_games} games vs TaurosV0 started ({procs} processes)")
+
+    def pending(self) -> list:
+        out = []
+        for order, (run, folder) in enumerate(self.watch):
+            if not os.path.isdir(folder):
+                continue
+            for f in os.listdir(folder):
+                m = re.fullmatch(r"weights_(\d+)\.pt", f)
+                if m and int(m.group(1)) > 0 and int(m.group(1)) % self.a.tournament_every == 0 \
+                        and not os.path.exists(os.path.join(self.dir, f"{run}_{m.group(1)}.json")):
+                    out.append((order, int(m.group(1)), run, os.path.join(folder, f)))
+        return [(run, step, path) for _, step, run, path in sorted(out)]
+
+    def busy(self) -> bool:
+        return bool(self.setup or self.upload or self.match or (self.ready and self.pending()))
+
+    def drain(self) -> None:
+        """At the end: waits for the upload and for the tournaments of the checkpoints training wrote."""
+        last = 0.0
+        while self.busy():
+            if time.time() - last > 120:
+                last = time.time()
+                what = [w for w, on in (("the tournament setup", self.setup), ("the upload", self.upload), ("a tournament", self.match)) if on]
+                self.l.log(f"waiting for {', '.join(what) or 'the next tournament'} ({len(self.pending()) if self.ready else 0} checkpoints left to play)")
+            self.poll()
+            time.sleep(5)
+
+    def stop(self) -> None:
+        jobs = [j for j in (self.setup, self.upload, self.match) if j]
+        self.l.stop([(j[0], j[1]) for j in jobs])
+        for j in jobs:
+            j[1].close()
 
 
 class Launcher:
@@ -111,6 +247,8 @@ class Launcher:
         try:
             while any(p.poll() is None for p, _ in procs):
                 time.sleep(2)
+                if getattr(self, "side", None):
+                    self.side.poll()  # (tournaments, the upload: started, reported)
                 if progress and time.time() - last > 30:
                     last = time.time()
                     self.log(f"{stage}: {progress()} ({time.time() - start:.0f}s)")
@@ -139,6 +277,8 @@ class Launcher:
         last = 0.0
         while any(p.poll() is None for _, p, _, _ in self.background):
             time.sleep(2)
+            if getattr(self, "side", None):
+                self.side.poll()
             for stage, p, _, _ in self.background:
                 if p.poll() not in (None, 0):
                     raise RuntimeError(f"{stage} failed; see {self.logs}/{stage}_0.txt")
@@ -163,6 +303,12 @@ class Launcher:
             return lines[-1][:150] if lines else "(no output yet)"
         except OSError:
             return "(no log yet)"
+
+    CHECK_FAILED = 3  # exit code of a failed data check: launch.sh does not restart the run after it (it would fail again)
+
+    def check_failed(self, text: str) -> None:
+        self.log(text)
+        raise SystemExit(self.CHECK_FAILED)
 
     def run_one(self, stage: str, cmd: list[str], env: dict) -> None:
         last_line = lambda: self.newest_line(stage)  # (a stage writes to its own log file: show its newest line, so a long stage is not silent)
@@ -342,13 +488,16 @@ class Launcher:
         with zipfile.ZipFile(path) as z:
             for info in z.infolist():
                 base = os.path.basename(info.filename)
-                if info.is_dir() or base.startswith(".") or not base.endswith(".npz") or info.filename.startswith("__MACOSX"):
+                stamp = kind == "built" and base == ENCODING_STAMP  # (upload_built.py puts the folder's encoding stamp in the zip)
+                if not stamp and (info.is_dir() or base.startswith(".") or not base.endswith(".npz") or info.filename.startswith("__MACOSX")):
                     continue
                 with z.open(info) as src, open(os.path.join(dest, base), "wb") as out:
                     shutil.copyfileobj(src, out, 1 << 20)
-                count += 1
+                count += not stamp
         if count == 0:
             raise RuntimeError(f"no .npz files in {a.built_repo}/{zip_name}")
+        if kind == "built" and not os.path.exists(os.path.join(dest, ENCODING_STAMP)):
+            self.log(f"{name}: {zip_name} has no {ENCODING_STAMP} stamp (zipped before upload_built.py): training will refuse it")
         open(marker, "w").write(f"{count}\n")
         self.log(f"{name}: extracted {count} {kind} files")
         os.remove(path)  # the zip is no longer needed
@@ -474,7 +623,7 @@ class Launcher:
                     raise SystemExit(f"preflight: cannot list the dataset repo {repo} ({type(e).__name__}: {e}). "
                                      f"Check HF_TOKEN (logged in as {user}) and the network") from e
             if f is not None and f not in listed[repo]:
-                raise SystemExit(f"preflight: {repo} has no {f} (it has {sorted(x for x in listed[repo] if x.endswith('.zip'))})")
+                self.check_failed(f"preflight: {repo} has no {f} (it has {sorted(x for x in listed[repo] if x.endswith('.zip'))})")
         self.log(f"preflight: Hugging Face user {user}; " + ("found " + ", ".join(f"{r}/{f or '<zip per source>'}" for r, f in needed) if needed else "nothing left to download"))
 
     def check_labels(self) -> None:
@@ -500,9 +649,9 @@ class Launcher:
             missing = [s for s in stems if s not in have]
             self.log(f"label check {name}: {len(stems) - len(missing)} of {len(stems)} trajectories have a downloaded label")
             if len(missing) > a.max_unlabelled * len(stems):
-                raise SystemExit(f"label check: {len(missing)} of {len(stems)} {name} trajectories have no label (more than "
-                                 f"{a.max_unlabelled:.0%}): the label zip does not belong to these trajectories, or is incomplete. "
-                                 f"First missing: {missing[:3]}")
+                self.check_failed(f"label check: {len(missing)} of {len(stems)} {name} trajectories have no label (more than "
+                                  f"{a.max_unlabelled:.0%}): the label zip does not belong to these trajectories, or is incomplete. "
+                                  f"First missing: {missing[:3]}")
             # random games until they hold --check-decisions decisions (a fixed number of games can be a handful of short ones)
             pool = sorted(have & set(stems))
             random.Random(f"{a.check_seed}-{name}").shuffle(pool)
@@ -540,8 +689,8 @@ class Launcher:
                     self.log(f"label check {name}: {line}")
             if r.returncode != 0:
                 reason = (text.splitlines() or ["?"])[-1]
-                raise SystemExit(f"label check FAILED for {name}: {reason} (details in {self.logs}/check_labels_compare_{name}.txt). "
-                                 f"Stopping before the build and training")
+                self.check_failed(f"label check FAILED for {name}: {reason} (details in {self.logs}/check_labels_compare_{name}.txt). "
+                                  f"Stopping before the build and training")
             results.append(f"{name}: {len(picked[name])} games")
         open(marker, "w").write(", ".join(results) + "\n")
         self.log("label check: PASSED")
@@ -572,7 +721,7 @@ class Launcher:
             for line in text.splitlines()[:3] + text.splitlines()[-1:]:
                 self.log(f"built check {name}: {line}")
             if r.returncode != 0:
-                raise SystemExit(f"built check FAILED for {name} (details in {self.logs}/check_built_{name}.txt). Stopping before training")
+                self.check_failed(f"built check FAILED for {name} (details in {self.logs}/check_built_{name}.txt). Stopping before training")
         self.log("built check: PASSED")
 
     def prepare(self, name: str, raw_dir: str | None, games: int) -> None:
@@ -651,14 +800,47 @@ class Launcher:
         near the first stage's policy by a KL penalty (--anchor-weight). --value-steps 0 trains both at once in a single stage."""
         a = self.args
         out = os.path.join(self.work, a.policy_run)
+        if a.finetune_from:
+            self.finetune()
+            return
         if a.value_steps <= 0:
             self.train_stage(out, a.steps, ["--stage", "joint"])
             return
-        self.train_stage(out, a.steps, ["--stage", "policy"])
-        weights = os.path.join(out, "weights_final.pt")
-        if not os.path.exists(weights):
-            raise RuntimeError(f"the policy stage left no {weights}")
-        self.train_stage(os.path.join(self.work, a.value_run), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight), "--lr", str(a.value_lr)])
+        if a.value_from:
+            # straight to the second stage, anchored to these policy weights (e.g. a stopped policy stage's weights_best.pt)
+            weights = os.path.abspath(a.value_from)
+            if not os.path.exists(weights):
+                raise SystemExit(f"--value-from: no {weights}")
+            self.log(f"skipping the policy stage: the value stage starts from and is anchored to {weights}")
+        else:
+            self.train_stage(out, a.steps, ["--stage", "policy"])
+            weights = os.path.join(out, "weights_final.pt")
+            if not os.path.exists(weights):
+                raise RuntimeError(f"the policy stage left no {weights}")
+        self.train_stage(os.path.join(self.work, a.value_run), a.value_steps, ["--stage", "value", "--init", weights, "--anchor-weight", str(a.anchor_weight),
+                                                                              "--lr", str(a.value_lr), "--value-bc-weight", str(a.value_bc_weight)])
+
+    def finetune(self) -> None:
+        """--finetune-from WEIGHTS (finetune.sh): three stages after policy distillation, each starting from the one before.
+          A  actor: trunk and actor head (the win head gets no gradient) on 0.5 x KL to Exeggcute's targets + 0.5 x imitation of the
+             --bc-players' played moves, anchored with weight 5 to the policy of WEIGHTS; early stopping on that weighted loss
+          1  value head: only the win head MLP (fresh), everything else frozen, so the policy is A's
+          2  everything: the win BCE, anchored with weight 1 to the policy of A (which stage 1 left unchanged)"""
+        a = self.args
+        start = os.path.abspath(a.finetune_from)
+        if not os.path.exists(start):
+            raise SystemExit(f"--finetune-from: no {start}")
+        runs = [os.path.join(self.work, f"{a.finetune_run}_{n}") for n in ("actor", "value_head", "all")]
+        self.log(f"fine-tuning from {start}: stages in {', '.join(runs)}")
+        self.train_stage(runs[0], a.ft_actor_steps, [
+            "--stage", "policy", "--init", start, "--alpha", str(a.ft_kl_weight), "--bc-weight", str(a.ft_bc_weight),
+            "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"])
+        actor = os.path.join(runs[0], "weights_final.pt")
+        self.train_stage(runs[1], a.ft_value_head_steps, [
+            "--stage", "value", "--init", actor, "--freeze", "trunk", "--anchor-weight", "0", "--lr", str(a.value_lr)])
+        head = os.path.join(runs[1], "weights_final.pt")
+        self.train_stage(runs[2], a.ft_all_steps, [
+            "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
 
     def train_stage(self, out: str, steps: int, extra: list[str]) -> None:
         a = self.args
@@ -673,9 +855,12 @@ class Launcher:
         cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
         if self.backup:
             cmd += ["--backup-dir", os.path.join(self.backup, os.path.basename(out)), "--backup-every", str(a.backup_every)]
-        if a.init and extra[1] != "value":
+        if a.init and extra[1] != "value" and not a.finetune_from:
             cmd += ["--init", self.init_path()]  # (the first stage starts from these weights; a later restart of the same command resumes from the run's own latest.pt instead)
         cmd += extra  # (later flags win: the value stage's --lr replaces the default one)
+        if a.tournament_every > 0:
+            cmd += ["--save-every", str(math.gcd(a.save_every, a.tournament_every))]  # (later flags win: a weights_<step>.pt at every tournament step)
+            self.side.watch.append((os.path.basename(out), out))
         stage = extra[1]
         self.log(f"training ({stage} stage) {steps} steps; progress in {out}/log.txt")
         self.run_one("train" if stage != "value" else "train_value", cmd, self.env(HF_HUB_OFFLINE=1))
@@ -700,7 +885,7 @@ class Launcher:
 
     def summary(self) -> None:
         a = self.args
-        out = os.path.join(self.work, a.value_run if a.value_steps > 0 else a.policy_run)
+        out = os.path.join(self.work, f"{a.finetune_run}_all" if a.finetune_from else a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
@@ -741,6 +926,17 @@ class Launcher:
             self.run_one("tables", [self.py, "-m", "metamon.recurrent.tables", os.path.join(self.work, "tables")], self.env())
         self.mix = dict(m.split("=") for m in a.mix) if a.mix else {"human": 0.4, "strong": 0.6}
         self.background = []
+        self.side = SideJobs(self)
+        try:
+            self.stages()
+        except BaseException:
+            self.side.stop()  # (Ctrl-C or a failure: nothing is left running)
+            raise
+
+    def stages(self) -> None:
+        a = self.args
+        self.side.start_setup()
+        uploadable = not a.train_only and a.data != "built"  # (games built here, not downloaded)
         if a.data == "built" and not a.train_only and not (a.from_raw or a.raw_human or a.raw_strong or a.traj_human_dir or a.traj_strong_dir):
             self.preflight()
             for name, weight in self.mix.items():
@@ -771,10 +967,14 @@ class Launcher:
         self.mix = {k: v for k, v in self.mix.items() if float(v) > 0}
         if not a.skip_checks and not a.train_only:
             self.check_built()
+        if uploadable:
+            self.side.start_upload(list(self.mix))
         if a.check_only:
+            self.side.drain()
             self.log("--check-only: data downloaded and checked; stopping before training")
             return
         self.train()
+        self.side.drain()
         self.summary()
 
 
@@ -809,6 +1009,20 @@ def main() -> None:
     ap.add_argument("--value-run", default="run_v3_value", help="folder under WORK for the second stage's")
     ap.add_argument("--anchor-weight", type=float, default=5.0, help="(second stage) weight of KL(first-stage policy || current policy)")
     ap.add_argument("--value-lr", type=float, default=3e-4, help="(second stage) learning rate")
+    ap.add_argument("--value-bc-weight", type=float, default=0.0,
+                    help="(second stage) weight of imitating the --bc-players' played actions on their games, besides the win head and the anchor")
+    ap.add_argument("--finetune-from", default=None, help="(finetune.sh) run the three fine-tuning stages from these weights instead of the usual two")
+    ap.add_argument("--finetune-run", default="run_ft", help="prefix of the fine-tuning stages' folders: <prefix>_actor, _value_head, _all")
+    ap.add_argument("--ft-kl-weight", type=float, default=0.5, help="(fine-tune A) weight of the KL to Exeggcute's targets")
+    ap.add_argument("--ft-bc-weight", type=float, default=0.5, help="(fine-tune A) weight of imitating the --bc-players' played moves")
+    ap.add_argument("--ft-actor-anchor", type=float, default=5.0, help="(fine-tune A) weight of KL(--finetune-from policy || current policy)")
+    ap.add_argument("--ft-all-anchor", type=float, default=1.0, help="(fine-tune 2) weight of KL(stage A policy || current policy)")
+    ap.add_argument("--ft-lr", type=float, default=1e-4, help="(fine-tune A and 2) learning rate; stage 1 uses --value-lr")
+    ap.add_argument("--ft-actor-steps", type=int, default=20000)
+    ap.add_argument("--ft-value-head-steps", type=int, default=10000)
+    ap.add_argument("--ft-all-steps", type=int, default=20000)
+    ap.add_argument("--value-from", default=None,
+                    help="skip the policy stage: start the value stage from these policy weights (they are also the anchor's reference)")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")
     ap.add_argument("--bc-weight", type=float, default=0.0, help="weight of the imitation term on the imitated bots' games")
     ap.add_argument("--bc-players", default="Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3", help="usernames whose played actions are imitated")
@@ -817,7 +1031,7 @@ def main() -> None:
     ap.add_argument("--val-fraction", type=int, default=20, help="hold out 1 game in N (by battle id)")
     ap.add_argument("--val-every", type=int, default=2000)
     ap.add_argument("--val-batches", type=int, default=0)
-    ap.add_argument("--save-every", type=int, default=2000)
+    ap.add_argument("--save-every", type=int, default=5000)
     ap.add_argument("--backup-dir", default="auto",
                     help="separate storage for backups that outlive the container disk: auto = the vast.ai local volume at /data when one is mounted; "
                          "a path; or none. Holds metamon-backup/<run>/ (weights_<step>.pt every --backup-every steps, latest.pt overwritten each time, "
@@ -838,6 +1052,13 @@ def main() -> None:
     ap.add_argument("--check-decisions", type=int, default=2500, help="(--data labels) decisions per source (random whole games) relabelled from scratch to check the downloaded labels")
     ap.add_argument("--check-built-games", type=int, default=300, help="built games per source checked against their labels by name")
     ap.add_argument("--check-seed", type=int, default=0, help="seed of the checks' random samples")
+    ap.add_argument("--tournament-every", type=int, default=5000, help="steps between tournaments against TaurosV0, in each training stage (0: none)")
+    ap.add_argument("--tournament-games", type=int, default=100)
+    ap.add_argument("--tournament-procs", type=int, default=0, help="harness processes per tournament (default: a quarter of the CPUs, at most 4)")
+    ap.add_argument("--tournament-temperature", type=float, default=1.0, help="both sides' action temperature in tournaments (1: sample from each model's probabilities; 0: argmax)")
+    ap.add_argument("--tournament-device", default="cpu", help="TaurosV0's device in tournaments (cpu, as in the local trials, or cuda)")
+    ap.add_argument("--upload-repo", default="auto", help="public dataset repo the built games are uploaded to when HF_WRITE_TOKEN is set "
+                                                          "(auto: <token's user>/gen1ou-recurrent-built)")
     args = ap.parse_args()
     args.full_games, args.full_steps, args.full_value_steps = args.games, args.steps, args.value_steps  # (the smoke run shrinks these; the projection scales back up)
     if args.smoke:
@@ -847,6 +1068,8 @@ def main() -> None:
         args.value_steps = min(args.value_steps, 75)
         args.val_fraction = min(args.val_fraction, 5)
         args.check_decisions, args.check_built_games = min(args.check_decisions, 300), min(args.check_built_games, 50)
+        if args.tournament_every > 0:
+            args.tournament_every, args.tournament_games = args.steps, min(args.tournament_games, 4)  # (one short tournament at the end of the policy stage)
         args.work = args.work.rstrip("/") + "_smoke"
     import signal
 

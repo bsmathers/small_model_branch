@@ -213,6 +213,14 @@ class Checkpointer:
             raise RuntimeError(f"checkpoint writer failed: {self.error}")
 
 
+def save_atomic(obj, path: str) -> None:
+    """torch.save to a temporary name, then rename: a crash mid-write leaves the previous file (or none), never a truncated one
+    that a restart would fail to load."""
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
 class Backup:
     """Copies of the run on separate storage (a vast.ai local volume, say), for when the container disk is lost:
     weights_<step>.pt (model only) at every backup, latest.pt (model, optimizer, step) overwritten at every backup,
@@ -373,6 +381,15 @@ def main() -> None:
                     help="policy: the win head gets no gradient (distillation and imitation only). value: starts from --init, trains the win head and lets the "
                          "backbone move only as far as --anchor-weight allows, with no policy loss of its own. joint: everything at once")
     ap.add_argument("--init", default=None, help="weights (weights_<step>.pt or a checkpoint) to start from; required for --stage value, and the frozen reference of its anchor")
+    ap.add_argument("--value-bc-weight", type=float, default=0.0,
+                    help="(--stage value) weight of the imitation term on the imitated bots' games: the policy then moves toward their played "
+                         "actions there, held near --init everywhere by the anchor (default 0: no policy loss of its own)")
+    ap.add_argument("--freeze", choices=("none", "trunk"), default="none",
+                    help="trunk: train only the win head MLP (embeddings, the recurrent transformer and the actor head stay as --init has them, "
+                         "so the policy does not change)")
+    ap.add_argument("--monitor", choices=("auto", "kl", "bce", "loss"), default="auto",
+                    help="the validation number early stopping and weights_best.pt follow: auto = bce in the value stage, kl otherwise; "
+                         "loss = the stage's own weighted loss (alpha * kl + bc_weight * bc + anchor_weight * anchor + value_weight * bce)")
     ap.add_argument("--keep-value-head", action="store_true", help="(--stage value) keep the win head of --init instead of re-initialising it")
     ap.add_argument("--value-weight", type=float, default=None, help="weight of the win BCE (default: 0 in the policy stage, else 1)")
     ap.add_argument("--anchor-weight", type=float, default=None, help="weight of KL(first-stage policy || current policy) (default: 5 in the value stage, else 0)")
@@ -400,7 +417,8 @@ def main() -> None:
     if args.stage == "value":
         if not args.init:
             ap.error("--stage value needs --init (the first stage's weights)")
-        args.alpha = args.bc_weight = 0.0  # (the policy is held by the anchor, not trained again)
+        args.alpha = 0.0  # (no distillation: the policy is held by the anchor)
+        args.bc_weight = args.value_bc_weight  # (imitation of the bots' played actions, only when asked for)
     if args.value_weight is None:
         args.value_weight = 0.0 if args.stage == "policy" else 1.0
     if args.anchor_weight is None:
@@ -458,6 +476,10 @@ def main() -> None:
         log(f"anchor: KL to the policy of {args.init}, weight {args.anchor_weight}")
     log(f"stage {args.stage}: alpha {args.alpha} bc {args.bc_weight} value {args.value_weight} anchor {args.anchor_weight}")
     log(f"model {count_parameters(model):,} parameters")
+    if args.freeze == "trunk":
+        for name, param in model.named_parameters():
+            param.requires_grad_(name.startswith("win."))
+        log(f"frozen: everything but the win head ({sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters)")
     if str(args.batch) == "auto":
         args.batch = probe_batch(model, args, device)
         log(f"batch size {args.batch} (measured)")
@@ -472,8 +494,8 @@ def main() -> None:
     )
     if args.compile:
         model.step = torch.compile(model.step)
-    decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "role" not in n]
-    no_decay = [p for n, p in model.named_parameters() if not (p.ndim >= 2 and "role" not in n)]
+    decay = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim >= 2 and "role" not in n]
+    no_decay = [p for n, p in model.named_parameters() if p.requires_grad and not (p.ndim >= 2 and "role" not in n)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay}, {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95))
 
     scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16" and device.type == "cuda")
@@ -549,14 +571,19 @@ def main() -> None:
                     f"played-action nll {result['bc']:.4f} accuracy {result['bc_top1']:.3f}")
                 log("calibration " + " ".join(f"[{i / 10:.1f}-{(i + 1) / 10:.1f}) n={c} pred={p:.3f} won={w:.3f}" for i, (c, p, w) in enumerate(result["calibration"]) if c))
                 log("by source " + " ".join(f"{names[s]}: kl {k:.4f} bce {b:.4f}" for s, (k, b) in sorted(result["by_source"].items())))
-                monitored = result["bce"] if args.stage == "value" else result["kl"]
+                monitor = args.monitor if args.monitor != "auto" else ("bce" if args.stage == "value" else "kl")
+                if monitor == "loss":
+                    monitored = (args.alpha * result["kl"] + args.bc_weight * result["bc"] + args.anchor_weight * result["anchor"]
+                                 + args.value_weight * result["bce"])
+                else:
+                    monitored = result[monitor]
                 if monitored < best - args.min_delta:
                     best, bad = monitored, 0
                     best_state = to_cpu(model.state_dict())
-                    torch.save(best_state, os.path.join(args.out, "weights_best.pt"))
+                    save_atomic(best_state, os.path.join(args.out, "weights_best.pt"))
                 else:
                     bad += 1
-                log(f"best validation {'bce' if args.stage == 'value' else 'kl'} {best:.4f}; {bad} validation(s) without progress of {args.min_delta:g}" + (f" (patience {args.patience})" if args.patience else ""))
+                log(f"best validation {monitor} {best:.4f}; {bad} validation(s) without progress of {args.min_delta:g}" + (f" (patience {args.patience})" if args.patience else ""))
                 stop = args.patience > 0 and bad >= args.patience
                 if backup and bad == 0:
                     backup.copy(os.path.join(args.out, "weights_best.pt"))
@@ -568,7 +595,7 @@ def main() -> None:
                     backup.save_step(step, state)
                     backup.copy(os.path.join(args.out, "log.txt"))
             if step % args.save_every == 0 or step == args.steps:
-                torch.save(to_cpu(model.state_dict()), os.path.join(args.out, f"weights_{step}.pt"))
+                save_atomic(to_cpu(model.state_dict()), os.path.join(args.out, f"weights_{step}.pt"))
             if stop:
                 log(f"early stop at step {step}: no progress for {bad} validations; the final weights are the best ones (validation {best:.4f})")
                 break
@@ -576,7 +603,7 @@ def main() -> None:
         checkpointer.close()  # the last submitted state reaches the disk even when the run is interrupted
     # weights_final.pt: the best validated weights after an early stop, else the last step's
     final = best_state if (args.patience > 0 and bad >= args.patience and best_state is not None) else to_cpu(model.state_dict())
-    torch.save(final, os.path.join(args.out, "weights_final.pt"))
+    save_atomic(final, os.path.join(args.out, "weights_final.pt"))
     log(f"done at step {step}, {time.time() - start:.0f}s")
     if backup:
         backup.copy(os.path.join(args.out, "weights_final.pt"))

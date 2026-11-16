@@ -1,0 +1,271 @@
+diff --git a/metamon/rl/experimental/ensemble/ensemble.py b/metamon/rl/experimental/ensemble/ensemble.py
+index 56c988c..5952da0 100644
+--- a/metamon/rl/experimental/ensemble/ensemble.py
++++ b/metamon/rl/experimental/ensemble/ensemble.py
+@@ -1495,6 +1495,12 @@ def build_heuristic_ensemble_experiment(
+     runtimes: list[_EnsembleMemberRuntime] = []
+     reference_experiment = None
+     reference_policy = None
++    # Released Kakuna/Alakazam configs name the optional CUDA FlashAttention
++    # kernel. Preserve their configured sliding window through the local SDPA
++    # compatibility backend when members run on CPU or MPS.
++    attention_backend = (
++        None if all(device.type == "cuda" for device in devices) else "sdpa"
++    )
+ 
+     for idx, (spec, device) in enumerate(zip(member_specs, devices)):
+         builder = get_pretrained_model(spec.model_name)
+@@ -1519,6 +1525,7 @@ def build_heuristic_ensemble_experiment(
+                 checkpoint=checkpoint,
+                 log=log,
+                 action_temperature=action_temperature * spec.action_temperature,
++                attention_backend=attention_backend,
+             )
+             reference_policy = reference_experiment.policy
+             reference_policy.to(device)
+@@ -1538,6 +1545,7 @@ def build_heuristic_ensemble_experiment(
+             checkpoint=checkpoint,
+             log=False,
+             action_temperature=action_temperature * spec.action_temperature,
++            attention_backend=attention_backend,
+         )
+         policy = experiment.policy
+         policy.to(device)
+diff --git a/metamon/rl/metamon_to_amago.py b/metamon/rl/metamon_to_amago.py
+index 962440f..dda03ef 100644
+--- a/metamon/rl/metamon_to_amago.py
++++ b/metamon/rl/metamon_to_amago.py
+@@ -253,6 +253,12 @@ def make_placeholder_experiment(
+         train_batches_per_epoch=0,
+         val_interval=None,
+         val_timesteps_per_epoch=0,
++        # AMAGO's default is the float literal ``1e10`` despite the parameter
++        # being an integer. Python 3.14 now rejects that value in
++        # ``random.randint`` while initializing the placeholder environment.
++        # This inference-only experiment never saves trajectories, but it must
++        # still be an integer to complete model construction.
++        traj_save_len=10**10,
+         ckpt_interval=None,
+         always_save_latest=False,
+         always_load_latest=False,
+diff --git a/metamon/rl/pretrained.py b/metamon/rl/pretrained.py
+index 6c32d98..143a8be 100644
+--- a/metamon/rl/pretrained.py
++++ b/metamon/rl/pretrained.py
+@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore")
+ import huggingface_hub
+ import torch
+ import amago
++import gin
+ 
+ import metamon
+ from metamon.rl.metamon_to_amago import (
+@@ -158,12 +159,14 @@ class PretrainedModel:
+         gin_overrides: Optional[dict] = None,
+         battle_backend: str = "metamon",
+         dataset_config: Optional[str] = None,
++        cpu_compatible: bool = False,
+     ):
+         self.model_name = model_name
+         self.model_gin_config = model_gin_config
+         self.train_gin_config = train_gin_config
+         self.battle_backend = battle_backend
+         self.dataset_config = dataset_config
++        self.cpu_compatible = cpu_compatible
+         self.model_gin_config_path = os.path.join(
+             metamon.rl.MODEL_CONFIG_DIR, self.model_gin_config
+         )
+@@ -200,11 +203,15 @@ class PretrainedModel:
+         return config
+ 
+     def get_path_to_checkpoint(self, checkpoint: int) -> str:
+-        # Download checkpoint from HF Hub
++        # Analysis must be reproducible and offline once a checkpoint has been
++        # installed.  Without ``local_files_only``, Hugging Face validates its
++        # cache against the Hub even on a cache hit, which both leaks a request
++        # and makes a local analysis depend on network availability.
+         checkpoint_path = huggingface_hub.hf_hub_download(
+             repo_id=self.HF_REPO_ID,
+             filename=f"{self.model_name}/ckpts/policy_weights/policy_epoch_{checkpoint}.pt",
+             cache_dir=self.hf_cache_dir,
++            local_files_only=True,
+         )
+         return checkpoint_path
+ 
+@@ -213,6 +220,7 @@ class PretrainedModel:
+         checkpoint: Optional[int] = None,
+         log: bool = False,
+         action_temperature: float = 1.0,
++        attention_backend: Optional[str] = None,
+     ) -> amago.Experiment:
+         # use the base config and the gin file to configure the model
+         amago.cli_utils.use_config(
+@@ -220,6 +228,47 @@ class PretrainedModel:
+             [self.model_gin_config_path, self.train_gin_config_path],
+             finalize=False,
+         )
++        if attention_backend not in {None, "vanilla", "sdpa"}:
++            raise ValueError("attention_backend must be vanilla, sdpa, or None")
++        if attention_backend == "sdpa":
++            from metamon.rl.sdpa_attention import SDPAAttention
++
++            gin.bind_parameter(
++                "amago.nets.traj_encoders.TformerTrajEncoder.attention_type",
++                SDPAAttention,
++            )
++            # Preserve the architecture's FlashAttention window when replacing
++            # only its kernel.  Tauros uses 32 left-context turns while
++            # Superkazam/Kakuna use 96; silently using SDPAAttention's default
++            # would change the latter model.
++            try:
++                flash_window = gin.query_parameter(
++                    "amago.nets.transformer.FlashAttention.window_size"
++                )
++            except ValueError:
++                flash_window = None
++            if flash_window is not None:
++                gin.bind_parameter(
++                    "metamon.rl.sdpa_attention.SDPAAttention.window_size",
++                    flash_window,
++                )
++        elif attention_backend == "vanilla":
++            from amago.nets.transformer import VanillaAttention
++
++            gin.bind_parameter(
++                "amago.nets.traj_encoders.TformerTrajEncoder.attention_type",
++                VanillaAttention,
++            )
++        elif self.cpu_compatible:
++            # The released Tauros config selects CUDA-only FlashAttention with
++            # a 32-step sliding window. PyTorch SDPA retains that window on CPU
++            # and MPS; VanillaAttention would silently change it to full context.
++            from metamon.rl.sdpa_attention import SDPAAttention
++
++            gin.bind_parameter(
++                "amago.nets.traj_encoders.TformerTrajEncoder.attention_type",
++                SDPAAttention,
++            )
+         checkpoint = checkpoint if checkpoint is not None else self.default_checkpoint
+         ckpt_path = self.get_path_to_checkpoint(checkpoint)
+         ckpt_base_dir = str(Path(ckpt_path).parents[2])
+@@ -1293,6 +1342,9 @@ class TaurosV0(PretrainedModel):
+                     "DefaultObservationSpace-v1"
+                 ),
+             },
++            # Tauros' released config selects CUDA-only FlashAttention. The
++            # local SDPA backend preserves its 32-step attention window.
++            cpu_compatible=True,
+         )
+ 
+ 
+diff --git a/metamon/rl/sdpa_attention.py b/metamon/rl/sdpa_attention.py
+new file mode 100644
+index 0000000..be804f5
+--- /dev/null
++++ b/metamon/rl/sdpa_attention.py
+@@ -0,0 +1,105 @@
++"""PyTorch SDPA attention with AMAGO-compatible recurrent KV caches.
++
++Unlike AMAGO's optional ``flash_attn`` backend, this implementation uses
++``torch.nn.functional.scaled_dot_product_attention`` and therefore dispatches
++through PyTorch's native MPS backend on Apple silicon.  The module deliberately
++keeps AMAGO's parameter-free attention interface so released checkpoints remain
++strictly load-compatible.
++"""
++
++from __future__ import annotations
++
++import torch
++import torch.nn.functional as F
++import gin
++
++from amago.nets.transformer import SelfAttention
++
++
++@gin.configurable
++class SDPAAttention(SelfAttention):
++    """Causal SDPA with FlashAttention-compatible sliding-window semantics."""
++
++    def __init__(
++        self,
++        causal: bool = True,
++        dropout: float = 0.0,
++        window_size: tuple[int, int] = (32, 0),
++    ):
++        super().__init__(causal=causal, dropout=dropout)
++        self.window_size = window_size
++
++    def _window_mask(self, length: int, device: torch.device) -> torch.Tensor | None:
++        left, right = self.window_size
++        if left < 0 and right < 0:
++            return None
++        query = torch.arange(length, device=device)[:, None]
++        key = torch.arange(length, device=device)[None, :]
++        mask = torch.ones((length, length), dtype=torch.bool, device=device)
++        if left >= 0:
++            mask &= key >= query - left
++        if right >= 0:
++            mask &= key <= query + right
++        if self.causal:
++            mask &= key <= query
++        return mask
++
++    def _forward_without_cache(self, qkv: torch.Tensor) -> torch.Tensor:
++        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
++        mask = self._window_mask(q.shape[-2], q.device)
++        out = F.scaled_dot_product_attention(
++            q,
++            k,
++            v,
++            attn_mask=mask,
++            dropout_p=self.dropout if self.training else 0.0,
++            is_causal=self.causal and mask is None,
++        )
++        return out.transpose(1, 2)
++
++    def _inference_with_cache(
++        self,
++        qkv: torch.Tensor,
++        key_cache: torch.Tensor,
++        val_cache: torch.Tensor,
++        cache_seqlens: torch.Tensor,
++    ) -> torch.Tensor:
++        q, k, v = qkv.unbind(dim=2)
++        if q.shape[1] != 1:
++            raise ValueError("cached SDPA inference requires one query token")
++        batch = torch.arange(q.shape[0], device=q.device)
++        key_cache[batch, cache_seqlens] = k[:, 0]
++        val_cache[batch, cache_seqlens] = v[:, 0]
++
++        end = cache_seqlens + 1
++        # Attend over the compact fixed-capacity cache and mask unwritten
++        # slots. Avoiding Tensor.item() prevents an MPS synchronization and a
++        # torch.compile graph break on every decoder layer.
++        max_len = key_cache.shape[1]
++        keys = torch.nan_to_num(key_cache).transpose(1, 2)
++        values = torch.nan_to_num(val_cache).transpose(1, 2)
++        query = q.transpose(1, 2)
++
++        positions = torch.arange(max_len, device=q.device)[None, :]
++        valid = positions < end[:, None]
++        left, _ = self.window_size
++        if left >= 0:
++            valid &= positions >= (end - left - 1)[:, None]
++        # Every cached key precedes or equals the one-token query, so passing
++        # is_causal=True here would incorrectly keep only key zero for Q=1.
++        out = F.scaled_dot_product_attention(
++            query,
++            keys,
++            values,
++            attn_mask=valid[:, None, None, :],
++            dropout_p=0.0,
++            is_causal=False,
++        )
++        return out.transpose(1, 2)
++
++    def forward(self, qkv, key_cache=None, val_cache=None, cache_seqlens=None):
++        if key_cache is None or val_cache is None or cache_seqlens is None:
++            return self._forward_without_cache(qkv)
++        if self.training:
++            raise ValueError("KV-cache inference requires eval mode")
++        return self._inference_with_cache(qkv, key_cache, val_cache, cache_seqlens)

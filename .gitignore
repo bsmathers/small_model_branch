@@ -204,3 +204,7 @@ metamon/data/stats
 
 # the launcher is part of this project
 !/launch.sh
+
+# Zig duel harness build output (it is built under WORK/duel, but not if someone builds in place)
+duel/harness/zig-out/
+duel/harness/.zig-cache/

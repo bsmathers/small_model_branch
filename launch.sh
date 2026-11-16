@@ -9,6 +9,14 @@
 # early without progress). The model ends up in ~/work/run_v3_value/weights_final.pt. Safe to run again: every stage resumes.
 # --data built trains on the uploaded built games instead, --data trajectories relabels everything, --from-raw parses raw logs.
 #
+# Also, in the background, never stopping the run:
+#   - every 5000 steps (--tournament-every) 100 games (--tournament-games) of the checkpoint against TaurosV0 on the Zig duel
+#     harness (duel/, set up under WORK/duel at the start); each result is printed as a TOURNAMENT line and kept in
+#     WORK/tournaments/results.txt
+#   - with HF_WRITE_TOKEN=hf_... set: after the built-game check, the built games are zipped and uploaded to a public dataset
+#     repo (--upload-repo, default <token's user>/gen1ou-recurrent-built), usable later with --data built --built-repo REPO
+# A crash restarts the run by itself (RETRIES, default 3), which resumes where it stopped; so does running the same command again.
+#
 #   ./launch.sh --steps 20000 --value-steps 20000 --init /path/to/latest.pt   # continue an earlier run's policy
 #
 #   With a vast.ai local volume attached (at /data or /workspace), backups go to <volume>/metamon-backup every 100 steps
@@ -55,6 +63,11 @@ if [ -z "${SKIP_INSTALL:-}" ] && [ ! -f "$WORK/venv/.installed" ]; then
   reach https://pypi.org/simple/pip/
   reach https://github.com
 fi
+# the tournaments' setup also needs GitHub (pkmn/engine, upstream metamon) and ziglang.org; without them only the tournaments are off
+for url in https://github.com https://ziglang.org/download/index.json; do
+  code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+  if [ "$code" -lt 200 ] || [ "$code" -ge 400 ]; then log "warning: cannot reach $url (HTTP $code): the tournaments against TaurosV0 will be off"; fi
+done
 if git rev-parse --git-dir >/dev/null 2>&1; then
   if git fetch -q origin 2>/dev/null; then
     behind=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
@@ -102,5 +115,45 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     || { log "nvidia-smi sees a GPU but torch cannot use it; check that the torch build matches the driver (CUDA 12.x)"; exit 1; }
 fi
 
-log "starting"
-exec "$PYTHON" -m metamon.recurrent.launch "$@"
+# ---- the run, restarted after a crash ----
+# Every stage resumes from what is on disk (finished downloads, labels, built games and tournaments are skipped; training continues
+# from its latest.pt, written every step), so after a crash the same command simply runs again: up to RETRIES times (default 3),
+# 60 s apart. Not after a failed data check (exit 3: it would fail again), a usage error (2) or Ctrl-C / kill (130, 143).
+# Each attempt runs in its own process group, and whatever it leaves running (a stuck worker) is killed before the next one.
+# One run per WORK at a time (a lock), so a second start cannot write into the same checkpoints.
+RETRIES="${RETRIES:-3}"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$WORK/.launch.lock"
+  flock -n 9 || { log "another launch.sh is already running on $WORK (lock $WORK/.launch.lock)"; exit 1; }
+fi
+child=""
+on_signal() {
+  log "stopping"
+  if [ -n "$child" ]; then kill -INT -- "-$child" 2>/dev/null || kill -INT "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
+  exit 130
+}
+trap on_signal INT TERM
+attempt=0
+while true; do
+  attempt=$((attempt + 1))
+  log "starting (attempt $attempt of $((RETRIES + 1)))"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$PYTHON" -m metamon.recurrent.launch "$@" &
+  else
+    "$PYTHON" -m metamon.recurrent.launch "$@" &
+  fi
+  child=$!
+  set +e
+  wait "$child"
+  code=$?
+  set -e
+  kill -KILL -- "-$child" 2>/dev/null || true  # (anything of this attempt still running)
+  child=""
+  case "$code" in
+    0) log "finished"; exit 0 ;;
+    2|3|130|143) log "stopped with exit code $code: not restarting (see $WORK/logs/launch.txt)"; exit "$code" ;;
+  esac
+  if [ "$attempt" -gt "$RETRIES" ]; then log "failed $attempt times (exit code $code): giving up; see $WORK/logs/launch.txt"; exit "$code"; fi
+  log "crashed with exit code $code; restarting in 60 s (it resumes where it stopped)"
+  sleep 60
+done

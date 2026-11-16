@@ -1,0 +1,10 @@
+.{
+    .name = .pkmn_search,
+    .version = "0.1.0",
+    .fingerprint = 0x4402bb83ba6a4b3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .pkmn = .{ .path = "../engine" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
