@@ -4,11 +4,14 @@
 #
 #   1  head     only the actor trains: a 3-layer actor head (192 -> 64 -> 64 -> 9, ~17k parameters) on the state
 #               token, added to the linear head and zero-initialised so it starts as START's policy; embeddings, the
-#               recurrent transformer and the win head frozen. It imitates the strong bots' played moves (weight 1) with a
-#               little KL to Exeggcute against overfitting (0.1). Data: the bots' games only.           -> WORK/exp_head
+#               recurrent transformer and the win head frozen. Phase 1: 1500 steps imitating Exeggcute (KL only, usual
+#               human/strong data; -> WORK/exp_head_exeggcute). Phase 2: imitates the strong bots' played moves (weight 1) with a
+#               little KL to Exeggcute against overfitting (0.1), on the bots' games only. (head_experiment.sh runs this
+#               one alone.)                                                                               -> WORK/exp_head
 #   2  opphead  an opponent-action head added (the opponent's next move or switch, read from the next decision's record);
 #               everything but the win head trains: imitation of the bots on their games (1), KL to Exeggcute on the other
 #               games (1), the opponent head's cross-entropy on all (0.5). Data: bots, human and other bot games 3:2:1.
+#               --exp-deep-actor adds the 3-layer actor head too (it trains with everything else).
 #                                                                                                         -> WORK/exp_opphead
 #   3  blend    no training: tournaments of START alone and of policy blends (each member keeps its own recurrent state;
 #               the move probabilities are averaged): START+head, START+opphead, head+opphead, all three, START+weights_5000

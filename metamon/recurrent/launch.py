@@ -859,7 +859,8 @@ class Launcher:
     DEFAULT_BLENDS = "start;start@0.5,head@0.5;start@0.5,opphead@0.5;head@0.5,opphead@0.5;start,head,opphead;start@0.5,ckpt5000@0.5"
 
     def experiment(self) -> None:
-        """--experiment head|opphead|blend with --finetune-from START: one training stage from START (none for blend), then a tournament
+        """--experiment head|opphead|blend with --finetune-from START: training from START (head: --exp-pre-steps imitating Exeggcute
+        first, then the bots; opphead: one stage; blend: none), then a tournament
         of --final-games games against TaurosV0 of its weights_final.pt (blend: of each --blends policy). Results: FINAL TOURNAMENT
         lines, WORK/tournaments/results.txt and WORK/tournaments/final_<name>.json (a rerun skips what is done)."""
         a = self.args
@@ -877,12 +878,24 @@ class Launcher:
         out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}")
         self.log(f"experiment {a.experiment} from {start}: lr {lr}, KL to Exeggcute {kl}, imitation {bc}, anchor {anchor}, "
                  + (f"opponent head {opp}, " if a.experiment == "opphead" else "") + f"data {mix}; in {out}")
-        extra = ["--stage", "policy", "--init", start, "--alpha", str(kl), "--bc-weight", str(bc), "--anchor-weight", str(anchor),
+        init = start
+        if a.experiment == "head" and a.exp_pre_steps > 0:
+            # phase 1: the new head (on the frozen trunk) first learns Exeggcute's policy: KL only, on the distillation data
+            pre = out + "_exeggcute"
+            self.log(f"experiment head, phase 1: {a.exp_pre_steps} steps imitating Exeggcute (KL only, data "
+                     f"{a.exp_pre_mix if a.exp_pre_mix != 'none' else 'the usual human/strong mix'}); in {pre}")
+            self.train_stage(pre, a.exp_pre_steps, [
+                "--stage", "policy", "--init", start, "--alpha", "1", "--bc-weight", "0", "--anchor-weight", "0", "--lr", str(lr),
+                "--warmup", str(a.exp_pre_warmup), "--monitor", "loss", "--deep-actor", "--freeze", "actor"]
+                + (["--rebalance", a.exp_pre_mix] if a.exp_pre_mix != "none" else []))
+            init = os.path.join(pre, "weights_final.pt")
+            self.log(f"experiment head, phase 2: imitating the strong bots from {init}")
+        extra = ["--stage", "policy", "--init", init, "--alpha", str(kl), "--bc-weight", str(bc), "--anchor-weight", str(anchor),
                  "--lr", str(lr), "--monitor", "loss", "--rebalance", mix]
         if a.experiment == "head":
             extra += ["--deep-actor", "--freeze", "actor"]
         else:
-            extra += ["--opponent-head", "--opp-weight", str(opp), "--kl-scope", "nonbot"]
+            extra += ["--opponent-head", "--opp-weight", str(opp), "--kl-scope", "nonbot"] + (["--deep-actor"] if a.exp_deep_actor else [])
         self.train_stage(out, a.exp_steps, extra)
         self.final_tournament(a.exp_run or a.experiment, os.path.join(out, "weights_final.pt"))
 
@@ -1120,6 +1133,13 @@ def main() -> None:
                          "deep actor head on the frozen state token), imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
                          "bots' games and KL to Exeggcute on the rest; blend = tournaments of policy blends (--blends). Each ends with a "
                          "--final-games tournament against TaurosV0")
+    ap.add_argument("--exp-pre-steps", type=int, default=1500,
+                    help="(head) phase 1: steps of the new head imitating Exeggcute (KL only) before the bot imitation; 0 skips it")
+    ap.add_argument("--exp-pre-warmup", type=int, default=150, help="(head) phase 1's learning-rate warmup steps")
+    ap.add_argument("--exp-pre-mix", default="none",
+                    help="(head) phase 1's data: none = the usual human/strong mix (--mix), or a --rebalance spec such as bots=1,human=0,otherbots=0")
+    ap.add_argument("--exp-deep-actor", action="store_true",
+                    help="(opphead) also add the 3-layer actor head (192 -> 64 -> 64 -> 9); it trains with everything else")
     ap.add_argument("--exp-run", default=None, help="(experiment) its folder in WORK (default exp_<experiment>)")
     ap.add_argument("--exp-steps", type=int, default=10000, help="(experiment) training steps (early stopping still applies)")
     ap.add_argument("--exp-lr", type=float, default=None, help="(experiment) learning rate (default: head 3e-4, opphead 1e-4)")
