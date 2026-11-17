@@ -835,7 +835,7 @@ class Launcher:
         start = os.path.abspath(a.finetune_from)
         if not os.path.exists(start):
             raise SystemExit(f"--finetune-from: no {start}")
-        runs = [os.path.join(self.work, f"{a.finetune_run}_{n}") for n in ("actor", "value_head", "all")]
+        runs = [os.path.join(self.work, f"{a.finetune_run}_{n}") for n in ("actor", "value_head", "all", "joint")]
         if a.ft_skip_actor:  # (value.sh: WEIGHTS is already a fine-tuned actor)
             actor = start
             self.log(f"value stages from the actor {start}: stage 1 in {runs[1]}" + (f", stage 2 in {runs[2]}" if a.ft_all_steps > 0 else " (no stage 2)"))
@@ -852,6 +852,15 @@ class Launcher:
         if a.ft_all_steps > 0:
             self.train_stage(runs[2], a.ft_all_steps, [
                 "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
+        if a.ft_joint_steps > 0:
+            # 3: everything, from stage 2 (or 1): the win BCE + KL to Exeggcute + imitation of the bots' played moves, no anchor;
+            # the trained win head is kept, and early stopping follows the weighted sum of the three
+            start3 = os.path.join(runs[2] if a.ft_all_steps > 0 else runs[1], "weights_final.pt")
+            self.log(f"stage 3 (joint) from {start3}: win BCE 1, KL to Exeggcute {a.ft_joint_kl_weight}, imitation {a.ft_joint_bc_weight}, no anchor")
+            self.train_stage(runs[3], a.ft_joint_steps, [
+                "--stage", "joint", "--init", start3, "--alpha", str(a.ft_joint_kl_weight), "--bc-weight", str(a.ft_joint_bc_weight),
+                "--anchor-weight", "0", "--lr", str(a.ft_lr), "--monitor", "loss"]
+                + (["--rebalance", a.ft_joint_mix] if a.ft_joint_mix != "none" else []))
 
     EXPERIMENT_DEFAULTS = {
         # head: everything frozen but the actor: the linear actor head plus the deep actor head added on top of the state token
@@ -994,7 +1003,8 @@ class Launcher:
             self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
             return
         out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}") if a.experiment else \
-            os.path.join(self.work, (f"{a.finetune_run}_all" if a.ft_all_steps > 0 else f"{a.finetune_run}_value_head") if a.finetune_from
+            os.path.join(self.work, (f"{a.finetune_run}_joint" if a.ft_joint_steps > 0 else f"{a.finetune_run}_all" if a.ft_all_steps > 0
+                                     else f"{a.finetune_run}_value_head") if a.finetune_from
                          else a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
@@ -1136,6 +1146,13 @@ def main() -> None:
                     help="(value.sh) skip stage A: --finetune-from is already the fine-tuned actor; stages 1 and 2 start from it")
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)
     ap.add_argument("--ft-all-steps", type=int, default=20000, help="(fine-tune 2) steps; 0 stops after stage 1")
+    ap.add_argument("--ft-joint-steps", type=int, default=0,
+                    help="(fine-tune 3) steps of a last stage from stage 2's weights: everything trains on the win BCE + KL to Exeggcute + "
+                         "imitation of the bots, no anchor; 0 = no stage 3 (value.sh: 20000)")
+    ap.add_argument("--ft-joint-kl-weight", type=float, default=0.25, help="(fine-tune 3) weight of the KL to Exeggcute's targets")
+    ap.add_argument("--ft-joint-bc-weight", type=float, default=1.0, help="(fine-tune 3) weight of imitating the bots' played moves")
+    ap.add_argument("--ft-joint-mix", default="none",
+                    help="(fine-tune 3) data: none = the usual human/strong mix (the value stages' data), or a --rebalance spec")
     ap.add_argument("--experiment", choices=("head", "opphead", "blend"), default=None,
                     help="(with --finetune-from START; experiments.sh) instead of the three stages: head = only the actor trains (the linear head plus a "
                          "deep actor head on the frozen state token), imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
