@@ -440,7 +440,7 @@ def main() -> None:
                          "so the policy does not change). actor: train only the actor head (its linear layer and, with --deep-actor, the deep head) "
                          "on the frozen trunk")
     ap.add_argument("--deep-actor", action="store_true",
-                    help="add the deep actor head (model.DeepActor: 3 residual blocks of width 256, added to the linear head, output "
+                    help="add the deeper actor head (model.DeepActor: 192 -> 64 -> 64 -> 9, added to the linear head, output "
                          "zero-initialised so the policy starts as --init's); kept by later runs")
     ap.add_argument("--opponent-head", action="store_true", help="add the opponent-action head (predicts the opponent's next move or switch)")
     ap.add_argument("--opp-weight", type=float, default=0.0, help="weight of the opponent head's cross-entropy (labels: the next decision's record of the opponent's action)")

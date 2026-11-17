@@ -2,7 +2,7 @@
 # Three fine-tuning experiments from one actor checkpoint, in order; each ends with a 500-game tournament against TaurosV0
 # (--final-games) on the Zig duel harness, printed as a FINAL TOURNAMENT line and kept in WORK/tournaments/results.txt.
 #
-#   1  head     only the actor trains: a deep actor head (3 residual MLP blocks of width 256, ~0.8M parameters) on the state
+#   1  head     only the actor trains: a 3-layer actor head (192 -> 64 -> 64 -> 9, ~17k parameters) on the state
 #               token, added to the linear head and zero-initialised so it starts as START's policy; embeddings, the
 #               recurrent transformer and the win head frozen. It imitates the strong bots' played moves (weight 1) with a
 #               little KL to Exeggcute against overfitting (0.1). Data: the bots' games only.           -> WORK/exp_head

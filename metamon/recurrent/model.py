@@ -48,10 +48,8 @@ class Config:
     field_width: int = 39
     n_actions: int = 9
     # optional heads (off in every model trained before them; from_state turns them on when a weights file has them)
-    deep_actor: bool = False  # a deep residual actor head added to the linear one (zero-initialised output: starts as the linear head)
-    actor_width: int = 256
-    actor_blocks: int = 3
-    actor_dropout: float = 0.1
+    deep_actor: bool = False  # a 3-layer actor head (192 -> 64 -> 64 -> 9) added to the linear one (zero-initialised output: starts as the linear head)
+    actor_width: int = 64
     opponent_head: bool = False  # predicts the opponent's next action: a move (by move id) or a switch (n_moves + species id)
     head_hidden: int = 128
 
@@ -79,33 +77,19 @@ class Block(nn.Module):
         return x + self.ff2(F.gelu(self.ff1(self.norm2(x))))
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, width: int, dropout: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(width)
-        self.ff1 = nn.Linear(width, 2 * width)
-        self.ff2 = nn.Linear(2 * width, width)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.drop(self.ff2(F.gelu(self.ff1(self.norm(x)))))
-
-
 class DeepActor(nn.Module):
-    """The deep actor head: the state token -> width -> `blocks` pre-norm residual MLP blocks -> 9 logits, added to the linear
-    head's. The output layer starts at zero, so a model that gets this head plays exactly as before until it is trained."""
+    """The deeper actor head: LayerNorm, then 3 linear layers on the state token (192 -> 64 -> 64 -> 9, GELU between), added to
+    the linear head's logits. The last layer starts at zero, so a model that gets this head plays exactly as before until trained."""
 
     def __init__(self, cfg: "Config"):
         super().__init__()
-        self.inp = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.actor_width), nn.GELU())
-        self.blocks = nn.Sequential(*(ResidualBlock(cfg.actor_width, cfg.actor_dropout) for _ in range(cfg.actor_blocks)))
-        self.out_norm = nn.LayerNorm(cfg.actor_width)
-        self.out = nn.Linear(cfg.actor_width, cfg.n_actions)
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        w = cfg.actor_width
+        self.net = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, w), nn.GELU(), nn.Linear(w, w), nn.GELU(), nn.Linear(w, cfg.n_actions))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.out(self.out_norm(self.blocks(self.inp(h))))
+        return self.net(h)
 
 
 class PolicyValueModel(nn.Module):
