@@ -836,17 +836,22 @@ class Launcher:
         if not os.path.exists(start):
             raise SystemExit(f"--finetune-from: no {start}")
         runs = [os.path.join(self.work, f"{a.finetune_run}_{n}") for n in ("actor", "value_head", "all")]
-        self.log(f"fine-tuning from {start}: stages in {', '.join(runs)}")
-        self.train_stage(runs[0], a.ft_actor_steps, [
-            "--stage", "policy", "--init", start, "--alpha", str(a.ft_kl_weight), "--bc-weight", str(a.ft_bc_weight),
-            "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"]
-            + (["--rebalance", a.ft_actor_mix] if a.ft_actor_mix != "none" else []))
-        actor = os.path.join(runs[0], "weights_final.pt")
+        if a.ft_skip_actor:  # (value.sh: WEIGHTS is already a fine-tuned actor)
+            actor = start
+            self.log(f"value stages from the actor {start}: stage 1 in {runs[1]}" + (f", stage 2 in {runs[2]}" if a.ft_all_steps > 0 else " (no stage 2)"))
+        else:
+            self.log(f"fine-tuning from {start}: stages in {', '.join(runs)}")
+            self.train_stage(runs[0], a.ft_actor_steps, [
+                "--stage", "policy", "--init", start, "--alpha", str(a.ft_kl_weight), "--bc-weight", str(a.ft_bc_weight),
+                "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"]
+                + (["--rebalance", a.ft_actor_mix] if a.ft_actor_mix != "none" else []))
+            actor = os.path.join(runs[0], "weights_final.pt")
         self.train_stage(runs[1], a.ft_value_head_steps, [
             "--stage", "value", "--init", actor, "--freeze", "trunk", "--anchor-weight", "0", "--lr", str(a.value_lr)])
         head = os.path.join(runs[1], "weights_final.pt")
-        self.train_stage(runs[2], a.ft_all_steps, [
-            "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
+        if a.ft_all_steps > 0:
+            self.train_stage(runs[2], a.ft_all_steps, [
+                "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
 
     EXPERIMENT_DEFAULTS = {
         # head: everything frozen but the actor: the linear actor head plus the deep actor head added on top of the state token
@@ -989,7 +994,8 @@ class Launcher:
             self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
             return
         out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}") if a.experiment else \
-            os.path.join(self.work, f"{a.finetune_run}_all" if a.finetune_from else a.value_run if a.value_steps > 0 else a.policy_run)
+            os.path.join(self.work, (f"{a.finetune_run}_all" if a.ft_all_steps > 0 else f"{a.finetune_run}_value_head") if a.finetune_from
+                         else a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
@@ -1126,8 +1132,10 @@ def main() -> None:
     ap.add_argument("--ft-all-anchor", type=float, default=1.0, help="(fine-tune 2) weight of KL(stage A policy || current policy)")
     ap.add_argument("--ft-lr", type=float, default=1e-4, help="(fine-tune A and 2) learning rate; stage 1 uses --value-lr")
     ap.add_argument("--ft-actor-steps", type=int, default=20000)
+    ap.add_argument("--ft-skip-actor", action="store_true",
+                    help="(value.sh) skip stage A: --finetune-from is already the fine-tuned actor; stages 1 and 2 start from it")
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)
-    ap.add_argument("--ft-all-steps", type=int, default=20000)
+    ap.add_argument("--ft-all-steps", type=int, default=20000, help="(fine-tune 2) steps; 0 stops after stage 1")
     ap.add_argument("--experiment", choices=("head", "opphead", "blend"), default=None,
                     help="(with --finetune-from START; experiments.sh) instead of the three stages: head = only the actor trains (the linear head plus a "
                          "deep actor head on the frozen state token), imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
