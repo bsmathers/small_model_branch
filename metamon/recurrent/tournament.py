@@ -93,11 +93,19 @@ def zig_binary(base: Path) -> str:
     return str(dest / "zig")
 
 
+def blend_spec(weights: str) -> str:
+    """The student's weights for the policy server: one file, or a blend "a.pt@0.5,b.pt@0.5" (metamon/recurrent/blend.py); the
+    paths made absolute (the harness runs in another folder)."""
+    from metamon.recurrent.blend import parse_spec
+
+    return ",".join(f"{Path(path).resolve()}@{weight:g}" for path, weight in parse_spec(weights))
+
+
 def duel_env(work: Path, cache: Path, weights: str, device: str = "cpu", temperature: float = 0.0) -> dict:
     env = dict(os.environ)
     env.update({
         "DUEL_PYTHON": sys.executable, "DUEL_TOOLS": str(DUEL / "tools"), "TAUROS_METAMON": str(work / "duel" / "tauros-metamon"),
-        "TAUROS_CACHE": str(cache), "TAUROS_DEVICE": device, "RECURRENT_WEIGHTS": str(Path(weights).resolve()),
+        "TAUROS_CACHE": str(cache), "TAUROS_DEVICE": device, "RECURRENT_WEIGHTS": blend_spec(weights),
         "METAMON_CACHE_DIR": str(cache), "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
         "TORCHDYNAMO_DISABLE": "1", "PYTHONUNBUFFERED": "1", "PYTHONHASHSEED": "0", "POLICY_TEMPERATURE": str(temperature),
     })
@@ -183,7 +191,14 @@ def play(work: Path, cache: Path, weights: str, games: int = 100, procs: int = 4
         raise SystemExit("duel failed: " + "; ".join(errors))
     totals["seconds"] = time.time() - start
     # what was played, for comparing runs: the weights, the simulator, the policies' settings
-    totals["weights_sha256"] = hashlib.sha256(Path(weights).read_bytes()).hexdigest()
+    from metamon.recurrent.blend import describe as describe_blend
+
+    members = describe_blend(blend_spec(weights))
+    if len(members) == 1:
+        totals["weights_sha256"] = members[0]["sha256"]
+    else:
+        totals["blend"] = members
+        totals["blend_mode"] = os.environ.get("RECURRENT_BLEND_MODE", "mix")
     totals["engine"] = ENGINE_COMMIT
     totals["tauros_metamon"] = METAMON_COMMIT
     totals["temperature"] = temperature
@@ -209,7 +224,7 @@ def main() -> None:
     for name in ("setup", "play"):
         p = sub.add_parser(name)
         if name == "play":
-            p.add_argument("weights")
+            p.add_argument("weights", help="a weights file, or a blend: a.pt@0.5,b.pt@0.5 (RECURRENT_BLEND_MODE=logit for the geometric blend)")
             p.add_argument("--games", type=int, default=100)
             p.add_argument("--procs", type=int, default=4)
             p.add_argument("--device", default="cpu", help="TaurosV0's device (the student runs on the CPU)")

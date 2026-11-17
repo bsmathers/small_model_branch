@@ -44,7 +44,7 @@ sys.path.insert(1, str(Path(__file__).resolve().parent))
 
 from metamon.interface import move_name, pokemon_name  # noqa: E402
 from metamon.recurrent.features import CANT_REASONS, LastTurn, canonical_own, encode_observer, policy_options  # noqa: E402
-from metamon.recurrent.model import PolicyValueModel  # noqa: E402
+from metamon.recurrent.blend import PolicyBlend  # noqa: E402
 from metamon.recurrent.tables import Tables  # noqa: E402
 from metamon_connector import SnapshotEncoder  # noqa: E402
 from metamon.recurrent.features import EFFECTS  # noqa: E402
@@ -116,8 +116,8 @@ class _Space:  # SnapshotEncoder keeps its per-battle effect memory on the obser
 class Game:
     """Per-game memory: the recurrent state and what the last-turn record needs."""
 
-    def __init__(self, model):
-        self.h = torch.zeros(1, model.cfg.d)
+    def __init__(self, policy):
+        self.h = policy.initial_state()  # (one recurrent state per blended member)
         self.space = _Space()
         self.prev = None  # (snapshot, UniversalState) of the last stepped decision
         self.sent = None  # what we answered there
@@ -298,7 +298,9 @@ def change(prev_mon, now_mon):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--weights", default=os.environ.get("RECURRENT_WEIGHTS", os.path.expanduser("~/model_weights/weights_best.pt")))
+    ap.add_argument("--weights", default=os.environ.get("RECURRENT_WEIGHTS", os.path.expanduser("~/model_weights/weights_best.pt")),
+                    help="a weights file, or a blend of several: a.pt@0.5,b.pt@0.5 (metamon/recurrent/blend.py)")
+    ap.add_argument("--blend-mode", default=os.environ.get("RECURRENT_BLEND_MODE", "mix"), choices=("mix", "logit"))
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--shadow", default=os.environ.get("RECURRENT_SHADOW"),
                     help="blend|judge: Exeggcute plays (the replies are its), this model only scores the same snapshots; prints the agreement")
@@ -324,10 +326,7 @@ def main():
 
     temperature = float(os.environ.get("POLICY_TEMPERATURE", "0"))
     rng = random.Random(f"student-{os.environ.get('POLICY_SEED', '0')}")
-    model = PolicyValueModel()
-    state_dict = torch.load(args.weights, map_location="cpu")
-    model.load_state_dict(state_dict["model"] if "model" in state_dict else state_dict)
-    model.eval()
+    model = PolicyBlend.load(args.weights, args.blend_mode)
     tables = Tables.from_dex(1)
     encoder = SnapshotEncoder(METAMON_ROOT, observation_space=_Space())
     # this metamon's UniversalPokemon also takes the actual stats; the parsed training data has none (-1 everywhere)
@@ -341,7 +340,7 @@ def main():
 
     pokemon_without_stats.universal_types = UniversalPokemon.universal_types
     encoder._universal = SimpleNamespace(UniversalMove=UniversalMove, UniversalPokemon=pokemon_without_stats, UniversalState=UniversalState)
-    print(f"recurrent policy: {args.weights}", file=sys.stderr, flush=True)
+    print(f"recurrent policy: {args.weights}" + (f" (blend of {model.size}, {args.blend_mode})" if model.size > 1 else ""), file=sys.stderr, flush=True)
     game = Game(model)
     for raw in sys.stdin:
         try:
@@ -425,9 +424,6 @@ def main():
             enc = encode_observer(state, party, revealed, game.last, game.decisions, tables, extras=extras)
             ids ={k: torch.from_numpy(v)[None, None] for k, v in enc.ids.items()}
             floats = {k: torch.from_numpy(v)[None, None] for k, v in enc.floats.items()}
-            with torch.no_grad():
-                tokens = model.observation_tokens(ids, floats)
-                logits, _, game.h = model.step(tokens[:, 0], game.h)
             # option name -> policy slot, with the training code's own definition (Metamon's action indices: the active's moves
             # sorted by name, then the living reserves sorted by species)
             moves, reserves = policy_options(canonical_own(state, party)[0])
@@ -439,6 +435,9 @@ def main():
                         slots[option] = 4 + reserves.index(name)
                 elif move_name(option) in moves:
                     slots[option] = moves.index(move_name(option))
+            # the policy's log-probabilities over the legal slots (one model: its logits up to a constant, so the sampling
+            # below is unchanged; a blend: the blended distribution)
+            logits, game.h = model.decide(ids, floats, game.h, sorted(set(slots.values())))
             scored = [(float(logits[0, s]), option) for option, s in slots.items()]
             reply = max(scored)[1] if scored else legal[0]
             if temperature > 0 and len(scored) > 1:  # (repo copy) sample from softmax(logits / T) over the legal options

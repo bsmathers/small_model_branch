@@ -85,7 +85,7 @@ class SideJobs:
         return p, handle
 
     def start_setup(self) -> None:
-        if self.a.tournament_every <= 0:
+        if self.a.tournament_every <= 0 and not self.a.experiment:
             self.l.log("tournaments: off (--tournament-every 0)")
             return
         self.setup = self.popen([self.l.py, "-m", "metamon.recurrent.tournament", "setup", "--work", self.l.work, "--cache", self.l.cache], "tournament_setup.txt")
@@ -800,6 +800,9 @@ class Launcher:
         near the first stage's policy by a KL penalty (--anchor-weight). --value-steps 0 trains both at once in a single stage."""
         a = self.args
         out = os.path.join(self.work, a.policy_run)
+        if a.finetune_from and a.experiment:
+            self.experiment()
+            return
         if a.finetune_from:
             self.finetune()
             return
@@ -845,6 +848,87 @@ class Launcher:
         self.train_stage(runs[2], a.ft_all_steps, [
             "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
 
+    EXPERIMENT_DEFAULTS = {
+        # mlp: the trunk (embeddings and the recurrent transformer) frozen; the actor head, with a residual MLP added, imitates the
+        # bots' played moves with a little KL to Exeggcute against overfitting, on the bots' games
+        "mlp": {"lr": 3e-4, "kl": 0.1, "bc": 1.0, "anchor": 0.0, "opp": 0.0, "mix": "bots=1,human=0,otherbots=0"},
+        # opphead: an opponent-action head added; everything trains (but the win head): imitation of the bots on their games, KL to
+        # Exeggcute on the others, the opponent head's cross-entropy on all
+        "opphead": {"lr": 1e-4, "kl": 1.0, "bc": 1.0, "anchor": 0.0, "opp": 0.5, "mix": "bots=3,human=2,otherbots=1"},
+    }
+    DEFAULT_BLENDS = "start;start@0.5,mlp@0.5;start@0.5,opphead@0.5;mlp@0.5,opphead@0.5;start,mlp,opphead;start@0.5,ckpt5000@0.5"
+
+    def experiment(self) -> None:
+        """--experiment mlp|opphead|blend with --finetune-from START: one training stage from START (none for blend), then a tournament
+        of --final-games games against TaurosV0 of its weights_final.pt (blend: of each --blends policy). Results: FINAL TOURNAMENT
+        lines, WORK/tournaments/results.txt and WORK/tournaments/final_<name>.json (a rerun skips what is done)."""
+        a = self.args
+        start = os.path.abspath(a.finetune_from)
+        if not os.path.exists(start):
+            raise SystemExit(f"--finetune-from: no {start}")
+        if a.experiment == "blend":
+            self.blend_experiment(start)
+            return
+        d = self.EXPERIMENT_DEFAULTS[a.experiment]
+        pick = lambda value, key: d[key] if value is None else value  # noqa: E731
+        lr, kl, bc, anchor, opp = (pick(a.exp_lr, "lr"), pick(a.exp_kl_weight, "kl"), pick(a.exp_bc_weight, "bc"),
+                                   pick(a.exp_anchor, "anchor"), pick(a.exp_opp_weight, "opp"))
+        mix = a.exp_mix or d["mix"]
+        out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}")
+        self.log(f"experiment {a.experiment} from {start}: lr {lr}, KL to Exeggcute {kl}, imitation {bc}, anchor {anchor}, "
+                 + (f"opponent head {opp}, " if a.experiment == "opphead" else "") + f"data {mix}; in {out}")
+        extra = ["--stage", "policy", "--init", start, "--alpha", str(kl), "--bc-weight", str(bc), "--anchor-weight", str(anchor),
+                 "--lr", str(lr), "--monitor", "loss", "--rebalance", mix]
+        if a.experiment == "mlp":
+            extra += ["--actor-mlp", "--freeze", "actor"]
+        else:
+            extra += ["--opponent-head", "--opp-weight", str(opp), "--kl-scope", "nonbot"]
+        self.train_stage(out, a.exp_steps, extra)
+        self.final_tournament(a.exp_run or a.experiment, os.path.join(out, "weights_final.pt"))
+
+    def blend_experiment(self, start: str) -> None:
+        """Each --blends policy (";" between policies, "," between members, "@w" a member's weight) against TaurosV0. Members by name:
+        start (--finetune-from), ckpt5000 (weights_5000.pt beside it), mlp and opphead (the experiments' weights_final.pt),
+        distilled (WORK/run_v3/weights_best.pt), or a path."""
+        names = {"start": start, "ckpt5000": os.path.join(os.path.dirname(start), "weights_5000.pt"),
+                 "mlp": os.path.join(self.work, "exp_mlp", "weights_final.pt"), "opphead": os.path.join(self.work, "exp_opphead", "weights_final.pt"),
+                 "distilled": os.path.join(self.work, "run_v3", "weights_best.pt")}
+        for policy in [p.strip() for p in self.args.blends.split(";") if p.strip()]:
+            members = []
+            for part in policy.split(","):
+                name, _, weight = part.strip().partition("@")
+                members.append((names.get(name, os.path.abspath(os.path.expanduser(name))), weight or "1"))
+            missing = [path for path, _ in members if not os.path.exists(path)]
+            if missing:
+                self.log(f"blend {policy}: skipped, no {', '.join(missing)}")
+                continue
+            self.final_tournament(re.sub(r"[^A-Za-z0-9.@_-]+", "+", policy), ",".join(f"{path}@{w}" for path, w in members))
+
+    def final_tournament(self, label: str, spec: str) -> None:
+        a = self.args
+        result = os.path.join(self.side.dir, f"final_{label}.json")
+        from metamon.recurrent.tournament import describe
+
+        if os.path.exists(result):
+            self.log(f"FINAL TOURNAMENT {label} vs TaurosV0 (played before): {describe(json.load(open(result)))}")
+            return
+        while self.side.setup:  # (the harness and TaurosV0, set up in the background at the start)
+            self.side.poll()
+            time.sleep(5)
+        if not os.path.exists(os.path.join(self.work, "duel", ".ready")):
+            raise RuntimeError(f"the tournament setup failed (see {self.logs}/tournament_setup.txt)")
+        procs = a.final_procs or max(1, min(16, self.cpus // 2))
+        self.log(f"final tournament {label}: {a.final_games} games vs TaurosV0 ({procs} processes; {spec})")
+        cmd = [self.py, "-m", "metamon.recurrent.tournament", "play", spec, "--work", self.work, "--cache", self.cache,
+               "--games", str(a.final_games), "--procs", str(procs), "--device", a.tournament_device,
+               "--temperature", str(a.tournament_temperature), "--out", result + ".tmp", "--log-dir", os.path.join(self.logs, f"final_{label}")]
+        self.run_one(f"final_{label}", cmd, self.env(RECURRENT_BLEND_MODE=a.blend_mode))
+        os.replace(result + ".tmp", result)
+        line = f"FINAL TOURNAMENT {label} vs TaurosV0: {describe(json.load(open(result)))}"
+        self.log(line)
+        with open(os.path.join(self.side.dir, "results.txt"), "a") as f:
+            f.write(f"{time.strftime('%F %T')} {line} [{spec}]\n")
+
     def train_stage(self, out: str, steps: int, extra: list[str]) -> None:
         a = self.args
         cmd = [self.py, "-m", "metamon.recurrent.train", out]
@@ -888,7 +972,11 @@ class Launcher:
 
     def summary(self) -> None:
         a = self.args
-        out = os.path.join(self.work, f"{a.finetune_run}_all" if a.finetune_from else a.value_run if a.value_steps > 0 else a.policy_run)
+        if a.experiment == "blend":
+            self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
+            return
+        out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}") if a.experiment else \
+            os.path.join(self.work, f"{a.finetune_run}_all" if a.finetune_from else a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
         if weights:
@@ -1027,6 +1115,25 @@ def main() -> None:
     ap.add_argument("--ft-actor-steps", type=int, default=20000)
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)
     ap.add_argument("--ft-all-steps", type=int, default=20000)
+    ap.add_argument("--experiment", choices=("mlp", "opphead", "blend"), default=None,
+                    help="(with --finetune-from START; experiments.sh) instead of the three stages: mlp = actor head + a residual MLP on the "
+                         "frozen trunk, imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
+                         "bots' games and KL to Exeggcute on the rest; blend = tournaments of policy blends (--blends). Each ends with a "
+                         "--final-games tournament against TaurosV0")
+    ap.add_argument("--exp-run", default=None, help="(experiment) its folder in WORK (default exp_<experiment>)")
+    ap.add_argument("--exp-steps", type=int, default=10000, help="(experiment) training steps (early stopping still applies)")
+    ap.add_argument("--exp-lr", type=float, default=None, help="(experiment) learning rate (default: mlp 3e-4, opphead 1e-4)")
+    ap.add_argument("--exp-kl-weight", type=float, default=None, help="(experiment) KL to Exeggcute (default: mlp 0.1 on all decisions, opphead 1 off the bots' games)")
+    ap.add_argument("--exp-bc-weight", type=float, default=None, help="(experiment) imitation of the bots' played moves (default 1)")
+    ap.add_argument("--exp-anchor", type=float, default=None, help="(experiment) KL(START policy || current) (default 0)")
+    ap.add_argument("--exp-opp-weight", type=float, default=None, help="(opphead) the opponent head's cross-entropy (default 0.5)")
+    ap.add_argument("--exp-mix", default=None, help="(experiment) --rebalance data (default: mlp bots=1,human=0,otherbots=0; opphead bots=3,human=2,otherbots=1)")
+    ap.add_argument("--blends", default=Launcher.DEFAULT_BLENDS,
+                    help="(blend) policies, ';' between them, members 'name@weight' (names: start, ckpt5000, mlp, opphead, distilled, or a path)")
+    ap.add_argument("--blend-mode", choices=("mix", "logit"), default="mix",
+                    help="(blend) mix: the weighted average of the members' move probabilities; logit: the weighted geometric mean")
+    ap.add_argument("--final-games", type=int, default=500, help="(experiment) games of each final tournament")
+    ap.add_argument("--final-procs", type=int, default=0, help="(experiment) harness processes of a final tournament (default: half the CPUs, at most 16)")
     ap.add_argument("--value-from", default=None,
                     help="skip the policy stage: start the value stage from these policy weights (they are also the anchor's reference)")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")

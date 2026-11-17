@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from metamon.recurrent.dataset import Windows, collate, scan
-from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS, PolicyValueModel, count_parameters
+from metamon.recurrent.model import FLOAT_KEYS, ID_KEYS, Config, PolicyValueModel, count_parameters
 
 BIG_NEGATIVE = -1e9
 
@@ -76,8 +76,16 @@ def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 def run_batch(model, batch: dict, args, ref=None):
     ids = {k: batch[f"ids_{k}"] for k in ID_KEYS}
     floats = {k: batch[f"floats_{k}"] for k in FLOAT_KEYS}
-    logits, win_logit, _ = model(ids, floats)
+    if model.cfg.opponent_head:
+        logits, win_logit, _, states = model(ids, floats, states=True)
+    else:
+        logits, win_logit, _ = model(ids, floats)
     out = compute((logits, win_logit), batch, args.target, args.mix)
+    if model.cfg.opponent_head and "opp_action" in batch:
+        target = batch["opp_action"]
+        opp_logits = model.opponent(states).float()
+        out["opp"] = F.cross_entropy(opp_logits.transpose(1, 2), target.clamp_min(0), reduction="none").masked_fill(target < 0, 0.0)
+        out["opp_top1"] = (opp_logits.argmax(-1) == target).float()
     if ref is not None:
         out["anchor"] = anchor_kl(logits, ref, ids, floats, batch["legal"] > 0)
     return out
@@ -97,8 +105,8 @@ def anchor_kl(logits: torch.Tensor, ref, ids: dict, floats: dict, legal: torch.T
 @torch.no_grad()
 def validate(model, loader, args, device, ref=None) -> dict:
     model.eval()
-    sums = {k: 0.0 for k in ("kl", "top1", "bce", "brier", "bc", "bc_top1", "anchor")}
-    count_p = count_w = count_b = 0.0
+    sums = {k: 0.0 for k in ("kl", "top1", "bce", "brier", "bc", "bc_top1", "anchor", "kl_nonbot", "opp", "opp_top1")}
+    count_p = count_w = count_b = count_n = count_o = 0.0
     bins = np.zeros((10, 3))  # count, sum of predictions, sum of results
     by_source: dict[int, list[float]] = {}
     for batch in loader:
@@ -115,6 +123,14 @@ def validate(model, loader, args, device, ref=None) -> dict:
         count_b += bcm.sum().item()
         for k in ("kl", "top1"):
             sums[k] += (out[k] * pol).sum().item()
+        nonbot = pol * (~batch["bc_game"]).float()
+        sums["kl_nonbot"] += (out["kl"] * nonbot).sum().item()
+        count_n += nonbot.sum().item()
+        if "opp" in out:
+            om = ((batch["opp_action"] >= 0) & batch["scored"]).float()
+            sums["opp"] += (out["opp"] * om).sum().item()
+            sums["opp_top1"] += (out["opp_top1"] * om).sum().item()
+            count_o += om.sum().item()
         for k in ("bce", "brier"):
             sums[k] += (out[k] * sc).sum().item()
         count_p += pol.sum().item()
@@ -139,6 +155,10 @@ def validate(model, loader, args, device, ref=None) -> dict:
         "bc": sums["bc"] / max(count_b, 1),
         "bc_top1": sums["bc_top1"] / max(count_b, 1),
         "anchor": sums["anchor"] / max(count_w, 1),
+        "kl_nonbot": sums["kl_nonbot"] / max(count_n, 1),
+        "opp": sums["opp"] / max(count_o, 1),
+        "opp_top1": sums["opp_top1"] / max(count_o, 1),
+        "opp_decisions": count_o,
         "bc_decisions": count_b,
         "decisions": count_w,
     }
@@ -306,6 +326,8 @@ def synthetic_batch(batch: int, size: int, device) -> dict:
     out["scored"] = torch.ones(batch, size, dtype=torch.bool)
     out["played"] = torch.zeros(batch, size, dtype=torch.long)
     out["bc_ok"] = torch.ones(batch, size, dtype=torch.bool)
+    out["bc_game"] = torch.zeros(batch, size, dtype=torch.bool)
+    out["opp_action"] = torch.randint(0, 320, (batch, size), generator=g)
     return {k: v.to(device) for k, v in out.items()}
 
 
@@ -413,9 +435,17 @@ def main() -> None:
     ap.add_argument("--rebalance", default=None,
                     help="bots=W1,human=W2,otherbots=W3: train on all games seen from the imitated bots' side plus random subsets of the human "
                          "and other bot games, game counts in the ratio of the weights (see rebalanced_sources)")
-    ap.add_argument("--freeze", choices=("none", "trunk"), default="none",
+    ap.add_argument("--freeze", choices=("none", "trunk", "actor"), default="none",
                     help="trunk: train only the win head MLP (embeddings, the recurrent transformer and the actor head stay as --init has them, "
-                         "so the policy does not change)")
+                         "so the policy does not change). actor: train only the actor head (its linear layer and, with --actor-mlp, its MLP) "
+                         "on the frozen trunk")
+    ap.add_argument("--actor-mlp", action="store_true",
+                    help="add a residual MLP to the actor head (zero-initialised: the policy starts as --init's); kept by later runs")
+    ap.add_argument("--opponent-head", action="store_true", help="add the opponent-action head (predicts the opponent's next move or switch)")
+    ap.add_argument("--opp-weight", type=float, default=0.0, help="weight of the opponent head's cross-entropy (labels: the next decision's record of the opponent's action)")
+    ap.add_argument("--kl-scope", choices=("all", "nonbot"), default="all",
+                    help="where the KL to Exeggcute applies: every decision, or only the games not seen from an imitated bot's side "
+                         "(nonbot: the bots' games are imitated, the others distilled)")
     ap.add_argument("--monitor", choices=("auto", "kl", "bce", "loss"), default="auto",
                     help="the validation number early stopping and weights_best.pt follow: auto = bce in the value stage, kl otherwise; "
                          "loss = the stage's own weighted loss (alpha * kl + bc_weight * bc + anchor_weight * anchor + value_weight * bce)")
@@ -489,11 +519,20 @@ def main() -> None:
     resume_state =torch.load(latest, map_location="cpu") if args.resume and os.path.exists(latest) else None
     start_step = resume_state["step"] if resume_state else 0
 
-    model = PolicyValueModel().to(device)
+    heads = {"actor_mlp": args.actor_mlp, "opponent_head": args.opponent_head}
+    if resume_state:
+        model = PolicyValueModel.from_state(resume_state["model"], **heads)  # (the heads of the run being resumed)
+    elif args.init:
+        model = PolicyValueModel.from_state(torch.load(args.init, map_location="cpu"), **heads)
+    else:
+        model = PolicyValueModel(Config(**heads))
+    model = model.to(device)
+    if model.cfg.actor_mlp or model.cfg.opponent_head:
+        log(f"heads: actor MLP {model.cfg.actor_mlp}, opponent head {model.cfg.opponent_head}")
+    if args.opp_weight > 0 and not model.cfg.opponent_head:
+        raise SystemExit("--opp-weight needs --opponent-head (or --init weights that have one)")
     ref = None
     if args.init and not resume_state:
-        init = torch.load(args.init, map_location="cpu")
-        model.load_state_dict(init["model"] if "model" in init else init)
         log(f"initialised from {args.init}")
         if args.stage == "value" and not args.keep_value_head:
             for module in model.win.modules():  # (fresh random weights: whatever the first stage's win head learned is discarded)
@@ -502,8 +541,7 @@ def main() -> None:
             log("win head re-initialised")
     if args.anchor_weight > 0:
         init = torch.load(args.init, map_location="cpu")
-        ref = PolicyValueModel().to(device)
-        ref.load_state_dict(init["model"] if "model" in init else init)
+        ref = PolicyValueModel.from_state(init).to(device)
         ref.eval().requires_grad_(False)
         del init
         log(f"anchor: KL to the policy of {args.init}, weight {args.anchor_weight}")
@@ -513,6 +551,10 @@ def main() -> None:
         for name, param in model.named_parameters():
             param.requires_grad_(name.startswith("win."))
         log(f"frozen: everything but the win head ({sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters)")
+    elif args.freeze == "actor":
+        for name, param in model.named_parameters():
+            param.requires_grad_(name.startswith(("policy.", "policy_mlp.")))
+        log(f"frozen: everything but the actor head ({sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters)")
     if str(args.batch) == "auto":
         args.batch = probe_batch(model, args, device)
         log(f"batch size {args.batch} (measured)")
@@ -535,8 +577,7 @@ def main() -> None:
     step = 0
     best, bad, best_state = math.inf, 0, None  # the monitored validation loss, validations since it improved, and the weights that had it
     if resume_state:
-        model.load_state_dict(resume_state["model"])
-        opt.load_state_dict(resume_state["opt"])
+        opt.load_state_dict(resume_state["opt"])  # (the model was built from it above)
         if "scaler" in resume_state:
             scaler.load_state_dict(resume_state["scaler"])
         step = resume_state["step"]
@@ -554,7 +595,7 @@ def main() -> None:
 
     model.train()
     start, window_start = time.time(), time.time()
-    running = {"loss": 0.0, "kl": 0.0, "bc": 0.0, "bce": 0.0, "top1": 0.0, "anchor": 0.0, "n": 0}
+    running = {"loss": 0.0, "kl": 0.0, "bc": 0.0, "bce": 0.0, "top1": 0.0, "anchor": 0.0, "opp": 0.0, "n": 0}
     try:
         for batch in train_loader:
             if step >= args.steps or (args.patience > 0 and bad >= args.patience):  # (also on a restart after an early stop)
@@ -564,14 +605,21 @@ def main() -> None:
                 g["lr"] = lr_at(step, args)
             with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
                 out = run_batch(model, batch, args, ref)
-            pol = (batch["policy_ok"] & batch["scored"]).float()
+            pol_mask = batch["policy_ok"] & batch["scored"]
+            pol = pol_mask.float()
+            kl_mask = (pol_mask & ~batch["bc_game"]).float() if args.kl_scope == "nonbot" else pol
             sc = batch["scored"].float()
             bcm = (batch["bc_ok"] & batch["scored"]).float()
-            kl = masked_mean(out["kl"], pol)
+            kl = masked_mean(out["kl"], kl_mask)
             bc = masked_mean(out["bc"], bcm)
             bce = masked_mean(out["bce"], sc)
             anchor = masked_mean(out["anchor"], sc) if ref is not None else kl.new_zeros(())
             loss = args.alpha * kl + args.bc_weight * bc + args.anchor_weight * anchor
+            opp = kl.new_zeros(())
+            if "opp" in out:
+                opp = masked_mean(out["opp"], ((batch["opp_action"] >= 0) & batch["scored"]).float())
+                if args.opp_weight > 0:
+                    loss = loss + args.opp_weight * opp
             if args.value_weight > 0:  # (left out of the graph at 0, so the policy stage never touches the win head, not even to decay it)
                 loss = loss + args.value_weight * bce
             opt.zero_grad(set_to_none=True)
@@ -586,13 +634,14 @@ def main() -> None:
             running["bc"] += bc.item()
             running["bce"] += bce.item()
             running["anchor"] += anchor.item()
+            running["opp"] += opp.item()
             running["top1"] += masked_mean(out["top1"], pol).item()
             running["n"] += 1
             if step % 100 == 0:
                 n = running["n"]
                 rate = n * args.batch * (args.chunk + args.burn_in) / (time.time() - window_start)
                 log(f"step {step} loss {running['loss'] / n:.4f} kl {running['kl'] / n:.4f} bc {running['bc'] / n:.4f} bce {running['bce'] / n:.4f} top1 {running['top1'] / n:.3f} anchor {running['anchor'] / n:.4f} "
-                    f"grad {norm:.2f} lr {lr_at(step, args):.2e} {rate:,.0f} steps/s")
+                    + (f"opp {running['opp'] / n:.4f} " if model.cfg.opponent_head else "") + f"grad {norm:.2f} lr {lr_at(step, args):.2e} {rate:,.0f} steps/s")
                 running = {k: 0.0 for k in running}
                 running["n"] = 0
                 window_start = time.time()
@@ -601,13 +650,16 @@ def main() -> None:
                 result = validate(model, val_loader if not args.val_batches else _limit(val_loader, args.val_batches), args, device, ref)
                 log(f"validation step {step} decisions {int(result['decisions'])} kl {result['kl']:.4f} top1 {result['top1']:.3f} "
                     f"anchor {result['anchor']:.4f} bce {result['bce']:.4f} brier {result['brier']:.4f} | imitated bots: {int(result['bc_decisions'])} decisions, "
-                    f"played-action nll {result['bc']:.4f} accuracy {result['bc_top1']:.3f}")
+                    f"played-action nll {result['bc']:.4f} accuracy {result['bc_top1']:.3f}"
+                    + (f" | kl on the other games {result['kl_nonbot']:.4f}" if args.kl_scope == "nonbot" else "")
+                    + (f" | opponent's next action: {int(result['opp_decisions'])} decisions, nll {result['opp']:.4f} accuracy {result['opp_top1']:.3f}"
+                       if model.cfg.opponent_head else ""))
                 log("calibration " + " ".join(f"[{i / 10:.1f}-{(i + 1) / 10:.1f}) n={c} pred={p:.3f} won={w:.3f}" for i, (c, p, w) in enumerate(result["calibration"]) if c))
                 log("by source " + " ".join(f"{names[s]}: kl {k:.4f} bce {b:.4f}" for s, (k, b) in sorted(result["by_source"].items())))
                 monitor = args.monitor if args.monitor != "auto" else ("bce" if args.stage == "value" else "kl")
                 if monitor == "loss":
-                    monitored = (args.alpha * result["kl"] + args.bc_weight * result["bc"] + args.anchor_weight * result["anchor"]
-                                 + args.value_weight * result["bce"])
+                    monitored = (args.alpha * (result["kl_nonbot"] if args.kl_scope == "nonbot" else result["kl"]) + args.bc_weight * result["bc"]
+                                 + args.anchor_weight * result["anchor"] + args.value_weight * result["bce"] + args.opp_weight * result["opp"])
                 else:
                     monitored = result[monitor]
                 if monitored < best - args.min_delta:

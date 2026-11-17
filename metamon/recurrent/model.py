@@ -47,6 +47,14 @@ class Config:
     last_width: int = 106
     field_width: int = 39
     n_actions: int = 9
+    # optional heads (off in every model trained before them; from_state turns them on when a weights file has them)
+    actor_mlp: bool = False  # a residual MLP added to the linear actor head (zero-initialised output: starts as the linear head)
+    opponent_head: bool = False  # predicts the opponent's next action: a move (by move id) or a switch (n_moves + species id)
+    head_hidden: int = 128
+
+    @property
+    def n_opponent(self) -> int:
+        return self.n_moves + self.n_species
 
 
 class Block(nn.Module):
@@ -86,6 +94,34 @@ class PolicyValueModel(nn.Module):
         self.final_norm = nn.LayerNorm(cfg.d)
         self.policy = nn.Linear(cfg.d, cfg.n_actions)
         self.win = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, 64), nn.GELU(), nn.Linear(64, 1))
+        if cfg.actor_mlp:
+            self.policy_mlp = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.head_hidden), nn.GELU(), nn.Linear(cfg.head_hidden, cfg.n_actions))
+            nn.init.zeros_(self.policy_mlp[-1].weight)
+            nn.init.zeros_(self.policy_mlp[-1].bias)
+        if cfg.opponent_head:
+            self.opponent = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.head_hidden), nn.GELU(), nn.Linear(cfg.head_hidden, cfg.n_opponent))
+
+    @classmethod
+    def from_state(cls, state: dict, actor_mlp: bool = False, opponent_head: bool = False) -> "PolicyValueModel":
+        """A model for these weights (a state dict, or a checkpoint with "model"): the optional heads the weights have, plus
+        the ones asked for, which start fresh (the actor MLP at zero, so the policy is unchanged). Any other missing or extra
+        key is an error."""
+        state = state["model"] if "model" in state else state
+        has_mlp = any(k.startswith("policy_mlp.") for k in state)
+        has_opp = any(k.startswith("opponent.") for k in state)
+        model = cls(Config(actor_mlp=actor_mlp or has_mlp, opponent_head=opponent_head or has_opp))
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        fresh = ("policy_mlp." if not has_mlp else "\0", "opponent." if not has_opp else "\0")
+        bad = [k for k in missing if not k.startswith(fresh)] + list(unexpected)
+        if bad:
+            raise RuntimeError(f"weights do not fit the model: {bad[:5]}")
+        return model
+
+    def policy_logits(self, h: torch.Tensor) -> torch.Tensor:
+        logits = self.policy(h)
+        if self.cfg.actor_mlp:
+            logits = logits + self.policy_mlp(h)
+        return logits
 
     # ---- observation tokens (independent of h; computed for all steps at once) ----
 
@@ -152,11 +188,12 @@ class PolicyValueModel(nn.Module):
         for block in self.blocks:
             x = block(x)
         h = self.final_norm(x[:, 0])
-        return self.policy(h), self.win(h).squeeze(-1), h
+        return self.policy_logits(h), self.win(h).squeeze(-1), h
 
-    def forward(self, ids: dict, floats: dict, h0: torch.Tensor | None = None, burn_in: int = 0):
+    def forward(self, ids: dict, floats: dict, h0: torch.Tensor | None = None, burn_in: int = 0, states: bool = False):
         """Runs a sequence. The first `burn_in` steps only build the recurrent state (no gradient, no
-        outputs); outputs cover the remaining steps. Returns (logits [B,T',9], win logits [B,T'], h_last)."""
+        outputs); outputs cover the remaining steps. Returns (logits [B,T',9], win logits [B,T'], h_last), and with
+        states=True also the state token of every output step [B,T',d] (the opponent head reads it)."""
         b, t = floats["field"].shape[:2]
         h = h0 if h0 is not None else floats["field"].new_zeros(b, self.cfg.d)
         tokens = self.observation_tokens(ids, floats)
@@ -165,11 +202,14 @@ class PolicyValueModel(nn.Module):
                 for i in range(burn_in):
                     _, _, h = self.step(tokens[:, i], h)
             h = h.detach()
-        logits, wins = [], []
+        logits, wins, hs = [], [], []
         for i in range(burn_in, t):
             lg, w, h = self.step(tokens[:, i], h)
             logits.append(lg)
             wins.append(w)
+            hs.append(h)
+        if states:
+            return torch.stack(logits, 1), torch.stack(wins, 1), h, torch.stack(hs, 1)
         return torch.stack(logits, 1), torch.stack(wins, 1), h
 
 

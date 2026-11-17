@@ -89,6 +89,19 @@ def load_game(path: str) -> dict[str, np.ndarray]:
         return {k: z[k] for k in z.files}
 
 
+N_MOVE_IDS = 168  # (model.Config.n_moves) the opponent head's classes: move id m, or N_MOVE_IDS + species id for a switch
+
+
+def opponent_actions(game: dict) -> np.ndarray:
+    """The opponent's action in the turn after each decision, [n], from the next decision's last-turn record: the move it ran
+    (move id), the species it switched in (N_MOVE_IDS + species id), or -1 (it did not act: asleep, frozen, its own Pokemon
+    fainted first, our forced switch; or the game ended)."""
+    move = game["ids_last_opp_move"].reshape(len(game["legal"]), -1)[:, 0].astype(np.int64)
+    species = game["ids_last_opp_species"].reshape(len(game["legal"]), -1)[:, 0].astype(np.int64)
+    action = np.where(move > 0, move, np.where(species > 0, N_MOVE_IDS + species, -1))
+    return np.concatenate([action[1:], [-1]])
+
+
 def window(game: dict, start: int, size: int) -> dict[str, np.ndarray]:
     """One window as arrays of length `size` (padded at the end), with a validity mask."""
     n = game["legal"].shape[0]
@@ -115,7 +128,10 @@ def window(game: dict, start: int, size: int) -> dict[str, np.ndarray]:
     played = cut(game["played"].astype(np.int64)) if "played" in game else np.full(size, -1, np.int64)
     played = np.where(valid, played, -1)
     out["played"] = played
-    out["bc_ok"] = (played >= 0) & bool(game["bc_game"] if "bc_game" in game else False)
+    bc_game = bool(game["bc_game"] if "bc_game" in game else False)
+    out["bc_ok"] = (played >= 0) & bc_game
+    out["bc_game"] = valid & bc_game  # (every decision of a game seen from an imitated bot's side)
+    out["opp_action"] = np.where(valid, cut(opponent_actions(game)), -1)  # (the opponent head's labels)
     out["start"] = np.array(start)
     out["win"] = np.array(float(game["win"]), np.float32)
     return out
