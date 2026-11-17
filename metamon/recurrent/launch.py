@@ -853,12 +853,13 @@ class Launcher:
             self.train_stage(runs[2], a.ft_all_steps, [
                 "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
         if a.ft_joint_steps > 0:
-            # 3: everything, from stage 2 (or 1): the win BCE + KL to Exeggcute + imitation of the bots' played moves, no anchor;
+            # 3: everything, from stage 2 (or 1): the win BCE (0.5) + KL to Exeggcute (0.5) + imitation of the bots' played moves (1), no anchor;
             # the trained win head is kept, and early stopping follows the weighted sum of the three
             start3 = os.path.join(runs[2] if a.ft_all_steps > 0 else runs[1], "weights_final.pt")
-            self.log(f"stage 3 (joint) from {start3}: win BCE 1, KL to Exeggcute {a.ft_joint_kl_weight}, imitation {a.ft_joint_bc_weight}, no anchor")
+            self.log(f"stage 3 (joint) from {start3}: win BCE {a.ft_joint_value_weight}, KL to Exeggcute {a.ft_joint_kl_weight}, imitation {a.ft_joint_bc_weight}, no anchor")
             self.train_stage(runs[3], a.ft_joint_steps, [
                 "--stage", "joint", "--init", start3, "--alpha", str(a.ft_joint_kl_weight), "--bc-weight", str(a.ft_joint_bc_weight),
+                "--value-weight", str(a.ft_joint_value_weight),
                 "--anchor-weight", "0", "--lr", str(a.ft_lr), "--monitor", "loss"]
                 + (["--rebalance", a.ft_joint_mix] if a.ft_joint_mix != "none" else []))
 
@@ -1149,7 +1150,8 @@ def main() -> None:
     ap.add_argument("--ft-joint-steps", type=int, default=0,
                     help="(fine-tune 3) steps of a last stage from stage 2's weights: everything trains on the win BCE + KL to Exeggcute + "
                          "imitation of the bots, no anchor; 0 = no stage 3 (value.sh: 20000)")
-    ap.add_argument("--ft-joint-kl-weight", type=float, default=0.25, help="(fine-tune 3) weight of the KL to Exeggcute's targets")
+    ap.add_argument("--ft-joint-kl-weight", type=float, default=0.5, help="(fine-tune 3) weight of the KL to Exeggcute's targets")
+    ap.add_argument("--ft-joint-value-weight", type=float, default=0.5, help="(fine-tune 3) weight of the win BCE")
     ap.add_argument("--ft-joint-bc-weight", type=float, default=1.0, help="(fine-tune 3) weight of imitating the bots' played moves")
     ap.add_argument("--ft-joint-mix", default="none",
                     help="(fine-tune 3) data: none = the usual human/strong mix (the value stages' data), or a --rebalance spec")

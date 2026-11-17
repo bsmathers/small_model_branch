@@ -7,7 +7,7 @@
 #   2  everything   from stage 1: the win loss on all parameters, anchored with weight 1 (--ft-all-anchor) to the actor's policy
 #                   (KL(actor || current)), lr 1e-4 (--ft-lr), up to 20000 steps (--ft-all-steps; 0 stops after stage 1)
 #                                                                                               -> WORK/run_value10k_all
-#   3  joint        from stage 2: everything trains on the win loss (1) + KL to Exeggcute's targets (0.25, --ft-joint-kl-weight)
+#   3  joint        from stage 2: everything trains on the win loss (0.5, --ft-joint-value-weight) + KL to Exeggcute's targets (0.5, --ft-joint-kl-weight)
 #                   + imitation of the strong bots' played moves (1, --ft-joint-bc-weight), no anchor; lr 1e-4 (--ft-lr), up to
 #                   20000 steps (--ft-joint-steps; 0 skips it), early stopping on the weighted sum   -> WORK/run_value10k_joint
 #
