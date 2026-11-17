@@ -362,17 +362,21 @@ def rebalanced_sources(items: list[str], spec: str, validation: bool, fraction: 
 
     dirs = {name: rest.rsplit(":", 1)[0] for name, rest in (item.split("=", 1) for item in items)}
     weights = {k: float(v) for k, v in (kv.split("=") for kv in spec.split(","))}
-    if set(weights) != {"bots", "human", "otherbots"} or not {"human", "strong"} <= set(dirs):
+    if set(weights) != {"bots", "human", "otherbots"} or weights["bots"] <= 0 or not {"human", "strong"} <= set(dirs):
         raise SystemExit("--rebalance needs bots=,human=,otherbots= weights and --source human=... and strong=...")
     bots = select_games(dirs["strong"], imitated=True)
     if not bots:
         raise SystemExit(f"--rebalance: no games by the imitated bots in {dirs['strong']}")
     per = len(bots) / weights["bots"]
-    human = select_games(dirs["human"], count=round(per * weights["human"]), seed=seed)
-    other = select_games(dirs["strong"], imitated=False, count=round(per * weights["otherbots"]), seed=seed)
-    return [scan("bots", dirs["strong"], weights["bots"], validation, fraction, bots),
-            scan("human", dirs["human"], weights["human"], validation, fraction, human),
-            scan("otherbots", dirs["strong"], weights["otherbots"], validation, fraction, other)]
+    sources = [scan("bots", dirs["strong"], weights["bots"], validation, fraction, bots)]
+    # (a weight of 0 leaves that source out: bots=1,human=0,otherbots=0 trains on the imitated bots' games alone)
+    if weights["human"] > 0:
+        human = select_games(dirs["human"], count=round(per * weights["human"]), seed=seed)
+        sources.append(scan("human", dirs["human"], weights["human"], validation, fraction, human))
+    if weights["otherbots"] > 0:
+        other = select_games(dirs["strong"], imitated=False, count=round(per * weights["otherbots"]), seed=seed)
+        sources.append(scan("otherbots", dirs["strong"], weights["otherbots"], validation, fraction, other))
+    return sources
 
 
 def parse_sources(items: list[str], validation: bool, fraction: int):

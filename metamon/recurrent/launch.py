@@ -823,8 +823,9 @@ class Launcher:
     def finetune(self) -> None:
         """--finetune-from WEIGHTS (finetune.sh): three stages after policy distillation, each starting from the one before.
           A  actor: trunk and actor head (the win head gets no gradient) on 0.5 x KL to Exeggcute's targets + 0.5 x imitation of the
-             --bc-players' played moves, anchored with weight 5 to the policy of WEIGHTS; early stopping on that weighted loss. Data
-             (--ft-actor-mix): 1/2 games seen from the imitated bots' side (all of them), 1/3 human, 1/6 other bot games
+             --bc-players' played moves, anchored with weight 2 to the policy of WEIGHTS; early stopping on that weighted loss. Data
+             (--ft-actor-mix): only the games seen from the imitated bots' side (e.g. bots=0.5,human=0.3333,otherbots=0.1667 adds
+             random subsets of human and other bot games)
           1  value head: only the win head MLP (fresh), everything else frozen, so the policy is A's
           2  everything: the win BCE, anchored with weight 1 to the policy of A (which stage 1 left unchanged)"""
         a = self.args
@@ -1014,13 +1015,13 @@ def main() -> None:
     ap.add_argument("--value-bc-weight", type=float, default=0.0,
                     help="(second stage) weight of imitating the --bc-players' played actions on their games, besides the win head and the anchor")
     ap.add_argument("--finetune-from", default=None, help="(finetune.sh) run the three fine-tuning stages from these weights instead of the usual two")
-    ap.add_argument("--finetune-run", default="run_ft", help="prefix of the fine-tuning stages' folders: <prefix>_actor, _value_head, _all")
+    ap.add_argument("--finetune-run", default="run_ft_bots", help="prefix of the fine-tuning stages' folders: <prefix>_actor, _value_head, _all")
     ap.add_argument("--ft-kl-weight", type=float, default=0.5, help="(fine-tune A) weight of the KL to Exeggcute's targets")
     ap.add_argument("--ft-bc-weight", type=float, default=0.5, help="(fine-tune A) weight of imitating the --bc-players' played moves")
-    ap.add_argument("--ft-actor-mix", default="bots=0.5,human=0.3333,otherbots=0.1667",
+    ap.add_argument("--ft-actor-mix", default="bots=1,human=0,otherbots=0",
                     help="(fine-tune A) the data: every game seen from the imitated bots' side, plus random subsets of the human and the "
                          "other bot games; game counts and shares of the trained decisions in these ratios (none: the usual human/strong mix)")
-    ap.add_argument("--ft-actor-anchor", type=float, default=5.0, help="(fine-tune A) weight of KL(--finetune-from policy || current policy)")
+    ap.add_argument("--ft-actor-anchor", type=float, default=2.0, help="(fine-tune A) weight of KL(--finetune-from policy || current policy)")
     ap.add_argument("--ft-all-anchor", type=float, default=1.0, help="(fine-tune 2) weight of KL(stage A policy || current policy)")
     ap.add_argument("--ft-lr", type=float, default=1e-4, help="(fine-tune A and 2) learning rate; stage 1 uses --value-lr")
     ap.add_argument("--ft-actor-steps", type=int, default=20000)
