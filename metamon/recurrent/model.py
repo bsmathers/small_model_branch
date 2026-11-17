@@ -48,7 +48,10 @@ class Config:
     field_width: int = 39
     n_actions: int = 9
     # optional heads (off in every model trained before them; from_state turns them on when a weights file has them)
-    actor_mlp: bool = False  # a residual MLP added to the linear actor head (zero-initialised output: starts as the linear head)
+    deep_actor: bool = False  # a deep residual actor head added to the linear one (zero-initialised output: starts as the linear head)
+    actor_width: int = 256
+    actor_blocks: int = 3
+    actor_dropout: float = 0.1
     opponent_head: bool = False  # predicts the opponent's next action: a move (by move id) or a switch (n_moves + species id)
     head_hidden: int = 128
 
@@ -76,6 +79,35 @@ class Block(nn.Module):
         return x + self.ff2(F.gelu(self.ff1(self.norm2(x))))
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, width: int, dropout: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(width)
+        self.ff1 = nn.Linear(width, 2 * width)
+        self.ff2 = nn.Linear(2 * width, width)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.drop(self.ff2(F.gelu(self.ff1(self.norm(x)))))
+
+
+class DeepActor(nn.Module):
+    """The deep actor head: the state token -> width -> `blocks` pre-norm residual MLP blocks -> 9 logits, added to the linear
+    head's. The output layer starts at zero, so a model that gets this head plays exactly as before until it is trained."""
+
+    def __init__(self, cfg: "Config"):
+        super().__init__()
+        self.inp = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.actor_width), nn.GELU())
+        self.blocks = nn.Sequential(*(ResidualBlock(cfg.actor_width, cfg.actor_dropout) for _ in range(cfg.actor_blocks)))
+        self.out_norm = nn.LayerNorm(cfg.actor_width)
+        self.out = nn.Linear(cfg.actor_width, cfg.n_actions)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.out(self.out_norm(self.blocks(self.inp(h))))
+
+
 class PolicyValueModel(nn.Module):
     def __init__(self, cfg: Config | None = None):
         super().__init__()
@@ -94,24 +126,22 @@ class PolicyValueModel(nn.Module):
         self.final_norm = nn.LayerNorm(cfg.d)
         self.policy = nn.Linear(cfg.d, cfg.n_actions)
         self.win = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, 64), nn.GELU(), nn.Linear(64, 1))
-        if cfg.actor_mlp:
-            self.policy_mlp = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.head_hidden), nn.GELU(), nn.Linear(cfg.head_hidden, cfg.n_actions))
-            nn.init.zeros_(self.policy_mlp[-1].weight)
-            nn.init.zeros_(self.policy_mlp[-1].bias)
+        if cfg.deep_actor:
+            self.policy_deep = DeepActor(cfg)
         if cfg.opponent_head:
             self.opponent = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.head_hidden), nn.GELU(), nn.Linear(cfg.head_hidden, cfg.n_opponent))
 
     @classmethod
-    def from_state(cls, state: dict, actor_mlp: bool = False, opponent_head: bool = False) -> "PolicyValueModel":
+    def from_state(cls, state: dict, deep_actor: bool = False, opponent_head: bool = False) -> "PolicyValueModel":
         """A model for these weights (a state dict, or a checkpoint with "model"): the optional heads the weights have, plus
-        the ones asked for, which start fresh (the actor MLP at zero, so the policy is unchanged). Any other missing or extra
+        the ones asked for, which start fresh (the deep actor's output at zero, so the policy is unchanged). Any other missing or extra
         key is an error."""
         state = state["model"] if "model" in state else state
-        has_mlp = any(k.startswith("policy_mlp.") for k in state)
+        has_deep = any(k.startswith("policy_deep.") for k in state)
         has_opp = any(k.startswith("opponent.") for k in state)
-        model = cls(Config(actor_mlp=actor_mlp or has_mlp, opponent_head=opponent_head or has_opp))
+        model = cls(Config(deep_actor=deep_actor or has_deep, opponent_head=opponent_head or has_opp))
         missing, unexpected = model.load_state_dict(state, strict=False)
-        fresh = ("policy_mlp." if not has_mlp else "\0", "opponent." if not has_opp else "\0")
+        fresh = ("policy_deep." if not has_deep else "\0", "opponent." if not has_opp else "\0")
         bad = [k for k in missing if not k.startswith(fresh)] + list(unexpected)
         if bad:
             raise RuntimeError(f"weights do not fit the model: {bad[:5]}")
@@ -119,8 +149,8 @@ class PolicyValueModel(nn.Module):
 
     def policy_logits(self, h: torch.Tensor) -> torch.Tensor:
         logits = self.policy(h)
-        if self.cfg.actor_mlp:
-            logits = logits + self.policy_mlp(h)
+        if self.cfg.deep_actor:
+            logits = logits + self.policy_deep(h)
         return logits
 
     # ---- observation tokens (independent of h; computed for all steps at once) ----

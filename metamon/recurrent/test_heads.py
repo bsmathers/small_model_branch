@@ -1,4 +1,4 @@
-"""The optional heads (actor MLP, opponent head), policy blending and the opponent-action labels."""
+"""The optional heads (deep actor, opponent head), policy blending and the opponent-action labels."""
 
 import numpy as np
 import pytest
@@ -22,7 +22,7 @@ def inputs(seed: int = 0, t: int = 3):
 def test_new_heads_leave_the_policy_unchanged():
     torch.manual_seed(0)
     base = PolicyValueModel().eval()
-    grown = PolicyValueModel.from_state(base.state_dict(), actor_mlp=True, opponent_head=True).eval()
+    grown = PolicyValueModel.from_state(base.state_dict(), deep_actor=True, opponent_head=True).eval()
     ids, floats = inputs()
     with torch.no_grad():
         a, wa, _ = base(ids, floats)
@@ -31,7 +31,7 @@ def test_new_heads_leave_the_policy_unchanged():
     assert grown.opponent(states).shape == (1, 3, Config().n_opponent)
     # a checkpoint with the heads gets them back without asking
     again = PolicyValueModel.from_state({"model": grown.state_dict()})
-    assert again.cfg.actor_mlp and again.cfg.opponent_head
+    assert again.cfg.deep_actor and again.cfg.opponent_head
 
 
 def test_from_state_rejects_other_weights():

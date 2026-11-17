@@ -849,17 +849,17 @@ class Launcher:
             "--stage", "value", "--init", head, "--keep-value-head", "--anchor-weight", str(a.ft_all_anchor), "--lr", str(a.ft_lr)])
 
     EXPERIMENT_DEFAULTS = {
-        # mlp: the trunk (embeddings and the recurrent transformer) frozen; the actor head, with a residual MLP added, imitates the
-        # bots' played moves with a little KL to Exeggcute against overfitting, on the bots' games
-        "mlp": {"lr": 3e-4, "kl": 0.1, "bc": 1.0, "anchor": 0.0, "opp": 0.0, "mix": "bots=1,human=0,otherbots=0"},
+        # head: everything frozen but the actor: the linear actor head plus the deep actor head added on top of the state token
+        # (model.DeepActor) imitate the bots' played moves with a little KL to Exeggcute against overfitting, on the bots' games
+        "head": {"lr": 3e-4, "kl": 0.1, "bc": 1.0, "anchor": 0.0, "opp": 0.0, "mix": "bots=1,human=0,otherbots=0"},
         # opphead: an opponent-action head added; everything trains (but the win head): imitation of the bots on their games, KL to
         # Exeggcute on the others, the opponent head's cross-entropy on all
         "opphead": {"lr": 1e-4, "kl": 1.0, "bc": 1.0, "anchor": 0.0, "opp": 0.5, "mix": "bots=3,human=2,otherbots=1"},
     }
-    DEFAULT_BLENDS = "start;start@0.5,mlp@0.5;start@0.5,opphead@0.5;mlp@0.5,opphead@0.5;start,mlp,opphead;start@0.5,ckpt5000@0.5"
+    DEFAULT_BLENDS = "start;start@0.5,head@0.5;start@0.5,opphead@0.5;head@0.5,opphead@0.5;start,head,opphead;start@0.5,ckpt5000@0.5"
 
     def experiment(self) -> None:
-        """--experiment mlp|opphead|blend with --finetune-from START: one training stage from START (none for blend), then a tournament
+        """--experiment head|opphead|blend with --finetune-from START: one training stage from START (none for blend), then a tournament
         of --final-games games against TaurosV0 of its weights_final.pt (blend: of each --blends policy). Results: FINAL TOURNAMENT
         lines, WORK/tournaments/results.txt and WORK/tournaments/final_<name>.json (a rerun skips what is done)."""
         a = self.args
@@ -879,8 +879,8 @@ class Launcher:
                  + (f"opponent head {opp}, " if a.experiment == "opphead" else "") + f"data {mix}; in {out}")
         extra = ["--stage", "policy", "--init", start, "--alpha", str(kl), "--bc-weight", str(bc), "--anchor-weight", str(anchor),
                  "--lr", str(lr), "--monitor", "loss", "--rebalance", mix]
-        if a.experiment == "mlp":
-            extra += ["--actor-mlp", "--freeze", "actor"]
+        if a.experiment == "head":
+            extra += ["--deep-actor", "--freeze", "actor"]
         else:
             extra += ["--opponent-head", "--opp-weight", str(opp), "--kl-scope", "nonbot"]
         self.train_stage(out, a.exp_steps, extra)
@@ -888,10 +888,10 @@ class Launcher:
 
     def blend_experiment(self, start: str) -> None:
         """Each --blends policy (";" between policies, "," between members, "@w" a member's weight) against TaurosV0. Members by name:
-        start (--finetune-from), ckpt5000 (weights_5000.pt beside it), mlp and opphead (the experiments' weights_final.pt),
+        start (--finetune-from), ckpt5000 (weights_5000.pt beside it), head and opphead (the experiments' weights_final.pt),
         distilled (WORK/run_v3/weights_best.pt), or a path."""
         names = {"start": start, "ckpt5000": os.path.join(os.path.dirname(start), "weights_5000.pt"),
-                 "mlp": os.path.join(self.work, "exp_mlp", "weights_final.pt"), "opphead": os.path.join(self.work, "exp_opphead", "weights_final.pt"),
+                 "head": os.path.join(self.work, "exp_head", "weights_final.pt"), "opphead": os.path.join(self.work, "exp_opphead", "weights_final.pt"),
                  "distilled": os.path.join(self.work, "run_v3", "weights_best.pt")}
         for policy in [p.strip() for p in self.args.blends.split(";") if p.strip()]:
             members = []
@@ -1115,21 +1115,21 @@ def main() -> None:
     ap.add_argument("--ft-actor-steps", type=int, default=20000)
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)
     ap.add_argument("--ft-all-steps", type=int, default=20000)
-    ap.add_argument("--experiment", choices=("mlp", "opphead", "blend"), default=None,
-                    help="(with --finetune-from START; experiments.sh) instead of the three stages: mlp = actor head + a residual MLP on the "
-                         "frozen trunk, imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
+    ap.add_argument("--experiment", choices=("head", "opphead", "blend"), default=None,
+                    help="(with --finetune-from START; experiments.sh) instead of the three stages: head = only the actor trains (the linear head plus a "
+                         "deep actor head on the frozen state token), imitating the bots with a little KL to Exeggcute; opphead = an opponent-action head, imitation on the "
                          "bots' games and KL to Exeggcute on the rest; blend = tournaments of policy blends (--blends). Each ends with a "
                          "--final-games tournament against TaurosV0")
     ap.add_argument("--exp-run", default=None, help="(experiment) its folder in WORK (default exp_<experiment>)")
     ap.add_argument("--exp-steps", type=int, default=10000, help="(experiment) training steps (early stopping still applies)")
-    ap.add_argument("--exp-lr", type=float, default=None, help="(experiment) learning rate (default: mlp 3e-4, opphead 1e-4)")
-    ap.add_argument("--exp-kl-weight", type=float, default=None, help="(experiment) KL to Exeggcute (default: mlp 0.1 on all decisions, opphead 1 off the bots' games)")
+    ap.add_argument("--exp-lr", type=float, default=None, help="(experiment) learning rate (default: head 3e-4, opphead 1e-4)")
+    ap.add_argument("--exp-kl-weight", type=float, default=None, help="(experiment) KL to Exeggcute (default: head 0.1 on all decisions, opphead 1 off the bots' games)")
     ap.add_argument("--exp-bc-weight", type=float, default=None, help="(experiment) imitation of the bots' played moves (default 1)")
     ap.add_argument("--exp-anchor", type=float, default=None, help="(experiment) KL(START policy || current) (default 0)")
     ap.add_argument("--exp-opp-weight", type=float, default=None, help="(opphead) the opponent head's cross-entropy (default 0.5)")
-    ap.add_argument("--exp-mix", default=None, help="(experiment) --rebalance data (default: mlp bots=1,human=0,otherbots=0; opphead bots=3,human=2,otherbots=1)")
+    ap.add_argument("--exp-mix", default=None, help="(experiment) --rebalance data (default: head bots=1,human=0,otherbots=0; opphead bots=3,human=2,otherbots=1)")
     ap.add_argument("--blends", default=Launcher.DEFAULT_BLENDS,
-                    help="(blend) policies, ';' between them, members 'name@weight' (names: start, ckpt5000, mlp, opphead, distilled, or a path)")
+                    help="(blend) policies, ';' between them, members 'name@weight' (names: start, ckpt5000, head, opphead, distilled, or a path)")
     ap.add_argument("--blend-mode", choices=("mix", "logit"), default="mix",
                     help="(blend) mix: the weighted average of the members' move probabilities; logit: the weighted geometric mean")
     ap.add_argument("--final-games", type=int, default=500, help="(experiment) games of each final tournament")

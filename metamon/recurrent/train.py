@@ -437,10 +437,11 @@ def main() -> None:
                          "and other bot games, game counts in the ratio of the weights (see rebalanced_sources)")
     ap.add_argument("--freeze", choices=("none", "trunk", "actor"), default="none",
                     help="trunk: train only the win head MLP (embeddings, the recurrent transformer and the actor head stay as --init has them, "
-                         "so the policy does not change). actor: train only the actor head (its linear layer and, with --actor-mlp, its MLP) "
+                         "so the policy does not change). actor: train only the actor head (its linear layer and, with --deep-actor, the deep head) "
                          "on the frozen trunk")
-    ap.add_argument("--actor-mlp", action="store_true",
-                    help="add a residual MLP to the actor head (zero-initialised: the policy starts as --init's); kept by later runs")
+    ap.add_argument("--deep-actor", action="store_true",
+                    help="add the deep actor head (model.DeepActor: 3 residual blocks of width 256, added to the linear head, output "
+                         "zero-initialised so the policy starts as --init's); kept by later runs")
     ap.add_argument("--opponent-head", action="store_true", help="add the opponent-action head (predicts the opponent's next move or switch)")
     ap.add_argument("--opp-weight", type=float, default=0.0, help="weight of the opponent head's cross-entropy (labels: the next decision's record of the opponent's action)")
     ap.add_argument("--kl-scope", choices=("all", "nonbot"), default="all",
@@ -519,7 +520,7 @@ def main() -> None:
     resume_state =torch.load(latest, map_location="cpu") if args.resume and os.path.exists(latest) else None
     start_step = resume_state["step"] if resume_state else 0
 
-    heads = {"actor_mlp": args.actor_mlp, "opponent_head": args.opponent_head}
+    heads = {"deep_actor": args.deep_actor, "opponent_head": args.opponent_head}
     if resume_state:
         model = PolicyValueModel.from_state(resume_state["model"], **heads)  # (the heads of the run being resumed)
     elif args.init:
@@ -527,8 +528,8 @@ def main() -> None:
     else:
         model = PolicyValueModel(Config(**heads))
     model = model.to(device)
-    if model.cfg.actor_mlp or model.cfg.opponent_head:
-        log(f"heads: actor MLP {model.cfg.actor_mlp}, opponent head {model.cfg.opponent_head}")
+    if model.cfg.deep_actor or model.cfg.opponent_head:
+        log(f"heads: deep actor {model.cfg.deep_actor}, opponent head {model.cfg.opponent_head}")
     if args.opp_weight > 0 and not model.cfg.opponent_head:
         raise SystemExit("--opp-weight needs --opponent-head (or --init weights that have one)")
     ref = None
@@ -553,7 +554,7 @@ def main() -> None:
         log(f"frozen: everything but the win head ({sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters)")
     elif args.freeze == "actor":
         for name, param in model.named_parameters():
-            param.requires_grad_(name.startswith(("policy.", "policy_mlp.")))
+            param.requires_grad_(name.startswith(("policy.", "policy_deep.")))
         log(f"frozen: everything but the actor head ({sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters)")
     if str(args.batch) == "auto":
         args.batch = probe_batch(model, args, device)
