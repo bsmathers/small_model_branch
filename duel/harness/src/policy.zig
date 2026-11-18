@@ -105,6 +105,13 @@ pub const Client = struct {
         return spawn(allocator, io, &.{ env("DUEL_PYTHON", "/Users/macuser/bot3/.venv/bin/python"), "-u", server });
     }
 
+    /// (repo copy) The epoch-20 actor (bot2's compact Tauros multi-head) through tools/epoch20_policy_server.py: bot2's own
+    /// engine and snapshot reader, sampling at POLICY_TEMPERATURE (seeded by POLICY_SEED), without bot2's veto filter.
+    pub fn initEpoch20(allocator: std.mem.Allocator, io: std.Io) !*Client {
+        const server = try std.fmt.allocPrint(allocator, "{s}/epoch20_policy_server.py", .{toolsDir()});
+        return spawn(allocator, io, &.{ env("DUEL_PYTHON", BOT2_PYTHON), "-u", server });
+    }
+
     /// The Exeggcute ensemble (Metamon's ensemble of gen 1 policies) through its snapshot server; same
     /// option names as TaurosV0.
     pub fn initExeggcute(allocator: std.mem.Allocator, io: std.Io) !*Client {

@@ -45,7 +45,10 @@ pub const Knowledge = struct {
                 const old_move = before.sides[side].active.moves[choice.data - 1];
                 const chosen = old_move.id;
                 const new_pp = after.sides[side].pokemon[pre_slot].moves[choice.data - 1].pp;
-                if (chosen != .None and after.sides[side].last_used_move == chosen and new_pp < old_move.pp) {
+                // (repo copy) PP goes down only when the move runs (Gen 1 has no other PP loss), and a move that ran is in the log;
+                // the engine's last_used_move is no test, as it is cleared at every faint, so a move that knocked out its target
+                // was never revealed before
+                if (chosen != .None and new_pp < old_move.pp) {
                     k.revealMove(side, pre_slot, chosen);
                     k.used[side][pre_slot][0] = old_move.pp - new_pp;
                 }
@@ -374,6 +377,11 @@ var species_lens: [256]usize = @splat(0);
 var species_ready = false;
 
 /// Normalized species name, cached per species value.
+/// Fills speciesName's table now (before the search starts threads: it is filled lazily otherwise).
+pub fn warmNames() void {
+    _ = speciesName(.None);
+}
+
 fn speciesName(species: pkmn.gen1.Species) []const u8 {
     const i: usize = @intFromEnum(species);
     if (!species_ready) {

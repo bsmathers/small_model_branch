@@ -13,13 +13,19 @@ Names are matched after normalisation (lowercase, letters and digits only).
 from __future__ import annotations
 
 import json
+import functools
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 
+@functools.lru_cache(maxsize=None)
+def _normalize(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
 def normalize(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+    return _normalize(str(name))  # (memoized: pure, and called for the same few hundred names again and again)
 
 
 @dataclass

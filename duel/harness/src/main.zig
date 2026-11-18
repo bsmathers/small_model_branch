@@ -15,6 +15,16 @@ const tokenizer = @import("tokenizer.zig");
 const policy = @import("policy.zig");
 const teams = @import("teams.zig");
 const priors = @import("priors.zig");
+const snapmod = @import("snapshot.zig");
+const remote = @import("remote.zig");
+const rmodel = @import("rmodel.zig");
+const rnative = @import("rnative.zig");
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn openblas_set_num_threads(n: c_int) void;
+const optionName = snapmod.optionName;
+const LastAction = snapmod.LastAction;
+const lastAction = snapmod.lastAction;
+const serializeDuelSnapshot = snapmod.serializeDuelSnapshot;
 
 const team1 = [_]pkmn.gen1.helpers.Pokemon{
     .{ .species = .Tauros, .moves = &.{ .BodySlam, .HyperBeam, .Blizzard, .Earthquake } },
@@ -65,6 +75,12 @@ fn playGame(allocator: std.mem.Allocator, seed: u64, iterations: u32, turns: *u3
 }
 
 pub fn main(init: std.process.Init) !void {
+    // (repo copy) Accelerate's matrix products on one thread unless asked otherwise: the harness runs many games in parallel,
+    // and the products here are small, so more threads cost CPU (measured: 2.3 against 1.0 CPU s per klnash decision)
+    if (@import("builtin").os.tag == .macos) _ = setenv("VECLIB_MAXIMUM_THREADS", "1", 0);
+    if (comptime @import("build_options").openblas) {
+        if (std.c.getenv("OPENBLAS_NUM_THREADS") == null) openblas_set_num_threads(1);
+    }
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len > 1 and std.mem.eql(u8, args[1], "value-check")) return valueCheck(init);
@@ -80,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "status-check")) return statusCheck();
     if (args.len > 1 and std.mem.eql(u8, args[1], "tournament")) return tournament(init, args);
     if (args.len > 1 and std.mem.eql(u8, args[1], "duel")) return duel(init, args);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "rmodel-check")) return rmodelCheck(init, args);
     if (args.len > 1 and std.mem.eql(u8, args[1], "mechanics-check")) return mechanicsCheck();
     if (args.len > 1 and std.mem.eql(u8, args[1], "value-sanity")) return valueSanity(init);
     if (args.len > 1 and std.mem.eql(u8, args[1], "actor-check")) return actorCheck(init);
@@ -761,18 +778,6 @@ fn statusCheck() !void {
 }
 
 /// Name of a legal option as the policy server reads it: "switch <species>" or a move name.
-fn optionName(allocator: std.mem.Allocator, battle: *const Battle, side: usize, choice: pkmn.Choice) ![]const u8 {
-    const active = battle.sides[side].order[0] - 1;
-    if (choice.type == .Move) {
-        // data 0 is the no-op a recharging Pokémon must take (Hyper Beam); it is not a move slot
-        if (choice.data == 0) return "recharge";
-        return @tagName(battle.sides[side].pokemon[active].moves[choice.data - 1].id);
-    }
-    if (choice.type == .Switch) {
-        return std.fmt.allocPrint(allocator, "switch {s}", .{@tagName(battle.sides[side].pokemon[battle.sides[side].order[choice.data - 1] - 1].species)});
-    }
-    return "pass";
-}
 
 /// The observer snapshot with the legal options, from P1's side or (`swap`) from P2's side.
 fn serializeSnapshot(galloc: std.mem.Allocator, battle: *const Battle, k: know.Knowledge, legal: []const []const u8, swap: bool) ![]u8 {
@@ -794,71 +799,11 @@ fn serializeSnapshot(galloc: std.mem.Allocator, battle: *const Battle, k: know.K
     return out.items;
 }
 
-/// What one side did in the update that produced the current state, as the battle log shows it (public): the move it ran
-/// ("none" when it ran none: a switch, sleep, full paralysis, a recharge...), and whether that turn was a recharge.
-/// Snapshot readers cannot rebuild this from `last_move`: the engine clears both sides' last_used_move at every switch-in
-/// and faint, and its own at a sleep or freeze turn.
-const LastAction = struct { executed: []const u8 = "none", recharged: bool = false };
-
-fn lastAction(allocator: std.mem.Allocator, before: *const Battle, after: *const Battle, side: usize, c: pkmn.Choice) !LastAction {
-    const b = before.sides[side];
-    const a = after.sides[side];
-    if (c.type != .Move or b.order[0] == 0) return .{};
-    if (b.active.volatiles.Recharging) return .{ .recharged = true };
-    const slot = b.order[0] - 1;
-    const forced = b.active.volatiles.Thrashing or b.active.volatiles.Rage or b.active.volatiles.Charging;
-    if (!forced and c.data >= 1 and c.data <= 4) {
-        const mv = b.active.moves[c.data - 1];
-        if (mv.id == .None) return .{};
-        // a selected move that runs costs PP (also when it misses); one that never ran (asleep, paralysed...) does not
-        if (a.pokemon[slot].moves[c.data - 1].pp < mv.pp) return .{ .executed = try std.ascii.allocLowerString(allocator, @tagName(mv.id)) };
-        // a trapping move going on costs no PP
-        if (b.active.volatiles.Binding and a.last_used_move == mv.id) return .{ .executed = try std.ascii.allocLowerString(allocator, @tagName(mv.id)) };
-        return .{};
-    }
-    // a locked move (Thrash, Rage, the second turn of a charge move) runs as the last selected one
-    const locked = b.last_selected_move;
-    if (locked != .None and locked != .SKIP_TURN and a.last_used_move == locked) return .{ .executed = try std.ascii.allocLowerString(allocator, @tagName(locked)) };
-    return .{};
-}
-
-/// serializeSnapshot plus the last update's actions of both sides (`last_actions`, from P1's side or swapped).
-fn serializeDuelSnapshot(galloc: std.mem.Allocator, battle: *const Battle, k: know.Knowledge, legal: []const []const u8, swap: bool, last: [2]LastAction) ![]u8 {
-    var view = battle.*;
-    var kk = k;
-    var mine = last[0];
-    var theirs = last[1];
-    if (swap) {
-        std.mem.swap(@TypeOf(view.sides[0]), &view.sides[0], &view.sides[1]);
-        kk = know.Knowledge{ .seen = .{ k.seen[1], k.seen[0] }, .moves = .{ k.moves[1], k.moves[0] }, .used = .{ k.used[1], k.used[0] } };
-        std.mem.swap(LastAction, &mine, &theirs);
-    }
-    const snap = try know.observerSnapshot(galloc, &view, kk, false);
-    const legal_items = try galloc.alloc(vs.V, legal.len);
-    for (legal, legal_items) |name, *item| item.* = .{ .str = name };
-    var sides: [2]vs.V = undefined;
-    for ([2]LastAction{ mine, theirs }, &sides) |act, *out| {
-        const f = try galloc.alloc(vs.Field, 2);
-        f[0] = .{ .key = "executed", .value = .{ .str = act.executed } };
-        f[1] = .{ .key = "recharged", .value = .{ .bool = act.recharged } };
-        out.* = .{ .obj = f };
-    }
-    const actions = try galloc.alloc(vs.Field, 2);
-    actions[0] = .{ .key = "user", .value = sides[0] };
-    actions[1] = .{ .key = "opponent", .value = sides[1] };
-    const base = snap.obj;
-    const fields = try galloc.alloc(vs.Field, base.len + 2);
-    @memcpy(fields[0..base.len], base);
-    fields[base.len] = .{ .key = "legal", .value = .{ .list = legal_items } };
-    fields[base.len + 1] = .{ .key = "last_actions", .value = .{ .obj = actions } };
-    var out: std.ArrayList(u8) = .empty;
-    try policy.writeJson(galloc, &out, .{ .obj = fields });
-    return out.items;
-}
 
 fn duelPlayer(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !*policy.Client {
     if (std.mem.eql(u8, name, "tauros")) return policy.Client.initTauros(allocator, io);
     if (std.mem.eql(u8, name, "recurrent")) return policy.Client.initRecurrent(allocator, io);
+    if (std.mem.eql(u8, name, "epoch20")) return policy.Client.initEpoch20(allocator, io);
     return policy.Client.initExeggcuteVariant(allocator, io, name);
 }
 
@@ -1006,8 +951,36 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
     // Mean-value racing can eliminate actions required by a mixed equilibrium.
     const racing = false;
     if ((prior_final == .adaptive or prior_final == .kl_nash) and !use_priors) return error.AdaptiveRequiresPriors;
-    const model = try vm.Model.load(allocator, init.io, "models/value");
-    const vocab = try loadVocab(allocator, init.io);
+    // SEARCH_MODEL=recurrent: the recurrent model (tools/recurrent_search_server.py, weights from RECURRENT_SEARCH_WEIGHTS or
+    // RECURRENT_WEIGHTS) gives the search its values and both sides' actor priors, instead of the windowed value model
+    // SEARCH_MODEL=native: the same recurrent model computed in-process (rnative.zig, exported by tools/export_recurrent.py into
+    // RECURRENT_NATIVE_DIR, default models/recurrent); NATIVE_CHECK=1 also runs the search server and compares every node
+    const model_name = if (std.c.getenv("SEARCH_MODEL")) |v| std.mem.span(v) else "";
+    const native = std.mem.eql(u8, model_name, "native");
+    const recurrent = native or std.mem.eql(u8, model_name, "recurrent");
+    if (recurrent and !use_model) return error.RecurrentNeedsModelMode;
+    var model_storage: vm.Model = undefined;
+    var vocab_storage: std.StringHashMap(u32) = undefined;
+    if (!recurrent) {
+        model_storage = try vm.Model.load(allocator, init.io, "models/value");
+        vocab_storage = try loadVocab(allocator, init.io);
+    }
+    const model_ptr: ?*const vm.Model = if (recurrent) null else &model_storage;
+    const vocab_ptr: ?*const std.StringHashMap(u32) = if (recurrent) null else &vocab_storage;
+    if (native) {
+        const dir = if (std.c.getenv("RECURRENT_NATIVE_DIR")) |v| std.mem.span(v) else "models/recurrent";
+        rnative.active = try rnative.Native.load(allocator, init.io, dir);
+        std.debug.print("search model: native recurrent ({s}, weights {s})\n", .{ dir, rnative.active.?.model.weights_sha256 });
+        if (envFloat("NATIVE_CHECK", 0) > 0) {
+            remote.active = try remote.Remote.init(allocator, init.io);
+            std.debug.print("NATIVE_CHECK: every node is also made by the search server and compared\n", .{});
+        }
+    } else if (recurrent) {
+        remote.active = try remote.Remote.init(allocator, init.io);
+        std.debug.print("search model: recurrent\n", .{});
+    }
+    defer if (native and remote.active != null) std.debug.print("NATIVE_CHECK: {d} nodes compared, {d} mismatches; largest logit difference otherwise {e:.2}\n", .{ pathmod.Path.check_nodes, pathmod.Path.check_mismatches, pathmod.Path.check_worst });
+    defer if (remote.active) |server| server.deinit();
     const belief_vocab = try bel.Vocab.load(allocator, init.io, "models/belief/training_metadata.json");
     const belief_model = try bel.Model.load(allocator, init.io, "models/belief");
     const move_table = try completion.Table.load(allocator, init.io, "models/completion/gen1ou_moves.txt");
@@ -1024,6 +997,7 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
     var pool_stats = teams.LoadStats{};
     const pool: []teams.Team = if (expert_teams) try teams.loadDir(allocator, init.io, "../teamset", &pool_stats) else &.{};
     if (!vs_tauros and !vs_exeggcute and !std.mem.eql(u8, opponent, "epoch20")) return error.UnknownOpponent;
+    if (recurrent and !vs_tauros and !vs_exeggcute) return error.RecurrentNeedsTaurosOrExeggcute; // (epoch20 plays from the windowed model)
     if (expert_teams and pool.len == 0) return error.EmptyTeamPool;
     std.debug.print("opponent {s}, teams {s}", .{ opponent, if (expert_teams) "expert" else "fixed" });
     if (expert_teams) std.debug.print(" (pool {d} of {d} files)", .{ pool_stats.loaded, pool_stats.files });
@@ -1056,14 +1030,24 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
         var knowledge = know.Knowledge{};
         knowledge = know.initial(&battle);
         var real = try galloc.create(pathmod.Path);
-        real.* = try pathmod.Path.extend(galloc, &model, &vocab, null, knowledge, try know.observerSnapshot(galloc, &battle, knowledge, false));
+        if (remote.active) |server| try server.reset();
+        real.* = try pathmod.Path.turn(galloc, model_ptr, vocab_ptr, null, &battle, &battle, result, .{}, .{}, knowledge, 0);
+        // the epoch-20 opponent's own chain (windowed model only)
         var opponent_path = try galloc.create(pathmod.Path);
-        opponent_path.* = try pathmod.Path.extend(galloc, &model, &vocab, null, know.swapKnowledge(knowledge), try know.perspectiveSnapshot(galloc, &battle, know.swapKnowledge(knowledge), 1));
+        if (!recurrent) opponent_path.* = try pathmod.Path.extend(galloc, model_ptr.?, vocab_ptr.?, null, know.swapKnowledge(knowledge), try know.perspectiveSnapshot(galloc, &battle, know.swapKnowledge(knowledge), 1));
+        // the real game's decision points, for the opponent's history in the search (search.Config.history)
+        var points: std.ArrayList(search.HistoryPoint) = .empty;
+        // HISTORY_CHECK=1 (recurrent model): the real opponent's own chain along the game, against which the search's P2 root
+        // chain rebuilt in the true world (the opponent's real team) is compared at every decision; they must agree
+        const history_check = recurrent and remote.active != null and envFloat("HISTORY_CHECK", 0) > 0; // (it compares on the search server)
+        var p2_real = try galloc.create(pathmod.Path);
+        if (history_check) p2_real.* = try pathmod.Path.turn(galloc, null, null, null, &battle, &battle, result, .{}, .{}, knowledge, 1);
         var history = pubhist.History.init(galloc);
         var belief_rng = bel.Rng.init(fixture_seed + 1000);
         var decisions: u32 = 0;
         while (result.type == .None and decisions < 1000) : (decisions += 1) {
             try history.record(&battle);
+            try points.append(galloc, .{ .battle = battle, .result = result, .knowledge = knowledge });
             const frame_ids = try pubhist.frameIds(galloc, &belief_vocab, history.frames.items);
             const n1 = battle.choices(.P1, result.p1, &choices1);
             const n2 = battle.choices(.P2, result.p2, &choices2);
@@ -1105,7 +1089,39 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
                 }
             }
 
-            var cfg = if (use_model) search.Config{ .iterations = iterations, .model = &model, .vocab = &vocab, .root_knowledge = knowledge, .root_path = real, .universes = universes, .actor_priors = use_priors, .root_final = prior_final, .root_racing = racing, .first_play_value = improved_fpu, .block_history = improved_history, .exploration = if (improved_fpu) 1.25 else 1.4, .max_depth = if (prior_final == .adaptive) 6 else 24, .switch_penalty = if (prior_final == .adaptive) 0 else 0.01 } else search.Config{ .iterations = iterations, .universes = universes, .evaluator = search.hpValue, .root_final = prior_final, .root_racing = racing, .first_play_value = improved_fpu, .block_history = improved_history, .exploration = if (improved_fpu) 1.25 else 1.4, .max_depth = if (prior_final == .adaptive) 6 else 24, .switch_penalty = if (prior_final == .adaptive) 0 else 0.01 };
+            if (history_check and points.items.len >= 2) {
+                const server = remote.active.?;
+                const m = try server.mark();
+                const check_cfg = search.Config{ .recurrent = true, .history = points.items, .root_knowledge = knowledge };
+                const rebuilt = try search.opponentRoot(galloc, check_cfg, &battle, result);
+                var worst: f32 = 0;
+                for (choices2[0..n2]) |choice| {
+                    const idx = know.actorIndex(&battle, 1, choice) orelse continue;
+                    const a = rebuilt.actor[idx];
+                    const b = p2_real.actor[idx];
+                    if (std.math.isInf(a) and std.math.isInf(b)) continue;
+                    worst = @max(worst, @abs(a - b));
+                }
+                std.debug.print("HISTORY_CHECK decision {d}: largest opponent logit difference {d:.6}, win logit {d:.6} vs {d:.6}\n", .{ decisions + 1, worst, rebuilt.logit, p2_real.logit });
+                // which rebuilt past states differ from the real ones (with the true world they should not)
+                for (points.items[0 .. points.items.len - 1], 0..) |point, pi| {
+                    const w = universe.pastWorld(&point.battle, point.knowledge, &battle, knowledge);
+                    for (0..6) |slot| {
+                        const x = w.sides[1].pokemon[slot];
+                        const y = point.battle.sides[1].pokemon[slot];
+                        for (0..4) |j| {
+                            if (x.moves[j].id != y.moves[j].id or x.moves[j].pp != y.moves[j].pp)
+                                std.debug.print("  point {d} slot {d} move {d}: rebuilt {s} pp {d}, real {s} pp {d} (known uses {any})\n", .{ pi, slot, j, @tagName(x.moves[j].id), x.moves[j].pp, @tagName(y.moves[j].id), y.moves[j].pp, point.knowledge.used[1][slot] });
+                        }
+                        if (x.hp != y.hp or x.status != y.status or x.species != y.species) std.debug.print("  point {d} slot {d}: hp/status/species differ\n", .{ pi, slot });
+                    }
+                    const xa = w.sides[1].active.moves;
+                    const ya = point.battle.sides[1].active.moves;
+                    for (0..4) |j| if (xa[j].id != ya[j].id or xa[j].pp != ya[j].pp) std.debug.print("  point {d} active move {d}: rebuilt pp {d}, real pp {d}\n", .{ pi, j, xa[j].pp, ya[j].pp });
+                }
+                try server.release(m);
+            }
+            var cfg = if (use_model) search.Config{ .iterations = iterations, .model = model_ptr, .vocab = vocab_ptr, .recurrent = recurrent, .history = points.items, .root_knowledge = knowledge, .root_path = real, .universes = universes, .actor_priors = use_priors, .root_final = prior_final, .root_racing = racing, .first_play_value = improved_fpu, .block_history = improved_history, .exploration = if (improved_fpu) 1.25 else 1.4, .max_depth = if (prior_final == .adaptive) 6 else 24, .switch_penalty = if (prior_final == .adaptive) 0 else 0.01 } else search.Config{ .iterations = iterations, .universes = universes, .evaluator = search.hpValue, .root_final = prior_final, .root_racing = racing, .first_play_value = improved_fpu, .block_history = improved_history, .exploration = if (improved_fpu) 1.25 else 1.4, .max_depth = if (prior_final == .adaptive) 6 else 24, .switch_penalty = if (prior_final == .adaptive) 0 else 0.01 };
             if (wide and universes.len > 0) {
                 cfg.universes = universes[0..n_worlds];
                 cfg.confirm_universes = universes[n_worlds..];
@@ -1129,6 +1145,8 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
                     cfg.chance_max_leaves = chance_max_leaves;
                 }
                 if (kl) {
+                    // SEARCH_THREADS: threads of the kl_nash root (native recurrent model)
+                    cfg.threads = @intFromFloat(envFloat("SEARCH_THREADS", 1));
                     cfg.switch_penalty = 0;
                     cfg.kl_tau = kl_tau;
                     cfg.kl_tau_opp = kl_tau_opp;
@@ -1163,16 +1181,29 @@ fn tournament(init: std.process.Init, args: []const []const u8) !void {
             std.debug.print("turn {d} decision {d}: search {s}; policy {s}; root win {d:.4}\n", .{ battle.turn, decisions + 1, try optionName(galloc, &battle, 0, c1), try optionName(galloc, &battle, 1, c2), real.value() });
 
             const before = battle;
+            points.items[points.items.len - 1].c1 = c1;
+            points.items[points.items.len - 1].c2 = c2;
             result = try battle.update(c1, c2, &options);
             try history.noteTransition(&before, &battle, c1, c2);
             knowledge = know.Knowledge.merge(knowledge, know.Knowledge.afterTransition(&before, &battle, c1, c2));
             if (result.type == .None) {
                 const next = try galloc.create(pathmod.Path);
-                next.* = try pathmod.Path.extend(galloc, &model, &vocab, real, knowledge, try know.observerSnapshot(galloc, &battle, knowledge, false));
+                if (recurrent) {
+                    next.* = try pathmod.Path.turn(galloc, null, null, real, &before, &battle, result, c1, c2, .{}, 0);
+                } else {
+                    next.* = try pathmod.Path.extend(galloc, model_ptr.?, vocab_ptr.?, real, knowledge, try know.observerSnapshot(galloc, &battle, knowledge, false));
+                }
                 real = next;
-                const next_opponent = try galloc.create(pathmod.Path);
-                next_opponent.* = try pathmod.Path.childSide(galloc, &model, &vocab, opponent_path, &before, &battle, c1, c2, 1);
-                opponent_path = next_opponent;
+                if (history_check) {
+                    const next2 = try galloc.create(pathmod.Path);
+                    next2.* = try pathmod.Path.turn(galloc, null, null, p2_real, &before, &battle, result, c1, c2, .{}, 1);
+                    p2_real = next2;
+                }
+                if (!recurrent) {
+                    const next_opponent = try galloc.create(pathmod.Path);
+                    next_opponent.* = try pathmod.Path.childSide(galloc, model_ptr.?, vocab_ptr.?, opponent_path, &before, &battle, c1, c2, 1);
+                    opponent_path = next_opponent;
+                }
             }
         }
         var winner: []const u8 = "draw";
@@ -1613,4 +1644,79 @@ fn sameUniverse(a: *const Battle, b: *const Battle) bool {
         }
     }
     return true;
+}
+
+/// `rmodel-check DIR CASES`: the native recurrent model (rmodel.zig, weights in DIR) on the cases of a JSON file (a list of
+/// {"ids": {...}, "floats": {...}, "h": [...]}, as tools/check_rmodel.py writes it); one line per case: the win logit, the nine
+/// logits and the new state, for comparison with PyTorch.
+fn rmodelCheck(init: std.process.Init, args: []const []const u8) !void {
+    const allocator = init.arena.allocator();
+    const model = try rmodel.Model.load(allocator, init.io, args[2]);
+    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, args[3], allocator, .unlimited);
+    const cases = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{});
+    var out: std.ArrayList(u8) = .empty;
+    const all_x = try allocator.alloc(rmodel.Input, cases.array.items.len);
+    const all_h = try allocator.alloc([rmodel.D]f32, cases.array.items.len);
+    for (cases.array.items, 0..) |c, case_index| {
+        var x = rmodel.Input{};
+        const ids = c.object.get("ids").?.object;
+        const fl = c.object.get("floats").?.object;
+        const I = struct {
+            fn v(o: std.json.ObjectMap, k: []const u8) []std.json.Value {
+                return o.get(k).?.array.items;
+            }
+            fn f(val: std.json.Value) f32 {
+                return switch (val) {
+                    .float => |q| @floatCast(q),
+                    .integer => |q| @floatFromInt(q),
+                    else => 0,
+                };
+            }
+        };
+        for (0..6) |s| {
+            x.own_species[s] = @intCast(I.v(ids, "own_species")[s].integer);
+            x.own_status[s] = @intCast(I.v(ids, "own_status")[s].integer);
+            x.opp_species[s] = @intCast(I.v(ids, "opp_species")[s].integer);
+            x.opp_status[s] = @intCast(I.v(ids, "opp_status")[s].integer);
+            for (0..4) |j| {
+                x.own_moves[s][j] = @intCast(I.v(ids, "own_moves")[s].array.items[j].integer);
+                x.opp_moves[s][j] = @intCast(I.v(ids, "opp_moves")[s].array.items[j].integer);
+            }
+            for (0..10) |j| x.own[s][j] = I.f(I.v(fl, "own")[s].array.items[j]);
+            for (0..7) |j| x.opp[s][j] = I.f(I.v(fl, "opp")[s].array.items[j]);
+        }
+        x.last_own_move = @intCast(I.v(ids, "last_own_move")[0].integer);
+        x.last_opp_move = @intCast(I.v(ids, "last_opp_move")[0].integer);
+        x.last_own_species = @intCast(I.v(ids, "last_own_species")[0].integer);
+        x.last_opp_species = @intCast(I.v(ids, "last_opp_species")[0].integer);
+        x.last_own_status = @intCast(I.v(ids, "last_own_status")[0].integer);
+        x.last_opp_status = @intCast(I.v(ids, "last_opp_status")[0].integer);
+        for (0..34) |j| x.last[j] = I.f(I.v(fl, "last")[j]);
+        for (0..39) |j| x.field[j] = I.f(I.v(fl, "field")[j]);
+        var h: [rmodel.D]f32 = undefined;
+        for (0..rmodel.D) |j| h[j] = I.f(c.object.get("h").?.array.items[j]);
+        all_x[case_index] = x;
+        all_h[case_index] = h;
+        var h2: [rmodel.D]f32 = undefined;
+        var logits: [rmodel.ACTIONS]f32 = undefined;
+        const win = model.step(&x, &h, &h2, &logits);
+        try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{win}));
+        for (logits) |l| try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " {d}", .{l}));
+        for (h2) |v| try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " {d}", .{v}));
+        try out.append(allocator, '\n');
+    }
+    // the same cases as one batch (stepBatch), prefixed "B"
+    const n = all_x.len;
+    const h_out = try allocator.alloc([rmodel.D]f32, n);
+    const logits_all = try allocator.alloc([rmodel.ACTIONS]f32, n);
+    const wins = try allocator.alloc(f32, n);
+    const scratch = try allocator.alloc(f32, rmodel.Model.scratchLen(n));
+    model.stepBatch(all_x, all_h, h_out, logits_all, wins, scratch);
+    for (0..n) |i| {
+        try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, "B {d}", .{wins[i]}));
+        for (logits_all[i]) |l| try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " {d}", .{l}));
+        for (h_out[i]) |v| try out.appendSlice(allocator, try std.fmt.allocPrint(allocator, " {d}", .{v}));
+        try out.append(allocator, '\n');
+    }
+    std.debug.print("{s}", .{out.items});
 }

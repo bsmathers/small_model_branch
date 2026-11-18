@@ -99,6 +99,14 @@ class SnapshotEffectMemory:
         self.clock = 0
         self.sides: dict[str, dict] = {}
 
+    def __deepcopy__(self, memo):
+        # (repo copy) the search server copies this memory for every node: copying its two levels directly is ~10x faster
+        # than the generic deepcopy, with the same result
+        other = SnapshotEffectMemory.__new__(SnapshotEffectMemory)
+        other.clock = self.clock
+        other.sides = {side: {"identity": r["identity"], "turn": r["turn"], "effects": dict(r["effects"])} for side, r in self.sides.items()}
+        return other
+
     def select(self, payload: dict, side: str) -> str:
         active = active_effects(payload)
         identity = norm(payload.get("base_species", payload.get("id", "unknown")))

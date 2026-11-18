@@ -7,6 +7,7 @@ it must never inspect or reconstruct hidden opponent team data.
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -27,8 +28,13 @@ _STATUS = {
     "fnt": "fnt",
 }
 
+@functools.lru_cache(maxsize=None)
+def _norm_str(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
 def _norm(value: object) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+    return _norm_str(str(value))  # (repo copy) memoized: the search server normalizes the same few hundred names millions of times
 
 
 def _status(value: object) -> str:
@@ -68,6 +74,17 @@ class SnapshotEncoder:
         UniversalMove = self._universal.UniversalMove
         if not payload or _norm(payload.get("id", "None")) in {"", "none"}:
             return UniversalMove.blank_move()
+        # (repo copy) a move is fixed by these four fields and nothing changes a UniversalMove after it is made, so equal
+        # payloads share one object (the search server builds ~46 moves per node otherwise)
+        key = (payload.get("id"), payload.get("max_pp"), payload.get("pp"), payload.get("uses"))
+        cache = self.__dict__.setdefault("_move_cache", {})
+        made = cache.get(key)
+        if made is None:
+            made = cache[key] = self._make_move(payload)
+        return made
+
+    def _make_move(self, payload: dict):
+        UniversalMove = self._universal.UniversalMove
         move_id = str(payload["id"])
         try:
             move = self.Move(move_id.lower(), gen=1)
@@ -138,6 +155,33 @@ class SnapshotEncoder:
         return memory.select(payload, side)
 
     def _pokemon(
+        self,
+        payload: dict,
+        active: bool,
+        *,
+        exact_hp: bool,
+        effect: str = "noeffect",
+    ):
+        # (repo copy) a reserve built twice from the same payload object (by state() and again by a caller that wants the whole
+        # party) is built once: `reuse` maps id(payload) to what was made from it, while the caller keeps it on (begin_reuse /
+        # end_reuse around one snapshot, so the payload objects outlive their ids). Only non-active Pokemon, which nothing
+        # changes after they are made, are shared.
+        reuse = self.__dict__.get("_reuse")
+        if reuse is not None and not active:
+            key = (id(payload), exact_hp, effect)
+            made = reuse.get(key)
+            if made is None:
+                made = reuse[key] = self._make_pokemon(payload, active, exact_hp=exact_hp, effect=effect)
+            return made
+        return self._make_pokemon(payload, active, exact_hp=exact_hp, effect=effect)
+
+    def begin_reuse(self) -> None:
+        self._reuse = {}
+
+    def end_reuse(self) -> None:
+        self._reuse = None
+
+    def _make_pokemon(
         self,
         payload: dict,
         active: bool,

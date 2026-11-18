@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
+import functools
+
 import numpy as np
 
 from metamon.recurrent.tables import Tables
@@ -131,8 +133,34 @@ def _name(pokemon) -> str:
     return pokemon.name
 
 
+@functools.lru_cache(maxsize=None)
+def _type_list(types: str) -> tuple:
+    return tuple(t for t in types.split(" ") if t and t != "notype")
+
+
 def _types(pokemon) -> list[str]:
-    return [t for t in pokemon.types.split(" ") if t and t != "notype"]
+    return list(_type_list(pokemon.types))
+
+
+@functools.lru_cache(maxsize=None)
+def _move_name(name: str) -> str:
+    """metamon.interface.move_name, memoized (it is pure)."""
+    from metamon.interface import move_name
+
+    return move_name(name)
+
+
+@functools.lru_cache(maxsize=None)
+def _pokemon_name(name: str) -> str:
+    """metamon.interface.pokemon_name, memoized (it is pure)."""
+    from metamon.interface import pokemon_name
+
+    return pokemon_name(name)
+
+
+@functools.lru_cache(maxsize=None)
+def _move_key(name: str) -> str:
+    return "".join(c for c in name.lower() if c.isalnum())
 
 
 # fixed damage (the user's level, 100), one-hit KOs, and the moves that halve the target's defense
@@ -234,7 +262,7 @@ def counter_fraction(user: str, extras: Optional[dict], tables: Tables, own_hp: 
 def _move_damage(user: str, attacker, defender, move, tables: Tables, attacker_stats, defender_stats, extras, own_hp: float, opp_hp: float) -> float:
     """Max-roll damage of one move as a fraction of the defender's max HP, with the Gen 1 moves whose damage is
     not a function of the two Pokemon's stats handled as the engine does."""
-    key = "".join(c for c in move.name.lower() if c.isalnum())
+    key = _move_key(move.name)
     if key == "counter":
         def estimate(victim_side: str, move_name: str) -> float:
             # the average Gen 1 roll (217..255 of 255) of the move that hit the Substitute, as a share of the victim's HP
@@ -305,8 +333,7 @@ def canonical_own(state, own_party: Sequence) -> tuple[list, object]:
     """
     import copy
 
-    from metamon.interface import move_name, pokemon_name
-
+    move_name, pokemon_name = _move_name, _pokemon_name
     active_name = state.player_active_pokemon.name
     active = [p for p in own_party if p.name == active_name]
     if not active:  # the party list should always hold the active; fall back to the state's own copy
@@ -329,7 +356,7 @@ def canonical_opponent(state, opp_revealed: Sequence) -> tuple[list, object]:
     opponent's active, each with its revealed moves sorted by name. Returns (revealed in slot order, the active)."""
     import copy
 
-    from metamon.interface import move_name, pokemon_name
+    move_name, pokemon_name = _move_name, _pokemon_name
 
     def with_sorted_moves(p):
         q = copy.copy(p)
@@ -343,8 +370,7 @@ def canonical_opponent(state, opp_revealed: Sequence) -> tuple[list, object]:
 def policy_options(ordered_party: Sequence) -> tuple[list[str], list[str]]:
     """What the policy slots mean for a party in canonical_own order: (move names of slots 0-3, species of slots 4-8), as
     interface.move_name / pokemon_name keys. Slot 4 + k is the k-th living reserve (party slot 1 + k), as in Metamon."""
-    from metamon.interface import move_name, pokemon_name
-
+    move_name, pokemon_name = _move_name, _pokemon_name
     moves = [move_name(m.name) for m in ordered_party[0].moves[:N_MOVES]]
     reserves = [pokemon_name(p.name) for p in ordered_party[1:] if _alive(p)][: N_ACTIONS - N_MOVES]
     return moves, reserves
@@ -396,6 +422,7 @@ def encode_observer(
     turn: int,
     tables: Tables,
     extras: Optional[dict] = None,
+    canonical: Optional[tuple] = None,
 ) -> Encoded:
     """Features for one decision, from the observer's view.
 
@@ -415,7 +442,8 @@ def encode_observer(
     """
     if len(own_party) > N_OWN or len(opp_revealed) > N_OPP:
         raise ValueError("a party has at most six Pokemon")
-    own_party, own_active = canonical_own(state, own_party)
+    # (`canonical`: canonical_own(state, own_party), when the caller has it already)
+    own_party, own_active = canonical if canonical is not None else canonical_own(state, own_party)
     opp_revealed, opp_active = canonical_opponent(state, opp_revealed)
     ids: dict[str, np.ndarray] = {
         "own_species": np.zeros(N_OWN, dtype=np.int64),

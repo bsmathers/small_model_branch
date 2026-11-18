@@ -11,6 +11,10 @@ const vm = @import("value_model.zig");
 const know = @import("knowledge.zig");
 const pathmod = @import("path.zig");
 const chance_enum = @import("chance_enum.zig");
+const remote = @import("remote.zig");
+const rnative = @import("rnative.zig");
+const rmodel = @import("rmodel.zig");
+const universe = @import("universe.zig");
 
 test {
     _ = chance_enum;
@@ -95,6 +99,16 @@ pub const Config = struct {
     exact_chance: bool = false,
     chance_min_path: f32 = 0.05,
     chance_max_leaves: u8 = 16,
+    /// Threads of the kl_nash root (the worlds are independent: each world's cells run on one thread, with its own memory and
+    /// its seed drawn as in one thread, so the result does not depend on the count). Only with the native recurrent model.
+    threads: u32 = 1,
+    /// The model is the recurrent one (remote.zig: values and actor logits from tools/recurrent_search_server.py) instead
+    /// of `model`; `root_path` must then be the real game's P1 path on the server.
+    recurrent: bool = false,
+    /// The real game's decision points so far, oldest first, the last one the root (with the choices played from each). P2's
+    /// root chain in each world replays them from P2's side with that world's opponent team (universe.pastWorld), so the
+    /// opponent's actor sees the game so far; empty: P2's chain starts at the root, with no history.
+    history: []const HistoryPoint = &.{},
     /// KL-anchored root game (root_final = .kl_nash): our strategy is anchored to our actor with
     /// temperature `kl_tau`, the opponent's (one per world) to its actor in that world with `kl_tau_opp`.
     kl_tau: f32 = 0.02,
@@ -104,6 +118,28 @@ pub const Config = struct {
 };
 
 pub const FinalRule = enum { visits, prior_value, nash, adaptive, kl_nash };
+
+/// One decision point of the real game: the state, the update result there, the observer's knowledge (P1's orientation),
+/// and the choices played from it (unused for the last point, the root).
+pub const HistoryPoint = struct {
+    battle: Battle,
+    result: pkmn.Result,
+    knowledge: know.Knowledge,
+    c1: pkmn.Choice = .{},
+    c2: pkmn.Choice = .{},
+};
+
+/// Whether nodes carry model paths (the windowed model or the recurrent one).
+/// SEARCH_NO_BATCH=1: the recurrent model's chance leaves one at a time (for checking the batched evaluation).
+var no_batch_flag: ?bool = null;
+fn noBatch() bool {
+    if (no_batch_flag == null) no_batch_flag = if (std.c.getenv("SEARCH_NO_BATCH")) |v| v[0] == '1' else false;
+    return no_batch_flag.?;
+}
+
+fn modelOn(cfg: Config) bool {
+    return cfg.model != null or cfg.recurrent;
+}
 
 pub const Outcome = struct {
     depth_total: u64 = 0,
@@ -310,14 +346,14 @@ const Step = struct { node: u32, a1: u8, a2: u8 };
 fn leafValue(tree: *Tree, idx: u32, cfg: Config, rand: *std.Random) !f32 {
     const node = &tree.nodes[idx];
     if (node.terminal) return node.terminal_value;
-    if (cfg.continuation > 0 and cfg.model != null and node.path != null and node.path2 != null) {
+    if (cfg.continuation > 0 and modelOn(cfg) and node.path != null and node.path2 != null) {
         if (!node.has_cont) {
             node.cont_value = try continuationValue(tree.allocator, node, cfg, rand);
             node.has_cont = true;
         }
         return node.cont_value;
     }
-    if (cfg.model != null) {
+    if (modelOn(cfg)) {
         if (node.path) |*p| return @floatCast(p.value());
     }
     return cfg.evaluator(&node.battle, node.result, rand);
@@ -341,8 +377,10 @@ fn greedyChoice(battle: *const Battle, side: usize, choices: []const pkmn.Choice
 /// chance each turn; returns the terminal result or P1's value at the end. The opponent's actor reads
 /// its own-perspective chain, so it plays from this world's (sampled) team.
 fn continuationValue(allocator: std.mem.Allocator, node: *const Node, cfg: Config, rand: *std.Random) !f32 {
-    const model = cfg.model.?;
-    const vocab = cfg.vocab.?;
+    // (one draw from the search's stream seeds this continuation's own chance, so a batched evaluation of several leaves
+    // plays exactly the same continuations)
+    var stream = std.Random.DefaultPrng.init(rand.int(u64));
+    const own = stream.random();
     var battle = node.battle;
     var result = node.result;
     // Paths point at their parents, so every continuation step's path lives in the arena (a stack
@@ -358,16 +396,16 @@ fn continuationValue(allocator: std.mem.Allocator, node: *const Node, cfg: Confi
         const c1 = greedyChoice(&battle, 0, buf1[0..n1], &p1.actor);
         const c2 = greedyChoice(&battle, 1, buf2[0..n2], &p2.actor);
         var next = battle;
-        next.rng = pkmn.gen1.PRNG.init(rand.int(u64));
+        next.rng = pkmn.gen1.PRNG.init(own.int(u64));
         var options = pkmn.battle.options(pkmn.protocol.NULL, pkmn.gen1.chance.NULL, pkmn.gen1.calc.NULL);
         const r = try next.update(c1, c2, &options);
         if (r.type != .None) return terminalValue(r);
         const p1_next = try allocator.create(pathmod.Path);
-        p1_next.* = try pathmod.Path.child(allocator, model, vocab, p1, &battle, &next, c1, c2);
+        p1_next.* = try pathmod.Path.turn(allocator, cfg.model, cfg.vocab, p1, &battle, &next, r, c1, c2, .{}, 0);
         // the opponent's chain is only needed to choose its next move
         if (step + 1 < cfg.continuation) {
             const p2_next = try allocator.create(pathmod.Path);
-            p2_next.* = try pathmod.Path.childSide(allocator, model, vocab, p2, &battle, &next, c1, c2, 1);
+            p2_next.* = try pathmod.Path.turn(allocator, cfg.model, cfg.vocab, p2, &battle, &next, r, c1, c2, .{}, 1);
             p2 = p2_next;
         }
         p1 = p1_next;
@@ -407,6 +445,11 @@ const Child = struct { idx: u32, existed: bool };
 /// existing chance child with the same state (the RNG aside), or a new node with its paths. Chance
 /// outcomes share an action edge, but have separate descendant trees.
 fn childFor(tree: *Tree, cur: u32, a1: u8, a2: u8, next: *const Battle, r: pkmn.Result, cfg: Config) !Child {
+    return childNode(tree, cur, a1, a2, next, r, cfg, false);
+}
+
+/// childFor; with `deferPaths` a new child gets no model paths (the caller attaches them, batched).
+fn childNode(tree: *Tree, cur: u32, a1: u8, a2: u8, next: *const Battle, r: pkmn.Result, cfg: Config, deferPaths: bool) !Child {
     const node = &tree.nodes[cur];
     var existing = node.child[a1][a2];
     while (existing != 0) : (existing = tree.nodes[existing].sibling) {
@@ -422,13 +465,14 @@ fn childFor(tree: *Tree, cur: u32, a1: u8, a2: u8, next: *const Battle, r: pkmn.
     const child = tree.alloc(next.*, r);
     tree.nodes[child].sibling = node.child[a1][a2];
     node.child[a1][a2] = child;
-    if (cfg.model) |model| {
+    if (deferPaths) return .{ .idx = child, .existed = false };
+    if (modelOn(cfg)) {
         if (!tree.nodes[child].terminal) {
             const parent_path = &tree.nodes[cur].path.?;
-            tree.nodes[child].path = try pathmod.Path.child(tree.allocator, model, cfg.vocab.?, parent_path, &tree.nodes[cur].battle, &tree.nodes[child].battle, node.choices[0][a1], node.choices[1][a2]);
+            tree.nodes[child].path = try pathmod.Path.turn(tree.allocator, cfg.model, cfg.vocab, parent_path, &tree.nodes[cur].battle, &tree.nodes[child].battle, r, node.choices[0][a1], node.choices[1][a2], .{}, 0);
             if (cfg.actor_priors and !cfg.leaf_only_value) {
                 const parent_path2 = &tree.nodes[cur].path2.?;
-                tree.nodes[child].path2 = try pathmod.Path.childSide(tree.allocator, model, cfg.vocab.?, parent_path2, &tree.nodes[cur].battle, &tree.nodes[child].battle, node.choices[0][a1], node.choices[1][a2], 1);
+                tree.nodes[child].path2 = try pathmod.Path.turn(tree.allocator, cfg.model, cfg.vocab, parent_path2, &tree.nodes[cur].battle, &tree.nodes[child].battle, r, node.choices[0][a1], node.choices[1][a2], .{}, 1);
                 computePriors(&tree.nodes[child]);
             }
         }
@@ -439,6 +483,7 @@ fn childFor(tree: *Tree, cur: u32, a1: u8, a2: u8, next: *const Battle, r: pkmn.
 /// Exact-chance value of root cell (`a`, `b`): the turn's chance leaves (chance_enum.enumerate,
 /// unforced events drawn from `seed`), each valued like a depth-1 leaf, weighted by probability.
 fn exactCellValue(tree: *Tree, root: u32, cfg: Config, seed: u64, a: u8, b: u8, rand: *std.Random) !f32 {
+    if (cfg.recurrent and !noBatch()) return exactCellValueBatched(tree, root, cfg, seed, a, b, rand);
     var leaves: [chance_enum.MAX_LEAVES]chance_enum.Leaf = undefined;
     const battle = tree.nodes[root].battle;
     const n = try chance_enum.enumerate(&battle, tree.nodes[root].choices[0][a], tree.nodes[root].choices[1][b], seed, .{ .min_path = cfg.chance_min_path, .max_leaves = cfg.chance_max_leaves }, &leaves);
@@ -447,6 +492,157 @@ fn exactCellValue(tree: *Tree, root: u32, cfg: Config, seed: u64, a: u8, b: u8, 
         const c = try childFor(tree, root, a, b, &leaf.battle, leaf.result, cfg);
         total += leaf.weight * try leafValue(tree, c.idx, cfg, rand);
     }
+    tree.leaves += n;
+    tree.depth_total += n;
+    tree.max_depth = @max(tree.max_depth, 1);
+    tree.nodes[root].visits[a][b] += 1;
+    tree.nodes[root].wins[a][b] += total;
+    return total;
+}
+
+/// exactCellValue with the recurrent model: the cell's chance leaves are independent, so their paths (both sides) are made in
+/// one request to the server, and their policy continuations advance together, one request per continuation turn. The same
+/// values as one leaf at a time (up to the batch's rounding), with the continuations' chance drawn in another order.
+fn exactCellValueBatched(tree: *Tree, root: u32, cfg: Config, seed: u64, a: u8, b: u8, rand: *std.Random) !f32 {
+    const L = chance_enum.MAX_LEAVES;
+    var leaves: [L]chance_enum.Leaf = undefined;
+    const battle = tree.nodes[root].battle;
+    const c1_root = tree.nodes[root].choices[0][a];
+    const c2_root = tree.nodes[root].choices[1][b];
+    const n = try chance_enum.enumerate(&battle, c1_root, c2_root, seed, .{ .min_path = cfg.chance_min_path, .max_leaves = cfg.chance_max_leaves }, &leaves);
+    const allocator = tree.allocator;
+    const with_p2 = cfg.actor_priors and !cfg.leaf_only_value;
+
+    // the leaves' nodes, and the paths of the new ones in one batch
+    var idx: [L]u32 = undefined;
+    var fresh: [L]u32 = undefined;
+    var n_fresh: usize = 0;
+    for (leaves[0..n], 0..) |*leaf, i| {
+        const c = try childNode(tree, root, a, b, &leaf.battle, leaf.result, cfg, true);
+        idx[i] = c.idx;
+        if (!c.existed and !tree.nodes[c.idx].terminal) {
+            fresh[n_fresh] = c.idx;
+            n_fresh += 1;
+        }
+    }
+    if (n_fresh > 0) {
+        const per: usize = if (with_p2) 2 else 1;
+        const specs = try allocator.alloc(pathmod.Path.TurnSpec, n_fresh * per);
+        for (fresh[0..n_fresh], 0..) |ci, k| {
+            const child = &tree.nodes[ci];
+            specs[k * per] = .{ .parent = &tree.nodes[root].path.?, .before = &tree.nodes[root].battle, .after = &child.battle, .result = child.result, .c1 = c1_root, .c2 = c2_root, .side = 0 };
+            if (with_p2) specs[k * per + 1] = .{ .parent = &tree.nodes[root].path2.?, .before = &tree.nodes[root].battle, .after = &child.battle, .result = child.result, .c1 = c1_root, .c2 = c2_root, .side = 1 };
+        }
+        const paths = try allocator.alloc(pathmod.Path, specs.len);
+        try pathmod.Path.turnBatch(allocator, cfg.model, cfg.vocab, specs, paths);
+        for (fresh[0..n_fresh], 0..) |ci, k| {
+            tree.nodes[ci].path = paths[k * per];
+            if (with_p2) {
+                tree.nodes[ci].path2 = paths[k * per + 1];
+                computePriors(&tree.nodes[ci]);
+            }
+        }
+    }
+
+    // the leaves' values; the policy continuations of those that need one, advanced together
+    var value: [L]f32 = undefined;
+    var cont: [L]usize = undefined; // leaf indices whose continuation is computed here
+    var n_cont: usize = 0;
+    for (0..n) |i| {
+        const node = &tree.nodes[idx[i]];
+        if (node.terminal) {
+            value[i] = node.terminal_value;
+        } else if (cfg.continuation > 0 and node.path != null and node.path2 != null) {
+            if (node.has_cont) {
+                value[i] = node.cont_value;
+            } else {
+                var dup = false; // (two leaves can reach the same node: its continuation is computed once)
+                for (cont[0..n_cont]) |j| dup = dup or idx[j] == idx[i];
+                if (!dup) {
+                    cont[n_cont] = i;
+                    n_cont += 1;
+                }
+            }
+        } else if (node.path) |*pp| {
+            value[i] = @floatCast(pp.value());
+        } else {
+            value[i] = cfg.evaluator(&node.battle, node.result, rand);
+        }
+    }
+    if (n_cont > 0) {
+        var state_battle: [L]Battle = undefined;
+        var state_result: [L]pkmn.Result = undefined;
+        var p1: [L]*const pathmod.Path = undefined;
+        var p2: [L]*const pathmod.Path = undefined;
+        var done: [L]bool = @splat(false);
+        var cv: [L]f32 = @splat(0.5);
+        var before: [L]Battle = undefined;
+        var streams: [L]std.Random.DefaultPrng = undefined;
+        for (cont[0..n_cont], 0..) |i, k| {
+            streams[k] = std.Random.DefaultPrng.init(rand.int(u64)); // (as continuationValue: one draw per leaf, in leaf order)
+            const node = &tree.nodes[idx[i]];
+            state_battle[k] = node.battle;
+            state_result[k] = node.result;
+            p1[k] = &node.path.?;
+            p2[k] = &node.path2.?;
+        }
+        var buf1: [pkmn.CHOICES_SIZE]pkmn.Choice = undefined;
+        var buf2: [pkmn.CHOICES_SIZE]pkmn.Choice = undefined;
+        for (0..cfg.continuation) |step| {
+            const want_p2 = step + 1 < cfg.continuation;
+            var specs: [2 * L]pathmod.Path.TurnSpec = undefined;
+            var owner: [2 * L]usize = undefined;
+            var ns: usize = 0;
+            for (0..n_cont) |k| {
+                if (done[k]) continue;
+                const n1 = state_battle[k].choices(.P1, state_result[k].p1, &buf1);
+                const n2 = state_battle[k].choices(.P2, state_result[k].p2, &buf2);
+                if (n1 == 0 or n2 == 0) {
+                    cv[k] = 0.5;
+                    done[k] = true;
+                    continue;
+                }
+                const c1 = greedyChoice(&state_battle[k], 0, buf1[0..n1], &p1[k].actor);
+                const c2 = greedyChoice(&state_battle[k], 1, buf2[0..n2], &p2[k].actor);
+                before[k] = state_battle[k];
+                state_battle[k].rng = pkmn.gen1.PRNG.init(streams[k].random().int(u64));
+                var options = pkmn.battle.options(pkmn.protocol.NULL, pkmn.gen1.chance.NULL, pkmn.gen1.calc.NULL);
+                const r = try state_battle[k].update(c1, c2, &options);
+                state_result[k] = r;
+                if (r.type != .None) {
+                    cv[k] = terminalValue(r);
+                    done[k] = true;
+                    continue;
+                }
+                specs[ns] = .{ .parent = p1[k], .before = &before[k], .after = &state_battle[k], .result = r, .c1 = c1, .c2 = c2, .side = 0 };
+                owner[ns] = k;
+                ns += 1;
+                if (want_p2) {
+                    specs[ns] = .{ .parent = p2[k], .before = &before[k], .after = &state_battle[k], .result = r, .c1 = c1, .c2 = c2, .side = 1 };
+                    owner[ns] = k;
+                    ns += 1;
+                }
+            }
+            if (ns == 0) break;
+            // (paths point at their parents, so each continuation step's paths live in the tree's arena)
+            const paths = try allocator.alloc(pathmod.Path, ns);
+            try pathmod.Path.turnBatch(allocator, cfg.model, cfg.vocab, specs[0..ns], paths);
+            for (0..ns) |j| {
+                if (specs[j].side == 0) p1[owner[j]] = &paths[j] else p2[owner[j]] = &paths[j];
+            }
+        }
+        for (cont[0..n_cont], 0..) |i, k| {
+            if (!done[k]) cv[k] = @floatCast(p1[k].value());
+            tree.nodes[idx[i]].cont_value = cv[k];
+            tree.nodes[idx[i]].has_cont = true;
+        }
+        for (0..n) |i| {
+            const node = &tree.nodes[idx[i]];
+            if (!node.terminal and node.has_cont) value[i] = node.cont_value;
+        }
+    }
+    var total: f32 = 0;
+    for (leaves[0..n], 0..) |*leaf, i| total += leaf.weight * value[i];
     tree.leaves += n;
     tree.depth_total += n;
     tree.max_depth = @max(tree.max_depth, 1);
@@ -582,7 +778,10 @@ fn setupRoots(allocator: std.mem.Allocator, cfg: Config, truth: *const Battle, t
     // The real game's P1 root view is the same in every universe (only P2's hidden team differs), so
     // it is built once and shared.
     var shared_view: ?pathmod.Path = null;
-    if (cfg.model != null and cfg.root_path != null) {
+    if (cfg.recurrent) {
+        if (cfg.root_path == null) return error.RecurrentNeedsRootPath;
+        shared_view = cfg.root_path.?.*; // (the recurrent state already holds the whole game)
+    } else if (cfg.model != null and cfg.root_path != null) {
         const rp = cfg.root_path.?;
         const window = if (cfg.block_history) @min(rp.memory.step, 16 + rp.memory.step % 16) else cfg.root_window;
         shared_view = if (window == 0) rp.* else try pathmod.Path.rootView(allocator, cfg.model.?, rp, window);
@@ -594,25 +793,95 @@ fn setupRoots(allocator: std.mem.Allocator, cfg: Config, truth: *const Battle, t
         randomizeHiddenTimers(&world, rand);
         trees[w] = Tree{ .allocator = allocator, .nodes = try allocator.alloc(Node, per_world + 2), .count = 1 };
         roots[w] = trees[w].alloc(world, truth_result);
-        if (cfg.model) |model| {
+        if (modelOn(cfg)) {
             const node = &trees[w].nodes[roots[w]];
-            if (cfg.root_path != null) {
+            if (shared_view != null) {
                 node.path = shared_view.?;
             } else {
                 const snapshot = try know.observerSnapshot(allocator, &node.battle, cfg.root_knowledge, false);
-                node.path = try pathmod.Path.extend(allocator, model, cfg.vocab.?, null, cfg.root_knowledge, snapshot);
+                node.path = try pathmod.Path.extend(allocator, cfg.model.?, cfg.vocab.?, null, cfg.root_knowledge, snapshot);
             }
-            if (cfg.actor_priors) {
-                // P2's root chain is built from this universe's own P2 roster: the real opponent's
-                // roster in the real game's history would not match the sampled team (see notes).
-                const snapshot2 = try know.perspectiveSnapshot(allocator, &node.battle, know.swapKnowledge(cfg.root_knowledge), 1);
-                node.path2 = try pathmod.Path.extend(allocator, model, cfg.vocab.?, null, know.swapKnowledge(cfg.root_knowledge), snapshot2);
+            if (cfg.actor_priors and !batchedOpponentRoots(cfg)) {
+                node.path2 = try opponentRoot(allocator, cfg, &node.battle, truth_result);
                 node.path2.?.block_window = cfg.block_history;
                 computePriors(node);
             }
         }
     }
+    if (modelOn(cfg) and cfg.actor_priors and batchedOpponentRoots(cfg)) {
+        const worlds = try allocator.alloc(*const Battle, world_count);
+        const paths = try allocator.alloc(pathmod.Path, world_count);
+        for (0..world_count) |w| worlds[w] = &trees[w].nodes[roots[w]].battle;
+        try opponentRoots(allocator, cfg, worlds, truth_result, paths);
+        for (0..world_count) |w| {
+            const node = &trees[w].nodes[roots[w]];
+            node.path2 = paths[w];
+            node.path2.?.block_window = cfg.block_history;
+            computePriors(node);
+        }
+    }
     return .{ .trees = trees, .roots = roots };
+}
+
+/// With the native recurrent model (and a history to replay), the worlds' P2 root chains advance together, one batch per
+/// past decision point (opponentRoots), instead of one world after the other (opponentRoot): the same paths.
+fn batchedOpponentRoots(cfg: Config) bool {
+    return cfg.recurrent and rnative.active != null and remote.active == null and cfg.history.len >= 2 and !noBatch();
+}
+
+/// opponentRoot for several worlds at once (the recurrent model replays the whole game).
+fn opponentRoots(allocator: std.mem.Allocator, cfg: Config, worlds: []const *const Battle, truth_result: pkmn.Result, out: []pathmod.Path) !void {
+    _ = truth_result; // (each point's own result is used; the last point is the root)
+    const h = cfg.history;
+    const W = worlds.len;
+    const cur = try allocator.alloc(*pathmod.Path, W);
+    const prev = try allocator.alloc(Battle, W);
+    const here = try allocator.alloc(Battle, W);
+    const specs = try allocator.alloc(pathmod.Path.TurnSpec, W);
+    for (0..W) |w| {
+        here[w] = universe.pastWorld(&h[0].battle, h[0].knowledge, worlds[w], cfg.root_knowledge);
+        cur[w] = try allocator.create(pathmod.Path);
+        cur[w].* = try pathmod.Path.turn(allocator, cfg.model, cfg.vocab, null, &here[w], &here[w], h[0].result, .{}, .{}, h[0].knowledge, 1);
+    }
+    for (1..h.len) |i| {
+        const point = h[i];
+        for (0..W) |w| {
+            prev[w] = here[w];
+            // the last point is the root: the world itself (its hidden timers drawn), the others rebuilt in it
+            here[w] = if (i + 1 == h.len) worlds[w].* else universe.pastWorld(&point.battle, point.knowledge, worlds[w], cfg.root_knowledge);
+            specs[w] = .{ .parent = cur[w], .before = &prev[w], .after = &here[w], .result = point.result, .c1 = h[i - 1].c1, .c2 = h[i - 1].c2, .side = 1 };
+        }
+        const next = try allocator.alloc(pathmod.Path, W);
+        try pathmod.Path.turnBatch(allocator, cfg.model, cfg.vocab, specs, next);
+        for (0..W) |w| cur[w] = &next[w];
+    }
+    for (0..W) |w| out[w] = cur[w].*;
+}
+
+/// P2's root path in the world `world`. With the real game's history (cfg.history), the chain replays the game from P2's
+/// side, each past decision point as it would have been in this world (universe.pastWorld: the world's opponent team, the
+/// public HP, status and PP of that time), so the opponent's actor reads a history consistent with the team it holds here;
+/// the windowed model replays the last `root_window` points (its window), the recurrent one the whole game. Without a
+/// history (or with a single point) the chain starts at the root.
+pub fn opponentRoot(allocator: std.mem.Allocator, cfg: Config, world: *const Battle, truth_result: pkmn.Result) !pathmod.Path {
+    const h = cfg.history;
+    if (h.len < 2) return pathmod.Path.turn(allocator, cfg.model, cfg.vocab, null, world, world, truth_result, .{}, .{}, cfg.root_knowledge, 1);
+    const first = if (cfg.recurrent or cfg.root_window == 0) 0 else h.len -| cfg.root_window;
+    var parent: ?*const pathmod.Path = null;
+    var prev: Battle = undefined;
+    for (h[first..], first..) |point, i| {
+        // the last point is the root: the world itself (its hidden timers drawn), the others rebuilt in this world
+        const here = if (i + 1 == h.len) world.* else universe.pastWorld(&point.battle, point.knowledge, world, cfg.root_knowledge);
+        const node = try allocator.create(pathmod.Path);
+        if (parent) |p| {
+            node.* = try pathmod.Path.turn(allocator, cfg.model, cfg.vocab, p, &prev, &here, point.result, h[i - 1].c1, h[i - 1].c2, .{}, 1);
+        } else {
+            node.* = try pathmod.Path.turn(allocator, cfg.model, cfg.vocab, null, &here, &here, point.result, .{}, .{}, point.knowledge, 1);
+        }
+        parent = node;
+        prev = here;
+    }
+    return parent.?.*;
 }
 
 const Cell = struct { visits: f32, wins: f32 };
@@ -1100,22 +1369,72 @@ fn solveKL(payoff: *const [MAX_WORLDS][MAXC][MAXC]f32, n1: usize, counts: []cons
 /// Root rule .kl_nash: every (own action, reply) cell in every world is valued (exact chance when
 /// configured), then the KL-anchored Bayesian game is solved (solveKL) and our action is drawn from
 /// its strategy (or its argmax with kl_argmax). All own actions of a world share a reply's seed.
+/// The cells of one world of the kl_nash root (its payoff rows); `cells` counts them.
+fn klNashWorld(tree: *Tree, r: u32, cfg: Config, seed: u64, n1: usize, payoff: *[MAXC][MAXC]f32, cells: *u32) !void {
+    const all: [MAXC]bool = @splat(true);
+    for (0..tree.nodes[r].n[1]) |b| {
+        const cell_seed = mixSeed(seed, @as(u64, b) + 1000);
+        for (0..n1) |a| payoff[a][b] = try cellValue(tree, r, cfg, cell_seed, &all, @intCast(a), @intCast(b));
+        cells.* += @intCast(n1);
+    }
+}
+
+const WorldJob = struct {
+    root: Root,
+    cfg: Config,
+    seeds: []const u64,
+    n1: usize,
+    payoff: *[MAX_WORLDS][MAXC][MAXC]f32,
+    threads: usize,
+    cells: [16]u32 = @splat(0),
+    failed: [16]?anyerror = @splat(null),
+
+    /// Thread `t` takes the worlds t, t + threads, ...
+    fn run(job: *WorldJob, t: usize) void {
+        var w = t;
+        while (w < job.root.trees.len) : (w += job.threads) {
+            klNashWorld(&job.root.trees[w], job.root.roots[w], job.cfg, job.seeds[w], job.n1, &job.payoff[w], &job.cells[t]) catch |e| {
+                job.failed[t] = e;
+                return;
+            };
+        }
+    }
+};
+
 fn klNashSearch(root: Root, cfg: Config, rand: *std.Random, n1: usize) !Outcome {
     const W = root.trees.len;
     var payoff: [MAX_WORLDS][MAXC][MAXC]f32 = undefined;
     var counts: [MAX_WORLDS]usize = undefined;
     var opp_prior: [MAX_WORLDS][MAXC]f32 = undefined;
-    const all: [MAXC]bool = @splat(true);
+    var seeds: [MAX_WORLDS]u64 = undefined;
     var cells: u32 = 0;
     for (root.trees, root.roots, 0..) |*tree, r, w| {
-        const node = &tree.nodes[r];
-        counts[w] = node.n[1];
-        opp_prior[w] = node.prior[1];
-        const seed = rand.int(u64);
-        for (0..counts[w]) |b| {
-            const cell_seed = mixSeed(seed, @as(u64, b) + 1000);
-            for (0..n1) |a| payoff[w][a][b] = try cellValue(tree, r, cfg, cell_seed, &all, @intCast(a), @intCast(b));
-            cells += @intCast(n1);
+        counts[w] = tree.nodes[r].n[1];
+        opp_prior[w] = tree.nodes[r].prior[1];
+        seeds[w] = rand.int(u64); // (in world order, as one thread draws them)
+    }
+    const threads: usize = @min(@max(cfg.threads, 1), @min(W, 16));
+    if (threads <= 1 or remote.active != null or rnative.active == null) {
+        for (root.trees, root.roots, 0..) |*tree, r, w| try klNashWorld(tree, r, cfg, seeds[w], n1, &payoff[w], &cells);
+    } else {
+        // every world allocates from its own arena while the threads run (the search's arena is not thread-safe)
+        var arenas: [MAX_WORLDS]std.heap.ArenaAllocator = undefined;
+        for (0..W) |w| {
+            arenas[w] = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            root.trees[w].allocator = arenas[w].allocator();
+        }
+        defer for (0..W) |w| arenas[w].deinit();
+        _ = noBatch();
+        know.warmNames();
+        rmodel.warm();
+        var job = WorldJob{ .root = root, .cfg = cfg, .seeds = seeds[0..W], .n1 = n1, .payoff = &payoff, .threads = threads };
+        var spawned: [16]std.Thread = undefined;
+        for (1..threads) |t| spawned[t] = try std.Thread.spawn(.{}, WorldJob.run, .{ &job, t });
+        job.run(0);
+        for (1..threads) |t| spawned[t].join();
+        for (0..threads) |t| {
+            if (job.failed[t]) |e| return e;
+            cells += job.cells[t];
         }
     }
     const own_prior = root.trees[0].nodes[root.roots[0]].prior[0];
@@ -1200,9 +1519,13 @@ pub fn search(
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    if (cfg.root_final == .adaptive and (!cfg.actor_priors or cfg.model == null or cfg.adaptive_candidates == 0 or
+    if (cfg.root_final == .adaptive and (!cfg.actor_priors or !modelOn(cfg) or cfg.adaptive_candidates == 0 or
         cfg.adaptive_min_sweeps < 2 or cfg.root_value_scale <= 0)) return error.InvalidAdaptiveConfig;
-    if (cfg.root_final == .kl_nash and (!cfg.actor_priors or cfg.model == null or cfg.kl_tau <= 0 or cfg.kl_tau_opp <= 0)) return error.InvalidKLConfig;
+    if (cfg.root_final == .kl_nash and (!cfg.actor_priors or !modelOn(cfg) or cfg.kl_tau <= 0 or cfg.kl_tau_opp <= 0)) return error.InvalidKLConfig;
+    if (cfg.recurrent and remote.active == null and rnative.active == null) return error.NoRecurrentModel;
+    // the recurrent server's nodes made by this search are forgotten when it returns (the real game's path was made before)
+    const server_mark: i64 = if (cfg.recurrent and remote.active != null) try remote.active.?.mark() else -1;
+    defer if (cfg.recurrent and remote.active != null) remote.active.?.release(server_mark) catch {};
     if (cfg.exact_chance and (cfg.max_depth != 1 or cfg.chance_max_leaves == 0 or cfg.chance_max_leaves > chance_enum.MAX_LEAVES)) return error.InvalidExactChance;
     if (cfg.max_depth == 0 or cfg.max_depth > MAX_DEPTH) return error.InvalidDepth;
     if (cfg.leaf_only_value and cfg.max_depth != 1) return error.LeafOnlyNeedsDepthOne;

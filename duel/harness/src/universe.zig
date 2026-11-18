@@ -93,3 +93,37 @@ pub fn knownParty(allocator: std.mem.Allocator, truth: *const Battle, knowledge:
     }
     return out.items;
 }
+
+/// An earlier decision point `past` (the observer's knowledge then: `past_knowledge`) as it would have been in `world`, a
+/// universe built at a later point with the observer's knowledge `knowledge_now`. The opponent's slots still unrevealed now
+/// hold `world`'s sampled Pokémon (never seen, so never in play: full HP, no status, full PP); its revealed Pokémon keep their
+/// real species, HP and status of that time with `world`'s movesets, at the PP left after the uses the observer knew of then.
+/// The observer's side is the real one.
+pub fn pastWorld(past: *const Battle, past_knowledge: know.Knowledge, world: *const Battle, knowledge_now: know.Knowledge) Battle {
+    var out = past.*;
+    const foe = &out.sides[1];
+    const active: usize = if (foe.order[0] > 0) foe.order[0] - 1 else 6;
+    for (0..6) |slot| {
+        if (!knowledge_now.seen[1][slot]) {
+            foe.pokemon[slot] = world.sides[1].pokemon[slot];
+            continue;
+        }
+        const mon = &foe.pokemon[slot];
+        if (mon.species == .None) continue;
+        for (0..4) |j| {
+            const id = world.sides[1].pokemon[slot].moves[j].id;
+            if (id == .None) {
+                mon.moves[j] = .{};
+            } else {
+                var used: u8 = 0;
+                for (past_knowledge.moves[1][slot], past_knowledge.used[1][slot]) |known, count| {
+                    if (known == id) used = count;
+                }
+                const maximum = @min(@as(u16, pkmn.gen1.Move.pp(id)) * 8 / 5, 61);
+                mon.moves[j] = .{ .id = id, .pp = @intCast(maximum -| used) };
+            }
+            if (slot == active) foe.active.moves[j] = mon.moves[j];
+        }
+    }
+    return out;
+}

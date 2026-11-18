@@ -44,6 +44,7 @@ sys.path.insert(1, str(Path(__file__).resolve().parent))
 
 from metamon.interface import move_name, pokemon_name  # noqa: E402
 from metamon.recurrent.features import CANT_REASONS, LastTurn, canonical_own, encode_observer, policy_options  # noqa: E402
+from metamon.recurrent.features import _move_name, _pokemon_name  # noqa: E402  (memoized move_name / pokemon_name)
 from metamon.recurrent.blend import PolicyBlend  # noqa: E402
 from metamon.recurrent.tables import Tables  # noqa: E402
 from metamon_connector import SnapshotEncoder  # noqa: E402
@@ -136,6 +137,17 @@ class Game:
         # opponent's faint reaches us in two snapshots (waiting for its replacement, then the replacement), and only the
         # second one is a decision
         self.actions: dict = {}
+
+    def fork(self) -> "Game":
+        """An independent copy (the search server's nodes): the recurrent state is replaced, never changed in place, and the
+        stored previous snapshot is not changed after it is stored, so only the memories that change in place are copied."""
+        other = copy.copy(self)
+        other.space = copy.deepcopy(self.space)
+        other.effects = copy.deepcopy(self.effects)
+        other.counter_selected = dict(self.counter_selected)
+        other.trap = dict(self.trap)
+        other.actions = dict(self.actions)
+        return other
 
     def note_actions(self, snap: dict) -> None:
         for side, act in (snap.get("last_actions") or {}).items():
@@ -296,6 +308,139 @@ def change(prev_mon, now_mon):
     return now_mon.hp_pct - prev_mon.hp_pct, inflicted, now_mon.status == "fnt"
 
 
+def make_encoder():
+    """The snapshot encoder and the move/species tables, set up as training saw the data."""
+    tables = Tables.from_dex(1)
+    encoder = SnapshotEncoder(METAMON_ROOT, observation_space=_Space())
+    # this metamon's UniversalPokemon also takes the actual stats; the parsed training data has none (-1 everywhere)
+    from types import SimpleNamespace
+    from metamon.interface import UniversalMove, UniversalPokemon, UniversalState
+
+    def pokemon_without_stats(*a, **kw):
+        for k in ("hp_stat", "atk_stat", "def_stat", "spa_stat", "spd_stat", "spe_stat"):
+            kw.setdefault(k, -1)
+        return UniversalPokemon(*a, **kw)
+
+    pokemon_without_stats.universal_types = UniversalPokemon.universal_types
+    encoder._universal = SimpleNamespace(UniversalMove=UniversalMove, UniversalPokemon=pokemon_without_stats, UniversalState=UniversalState)
+    return encoder, tables
+
+
+class Prepared:
+    """One decision's model input and what the rest of the loop reads."""
+
+    def __init__(self, enc, state, party, opp_active, ids, floats):
+        self.enc, self.state, self.party, self.opp_active, self.ids, self.floats = enc, state, party, opp_active, ids, floats
+
+
+def prepare(game: Game, snap: dict, encoder, tables):
+    """Everything before the model step for one snapshot: updates the game's memories and returns the model input, or None
+    for a wait state (only the opponent's forced switch: not a decision in parsed replays, so the model is not stepped)."""
+    legal = snap["legal"]
+    game.note_actions(snap)
+    if legal == ["no move"] and snap.get("opponent_force_switch") and not snap.get("force_switch"):
+        game.opp_faint_switch = True  # waiting: not a decision of a parsed replay
+        return None
+    # (repo copy) own HP as training saw it: recorded games show every Pokemon's HP in percent (Showdown's HP
+    # Percentage Mod), not exactly; the raw snapshot keeps the exact values for the checks below
+    # (only the own party's entries change: copied, not the whole snapshot)
+    enc_snap = dict(snap)
+    enc_snap["user"] = dict(snap["user"])
+    enc_snap["user"]["pokemon"] = [dict(m) for m in snap["user"]["pokemon"]]
+    for m in enc_snap["user"]["pokemon"]:
+        m["hp_pct"] = showdown_pct(int(m.get("hp", 0)), int(m.get("maxhp", 1))) / 100.0
+    encoder.begin_reuse()  # (the reserves state() builds are reused for the party below: same payloads, same objects)
+    try:
+        state = encoder.state(enc_snap, game.space)
+        # the full party: the active from the state (it carries the boosts), the others from the snapshot
+        party = [state.player_active_pokemon] + [encoder._pokemon(m, False, exact_hp=True) for m in enc_snap["user"]["pokemon"][1:]]
+    finally:
+        encoder.end_reuse()
+    opp_active = state.opponent_active_pokemon
+    revealed = []  # (in the snapshot's order: encode_observer sorts them by species)
+    for r in snap["opponent"]["revealed"][:6]:
+        if norm(r["species"]) == norm(opp_active.base_species) or norm(r["species"]) == norm(opp_active.name):
+            revealed.append(opp_active)
+        else:
+            revealed.append(encoder._pokemon({"id": r["species"], "hp_pct": r.get("hp", 1.0), "status": r.get("status", "none"), "moves": r.get("moves", [])}, False, exact_hp=False))
+    if game.prev is not None:
+        prev_snap, prev_state = game.prev
+        acts = game.actions if "last_actions" in snap else {}
+        ok, on, oc = own_cant(prev_snap, prev_state, snap, state, game.sent, game.last, acts.get("user"))
+        pk, pn, pc = opp_cant(prev_snap, prev_state, snap, state, game.opp_faint_switch, game.last, game.opp_move, acts.get("opponent"))
+        own_hp, own_status, own_fainted = change(prev_state.player_active_pokemon, state.player_active_pokemon)
+        opp_hp, opp_status, opp_fainted = change(prev_state.opponent_active_pokemon, state.opponent_active_pokemon)
+        game.last = LastTurn(
+            own_kind=ok, own_name=on, own_cant=oc if oc in CANT_REASONS else None,
+            opp_kind=pk, opp_name=pn, opp_cant=pc if pc in CANT_REASONS else None,
+            own_hp_change=own_hp, opp_hp_change=opp_hp, own_status_inflicted=own_status, opp_status_inflicted=opp_status,
+            own_fainted=own_fainted, opp_fainted=opp_fainted,
+        )
+        # (repo copy) the parser's Counter selection memory: a move that ran sets it, a turn without one (cant) clears
+        # it, a switch leaves it
+        for who, kind, name, cant in (("player", ok, on, oc), ("opponent", pk, pn, pc)):
+            if kind == "move":
+                game.counter_selected[who] = norm(name) == "counter"
+            elif cant is not None:
+                game.counter_selected[who] = False
+    # Effects as the replay parser's states carry them. Screens are read from each active's single effect (in Gen 1
+    # Reflect, Light Screen and Mist are volatiles; the parser's side-condition lists are always empty), so the
+    # effects are re-selected from the public volatiles, the opponent's included.
+    own_species, opp_species = norm(state.player_active_pokemon.base_species), norm(state.opponent_active_pokemon.base_species)
+    state.player_active_pokemon.effect = game.effects.select(effect_payload(snap, "user", own_species), "user")
+    state.opponent_active_pokemon.effect = game.effects.select(effect_payload(snap, "opponent", opp_species), "opponent")
+    opp_active.effect = state.opponent_active_pokemon.effect
+    extras = {
+        "last_damage": counter_damage(snap, game, state, tables),
+        "last_move": {"player": norm(snap["user"].get("last_move")), "opponent": norm(snap["opponent"].get("last_move"))},
+        "counter_selected": dict(game.counter_selected),
+        "player_cant": game.last.own_cant,
+        "opponent_cant": game.last.opp_cant,
+        "player_effects": [v for v in public_volatiles(snap["user"]) if v in EFFECTS],
+        "opponent_effects": [v for v in public_volatiles(snap["opponent"]) if v in EFFECTS],
+        "player_trapped": game.trap_probability(snap, "opponent"),  # caught in the opponent's trap
+        "opponent_trapped": game.trap_probability(snap, "user"),
+        "player_conditions_all": [],
+        "opponent_conditions_all": [],
+    }
+    game.decisions += 1
+    canonical = canonical_own(state, party)  # (computed once: the features and legal_slots both need it)
+    enc = encode_observer(state, party, revealed, game.last, game.decisions, tables, extras=extras, canonical=canonical)
+    ids ={k: torch.from_numpy(v)[None, None] for k, v in enc.ids.items()}
+    floats = {k: torch.from_numpy(v)[None, None] for k, v in enc.floats.items()}
+    prep = Prepared(enc, state, party, opp_active, ids, floats)
+    prep.canonical = canonical
+    return prep
+
+
+def legal_slots(prep: Prepared, legal: list) -> dict:
+    """Option name -> policy slot, with the training code's own definition (Metamon's action indices: the active's moves
+    sorted by name, then the living reserves sorted by species); options without a slot are left out."""
+    moves, reserves = policy_options(prep.canonical[0])
+    slots = {}
+    for option in legal:
+        if option.startswith("switch "):
+            name = _pokemon_name(option[7:])
+            if name in reserves:
+                slots[option] = 4 + reserves.index(name)
+        elif _move_name(option) in moves:
+            slots[option] = moves.index(_move_name(option))
+    return slots
+
+
+def finish(game: Game, snap: dict, prep: Prepared, reply: str) -> None:
+    """The memories updated after a decision: the opponent's active and last move, and what we answered."""
+    species = norm(snap["opponent"]["active_species"])
+    if species != game.opp_species:
+        game.opp_species, game.opp_move = species, ""
+    if game.last.opp_kind == "move" and game.last.opp_name:
+        game.opp_move = norm(game.last.opp_name)
+    if norm(snap["opponent"].get("last_move")) not in ("", "none"):
+        game.opp_move = norm(snap["opponent"]["last_move"])
+    game.prev, game.sent, game.opp_faint_switch = (snap, prep.state), reply, False
+    game.actions = {}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default=os.environ.get("RECURRENT_WEIGHTS", os.path.expanduser("~/model_weights/weights_best.pt")),
@@ -327,19 +472,7 @@ def main():
     temperature = float(os.environ.get("POLICY_TEMPERATURE", "0"))
     rng = random.Random(f"student-{os.environ.get('POLICY_SEED', '0')}")
     model = PolicyBlend.load(args.weights, args.blend_mode)
-    tables = Tables.from_dex(1)
-    encoder = SnapshotEncoder(METAMON_ROOT, observation_space=_Space())
-    # this metamon's UniversalPokemon also takes the actual stats; the parsed training data has none (-1 everywhere)
-    from types import SimpleNamespace
-    from metamon.interface import UniversalMove, UniversalPokemon, UniversalState
-
-    def pokemon_without_stats(*a, **kw):
-        for k in ("hp_stat", "atk_stat", "def_stat", "spa_stat", "spd_stat", "spe_stat"):
-            kw.setdefault(k, -1)
-        return UniversalPokemon(*a, **kw)
-
-    pokemon_without_stats.universal_types = UniversalPokemon.universal_types
-    encoder._universal = SimpleNamespace(UniversalMove=UniversalMove, UniversalPokemon=pokemon_without_stats, UniversalState=UniversalState)
+    encoder, tables = make_encoder()
     print(f"recurrent policy: {args.weights}" + (f" (blend of {model.size}, {args.blend_mode})" if model.size > 1 else ""), file=sys.stderr, flush=True)
     game = Game(model)
     for raw in sys.stdin:
@@ -360,81 +493,15 @@ def main():
                 print(told or "ok", flush=True)
                 continue
             legal = snap["legal"]
-            game.note_actions(snap)
-            if legal == ["no move"] and snap.get("opponent_force_switch") and not snap.get("force_switch"):
-                game.opp_faint_switch = True  # waiting: not a decision of a parsed replay
+            prep = prepare(game, snap, encoder, tables)
+            if prep is None:
+                if os.environ.get("RECURRENT_DUMP") and os.environ.get("RECURRENT_DUMP_SNAP"):  # (the whole snapshot stream)
+                    with open(os.environ["RECURRENT_DUMP"], "a") as f:
+                        f.write(json.dumps({"wait": True, "snap": snap}) + "\n")
                 print(told or "no move", flush=True)
                 continue
-            # (repo copy) own HP as training saw it: recorded games show every Pokemon's HP in percent (Showdown's HP
-            # Percentage Mod), not exactly; the raw snapshot keeps the exact values for the checks below
-            enc_snap = copy.deepcopy(snap)
-            for m in enc_snap["user"]["pokemon"]:
-                m["hp_pct"] = showdown_pct(int(m.get("hp", 0)), int(m.get("maxhp", 1))) / 100.0
-            state = encoder.state(enc_snap, game.space)
-            # the full party: the active from the state (it carries the boosts), the others from the snapshot
-            party = [state.player_active_pokemon] + [encoder._pokemon(m, False, exact_hp=True) for m in enc_snap["user"]["pokemon"][1:]]
-            opp_active = state.opponent_active_pokemon
-            revealed = []  # (in the snapshot's order: encode_observer sorts them by species)
-            for r in snap["opponent"]["revealed"][:6]:
-                if norm(r["species"]) == norm(opp_active.base_species) or norm(r["species"]) == norm(opp_active.name):
-                    revealed.append(opp_active)
-                else:
-                    revealed.append(encoder._pokemon({"id": r["species"], "hp_pct": r.get("hp", 1.0), "status": r.get("status", "none"), "moves": r.get("moves", [])}, False, exact_hp=False))
-            if game.prev is not None:
-                prev_snap, prev_state = game.prev
-                acts = game.actions if "last_actions" in snap else {}
-                ok, on, oc = own_cant(prev_snap, prev_state, snap, state, game.sent, game.last, acts.get("user"))
-                pk, pn, pc = opp_cant(prev_snap, prev_state, snap, state, game.opp_faint_switch, game.last, game.opp_move, acts.get("opponent"))
-                own_hp, own_status, own_fainted = change(prev_state.player_active_pokemon, state.player_active_pokemon)
-                opp_hp, opp_status, opp_fainted = change(prev_state.opponent_active_pokemon, state.opponent_active_pokemon)
-                game.last = LastTurn(
-                    own_kind=ok, own_name=on, own_cant=oc if oc in CANT_REASONS else None,
-                    opp_kind=pk, opp_name=pn, opp_cant=pc if pc in CANT_REASONS else None,
-                    own_hp_change=own_hp, opp_hp_change=opp_hp, own_status_inflicted=own_status, opp_status_inflicted=opp_status,
-                    own_fainted=own_fainted, opp_fainted=opp_fainted,
-                )
-                # (repo copy) the parser's Counter selection memory: a move that ran sets it, a turn without one (cant) clears
-                # it, a switch leaves it
-                for who, kind, name, cant in (("player", ok, on, oc), ("opponent", pk, pn, pc)):
-                    if kind == "move":
-                        game.counter_selected[who] = norm(name) == "counter"
-                    elif cant is not None:
-                        game.counter_selected[who] = False
-            # Effects as the replay parser's states carry them. Screens are read from each active's single effect (in Gen 1
-            # Reflect, Light Screen and Mist are volatiles; the parser's side-condition lists are always empty), so the
-            # effects are re-selected from the public volatiles, the opponent's included.
-            own_species, opp_species = norm(state.player_active_pokemon.base_species), norm(state.opponent_active_pokemon.base_species)
-            state.player_active_pokemon.effect = game.effects.select(effect_payload(snap, "user", own_species), "user")
-            state.opponent_active_pokemon.effect = game.effects.select(effect_payload(snap, "opponent", opp_species), "opponent")
-            opp_active.effect = state.opponent_active_pokemon.effect
-            extras = {
-                "last_damage": counter_damage(snap, game, state, tables),
-                "last_move": {"player": norm(snap["user"].get("last_move")), "opponent": norm(snap["opponent"].get("last_move"))},
-                "counter_selected": dict(game.counter_selected),
-                "player_cant": game.last.own_cant,
-                "opponent_cant": game.last.opp_cant,
-                "player_effects": [v for v in public_volatiles(snap["user"]) if v in EFFECTS],
-                "opponent_effects": [v for v in public_volatiles(snap["opponent"]) if v in EFFECTS],
-                "player_trapped": game.trap_probability(snap, "opponent"),  # caught in the opponent's trap
-                "opponent_trapped": game.trap_probability(snap, "user"),
-                "player_conditions_all": [],
-                "opponent_conditions_all": [],
-            }
-            game.decisions += 1
-            enc = encode_observer(state, party, revealed, game.last, game.decisions, tables, extras=extras)
-            ids ={k: torch.from_numpy(v)[None, None] for k, v in enc.ids.items()}
-            floats = {k: torch.from_numpy(v)[None, None] for k, v in enc.floats.items()}
-            # option name -> policy slot, with the training code's own definition (Metamon's action indices: the active's moves
-            # sorted by name, then the living reserves sorted by species)
-            moves, reserves = policy_options(canonical_own(state, party)[0])
-            slots = {}
-            for option in legal:
-                if option.startswith("switch "):
-                    name = pokemon_name(option[7:])
-                    if name in reserves:
-                        slots[option] = 4 + reserves.index(name)
-                elif move_name(option) in moves:
-                    slots[option] = moves.index(move_name(option))
+            enc, state, party, opp_active, ids, floats = prep.enc, prep.state, prep.party, prep.opp_active, prep.ids, prep.floats
+            slots = legal_slots(prep, legal)
             # the policy's log-probabilities over the legal slots (one model: its logits up to a constant, so the sampling
             # below is unchanged; a blend: the blended distribution)
             logits, game.h = model.decide(ids, floats, game.h, sorted(set(slots.values())))
@@ -450,13 +517,6 @@ def main():
                 print(f"TRACE d{game.decisions} {state.player_active_pokemon.name} {state.player_active_pokemon.hp_pct:.2f} vs {opp_active.name} {opp_active.hp_pct:.2f} "
                       f"last own={game.last.own_kind}:{game.last.own_name}:{game.last.own_cant} opp={game.last.opp_kind}:{game.last.opp_name}:{game.last.opp_cant} "
                       f"unmapped={[o for o in legal if o not in slots]} -> {reply} | " + " ".join(f"{o}={q:.2f}" for q, o in ranked), file=sys.stderr, flush=True)
-            species = norm(snap["opponent"]["active_species"])
-            if species != game.opp_species:
-                game.opp_species, game.opp_move = species, ""
-            if game.last.opp_kind == "move" and game.last.opp_name:
-                game.opp_move = norm(game.last.opp_name)
-            if norm(snap["opponent"].get("last_move")) not in ("", "none"):
-                game.opp_move = norm(snap["opponent"]["last_move"])
             if os.environ.get("RECURRENT_DUMP"):  # features, the option -> slot map and (shadow mode) the teacher's reply
                 with open(os.environ["RECURRENT_DUMP"], "a") as f:
                     f.write(json.dumps({**{f"ids_{k}": v.tolist() for k, v in enc.ids.items()}, **{f"floats_{k}": v.tolist() for k, v in enc.floats.items()},
@@ -467,8 +527,7 @@ def main():
                     agree[0] += reply == told
                     agree[1] += 1
                 reply = told if told in legal else reply
-            game.prev, game.sent, game.opp_faint_switch = (snap, state), reply, False
-            game.actions = {}
+            finish(game, snap, prep, reply)
             print(reply, flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"!error {type(exc).__name__}: {exc}", flush=True)
