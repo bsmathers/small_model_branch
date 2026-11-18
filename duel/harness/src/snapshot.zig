@@ -74,11 +74,31 @@ pub fn serializeDuelSnapshot(galloc: std.mem.Allocator, battle: *const Battle, k
     const actions = try galloc.alloc(vs.Field, 2);
     actions[0] = .{ .key = "user", .value = sides[0] };
     actions[1] = .{ .key = "opponent", .value = sides[1] };
+    // (repo copy) for TaurosV0's connector (metamon_connector.py; the other readers ignore them): whether each side's active
+    // is badly poisoned (Toxic: Showdown's "tox" status, which the snapshot's status calls poison) and the move Disable
+    // stopped ("" if none; the Disable message names it)
+    const toxic = try galloc.alloc(vs.Field, 2);
+    const disabled = try galloc.alloc(vs.Field, 2);
+    for (0..2) |i| {
+        const key = if (i == 0) "user" else "opponent";
+        const side = view.sides[i];
+        const v = side.active.volatiles;
+        const alive = side.order[0] != 0 and side.pokemon[side.order[0] - 1].hp > 0;
+        toxic[i] = .{ .key = key, .value = .{ .bool = alive and v.Toxic } };
+        var name: []const u8 = "";
+        if (alive and v.disable_move != 0 and v.disable_move <= 4) {
+            const id = side.active.moves[v.disable_move - 1].id;
+            if (id != .None) name = try std.ascii.allocLowerString(galloc, @tagName(id));
+        }
+        disabled[i] = .{ .key = key, .value = .{ .str = name } };
+    }
     const base = snap.obj;
-    const fields = try galloc.alloc(vs.Field, base.len + 2);
+    const fields = try galloc.alloc(vs.Field, base.len + 4);
     @memcpy(fields[0..base.len], base);
     fields[base.len] = .{ .key = "legal", .value = .{ .list = legal_items } };
     fields[base.len + 1] = .{ .key = "last_actions", .value = .{ .obj = actions } };
+    fields[base.len + 2] = .{ .key = "toxic", .value = .{ .obj = toxic } };
+    fields[base.len + 3] = .{ .key = "disabled", .value = .{ .obj = disabled } };
     var out: std.ArrayList(u8) = .empty;
     try policy.writeJson(galloc, &out, .{ .obj = fields });
     return out.items;
@@ -89,6 +109,22 @@ pub fn duelName(allocator: std.mem.Allocator, battle: *const Battle, side: usize
     const raw = try optionName(allocator, battle, side, choice);
     if (std.mem.eql(u8, raw, "pass") or std.mem.eql(u8, raw, "recharge")) return "no move";
     return std.ascii.allocLowerString(allocator, raw);
+}
+
+/// An option's name as Pokémon Showdown's request shows it to TaurosV0 (lowercase; the engine's choices are Showdown's): the
+/// engine's move data 0 in a move request is Struggle ("struggle"); a Pokémon that must recharge gets "recharge"; one locked
+/// into Thrash / Petal Dance, Rage or a two-turn move gets that move (the engine's forced choice is move slot 1, whatever the
+/// locked move is); the pass while the opponent replaces a fainted Pokémon is "no move". metamon maps "struggle" and
+/// "recharge" to every move index (interface.UniversalAction.action_idx_to_BattleOrder), so the adapter does too.
+pub fn taurosName(allocator: std.mem.Allocator, battle: *const Battle, side: usize, choice: pkmn.Choice) ![]const u8 {
+    if (choice.type == .Move) {
+        const s = battle.sides[side];
+        const v = s.active.volatiles;
+        if (v.Recharging) return "recharge";
+        if (v.Thrashing or v.Rage or v.Charging) return std.ascii.allocLowerString(allocator, @tagName(s.last_selected_move));
+        if (choice.data == 0) return "struggle";
+    }
+    return duelName(allocator, battle, side, choice);
 }
 
 /// `side`'s legal options at a decision point (`result` is the update's result there) and their duel names.

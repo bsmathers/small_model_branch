@@ -95,6 +95,18 @@ def counter_damage(snap: dict, game, state, tables):
         estimate = _stat_of(tables.base_stats(name)["hp"], hp=True)
     except KeyError:
         return None
+    if side == "opponent":
+        # (repo copy) damage to the opponent is public only as its HP percentage's drop (Showdown's rounded percentage); the
+        # engine's exact amount, or what a Substitute absorbed, is not: none when its active changed or showed no drop
+        if game.prev is None:
+            return None
+        pb, pa = game.prev[0]["opponent"], snap["opponent"]
+        if norm(pb["active_species"]) != norm(pa["active_species"]):
+            return None
+        drop = float(pb["active"]["hp"]) - float(pa["active"]["hp"])
+        if drop <= 0:
+            return None
+        return {"kind": "hit", "side": side, "name": name, "pct": 100.0 * drop}
     return {"kind": "hit", "side": side, "name": name, "pct": 100.0 * damage / max(estimate, 1.0)}
 
 

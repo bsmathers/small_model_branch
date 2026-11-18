@@ -61,6 +61,10 @@ class SnapshotEncoder:
         self.Move = Move
         self.Pokemon = Pokemon
         self._species_feature_cache = {}
+        # (repo copy) True for TaurosV0 (tauros_inference): Toxic and Disable from the duel snapshot's "toxic" / "disabled",
+        # as native metamon shows them. Off for the recurrent model's servers, whose features (and rnative.zig) keep the
+        # snapshot's poison status and no Disable effect
+        self.duel_extras = False
         self._universal = __import__(
             "metamon.interface",
             fromlist=["UniversalMove", "UniversalPokemon", "UniversalState"],
@@ -240,8 +244,7 @@ class SnapshotEncoder:
             base_hp=int(stats["hp"]),
         )
 
-    @staticmethod
-    def _public_effects(snapshot: dict, side: str) -> list:
+    def _public_effects(self, snapshot: dict, side: str) -> list:
         """(repo copy) A side's active effects from the public volatile lists, as the replay parser would see them: a trap's
         "binding" belongs to its user (the older "volatiles" list called it "partiallytrapped", the reverse), and the Pokemon
         caught in the other side's trap carries "partiallytrapped" (named after the trapping move by active_effects)."""
@@ -251,7 +254,11 @@ class SnapshotEncoder:
         # Native metamon's states never carry a recharge effect (it is not in TaurosV0's vocabulary: an unknown token) and
         # carry a trap's name in 0.04% of states (Gen 1 logs have no trap start line), against 3% here: both are left out,
         # as is the lock of Thrash
-        return [v for v in mine if v not in ("binding", "mustrecharge", "lockedmove")]
+        effects = [v for v in mine if v not in ("binding", "mustrecharge", "lockedmove")]
+        # (repo copy) Disable (the snapshot's volatile lists leave it out; the duel snapshot's "disabled" names the move)
+        if self.duel_extras and (snapshot.get("disabled") or {}).get(side) and "disable" not in effects:
+            effects.append("disable")
+        return effects
 
     def state(self, snapshot: dict, space=None):
         UniversalState = self._universal.UniversalState
@@ -267,6 +274,10 @@ class SnapshotEncoder:
         own_active_payload["conditions"] = user.get("conditions", {})
         own_active_payload["last_move"] = user.get("last_move", "None")
         own_active_payload["trapping_move"] = opponent.get("last_move", "None")
+        # (repo copy) Toxic is Showdown's "tox" status (the snapshot's status calls it poison; the duel snapshot flags it)
+        toxic = (snapshot.get("toxic") or {}) if self.duel_extras else {}
+        if toxic.get("user"):
+            own_active_payload["status"] = "toxic"
         active = self._pokemon(
             own_active_payload,
             True,
@@ -292,7 +303,7 @@ class SnapshotEncoder:
             "base_species": active_base_species,
             "types": active_public.get("types", []),
             "hp_pct": active_public.get("hp", known.get("hp", 1.0)),
-            "status": active_public.get("status", known.get("status", "none")),
+            "status": "toxic" if toxic.get("opponent") else active_public.get("status", known.get("status", "none")),
             "moves": known.get("moves", []),
             "boosts": active_public.get("boosts", {}),
             "volatiles": self._public_effects(snapshot, "opponent") if "public_volatiles" in opponent else active_public.get("volatiles", []),

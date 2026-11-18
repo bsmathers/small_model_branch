@@ -860,16 +860,13 @@ fn duel(init: std.process.Init, args: []const []const u8) !void {
             const n1 = battle.choices(.P1, result.p1, &choices1);
             const n2 = battle.choices(.P2, result.p2, &choices2);
             if (n1 == 0 or n2 == 0) break;
+            // (repo copy) TaurosV0 gets Showdown's names for Struggle, Recharge and locked moves (snapshot.taurosName)
+            const p1_tauros = std.mem.eql(u8, if (blend_is_p1) name_a else name_b, "tauros");
+            const p2_tauros = std.mem.eql(u8, if (blend_is_p1) name_b else name_a, "tauros");
             const names1 = try galloc.alloc([]const u8, n1);
-            for (0..n1) |i| {
-                const raw = try optionName(galloc, &battle, 0, choices1[i]);
-                names1[i] = if (std.mem.eql(u8, raw, "pass") or std.mem.eql(u8, raw, "recharge")) "no move" else try std.ascii.allocLowerString(galloc, raw);
-            }
+            for (0..n1) |i| names1[i] = if (p1_tauros) try snapmod.taurosName(galloc, &battle, 0, choices1[i]) else try snapmod.duelName(galloc, &battle, 0, choices1[i]);
             const names2 = try galloc.alloc([]const u8, n2);
-            for (0..n2) |i| {
-                const raw = try optionName(galloc, &battle, 1, choices2[i]);
-                names2[i] = if (std.mem.eql(u8, raw, "pass") or std.mem.eql(u8, raw, "recharge")) "no move" else try std.ascii.allocLowerString(galloc, raw);
-            }
+            for (0..n2) |i| names2[i] = if (p2_tauros) try snapmod.taurosName(galloc, &battle, 1, choices2[i]) else try snapmod.duelName(galloc, &battle, 1, choices2[i]);
             const snap1 = try serializeDuelSnapshot(galloc, &battle, knowledge, names1, false, last_actions);
             const snap2 = try serializeDuelSnapshot(galloc, &battle, knowledge, names2, true, last_actions);
             const client1 = if (blend_is_p1) blend else judge;

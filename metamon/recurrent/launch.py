@@ -88,6 +88,11 @@ class SideJobs:
         if self.a.tournament_every <= 0 and not self.a.experiment:
             self.l.log("tournaments: off (--tournament-every 0)")
             return
+        if self.a.reuse_tournament_setup and os.path.exists(os.path.join(self.l.work, "duel", ".ready")):
+            # (several launchers at once: one setup made beforehand, not redone by each; a setup rebuilds the shared harness)
+            self.ready = True
+            self.l.log("tournaments: ready (the existing setup in WORK/duel)")
+            return
         self.setup = self.popen([self.l.py, "-m", "metamon.recurrent.tournament", "setup", "--work", self.l.work, "--cache", self.l.cache], "tournament_setup.txt")
         self.l.log(f"tournaments: setting up the duel harness and TaurosV0 in the background (log {self.l.logs}/tournament_setup.txt)")
 
@@ -188,7 +193,7 @@ class Launcher:
     def __init__(self, args):
         self.args = args
         self.work = os.path.abspath(args.work)
-        self.logs = os.path.join(self.work, "logs")
+        self.logs = os.path.join(self.work, args.logs_name)
         os.makedirs(self.logs, exist_ok=True)
         self.cache = os.path.abspath(args.cache or os.path.join(self.work, "metamon-cache"))
         self.timings: dict[str, float] = {}
@@ -966,12 +971,21 @@ class Launcher:
         for name, weight in self.mix.items():
             cmd += ["--source", f"{name}={os.path.join(self.work, name, 'built')}:{weight}"]
         cmd += ["--burn-in", str(a.burn_in), "--seed", str(a.seed), "--accum", str(a.accum)]
-        cmd += ["--steps", str(steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
+        cmd += ["--steps", str(steps), "--batch", str(a.batch), "--workers", str(a.train_workers or min(self.cpus, 12)), "--device", self.device,
                 "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--bc-weight", str(a.bc_weight), "--lr", str(a.lr), "--ckpt-every", str(a.ckpt_every),
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
         if a.val_batches:
             cmd += ["--val-batches", str(a.val_batches)]
         cmd += ["--patience", str(a.patience), "--min-delta", str(a.min_delta)]
+        # the model's size (a fresh model; resumed or initialised weights keep theirs) and the win loss's weight and reach
+        if (a.width, a.layers, a.ff) != (192, 4, 0):
+            cmd += ["--width", str(a.width), "--layers", str(a.layers), "--ff", str(a.ff)]
+        if a.value_weight is not None:
+            cmd += ["--value-weight", str(a.value_weight)]
+        if a.value_trunk_scale != 1.0:
+            cmd += ["--value-trunk-scale", str(a.value_trunk_scale)]
+        if a.monitor != "auto":
+            cmd += ["--monitor", a.monitor]
         if self.backup:
             cmd += ["--backup-dir", os.path.join(self.backup, os.path.basename(out)), "--backup-every", str(a.backup_every)]
         if a.init and extra[1] != "value" and not a.finetune_from:
@@ -1194,6 +1208,18 @@ def main() -> None:
     ap.add_argument("--final-procs", type=int, default=0, help="(experiment) harness processes of a final tournament (default: half the CPUs, at most 16)")
     ap.add_argument("--value-from", default=None,
                     help="skip the policy stage: start the value stage from these policy weights (they are also the anchor's reference)")
+    ap.add_argument("--logs-name", default="logs", help="folder under WORK for the launcher's logs (one per launcher when several share WORK)")
+    ap.add_argument("--train-workers", type=int, default=0, help="training data loader processes (0: the CPUs, at most 12)")
+    ap.add_argument("--reuse-tournament-setup", action="store_true",
+                    help="use WORK/duel as it is when it is ready instead of setting it up again (several launchers at once)")
+    ap.add_argument("--width", type=int, default=192, help="model width (a multiple of 32): 192 is the 1.31M model, 96 with --layers 2 is 205k, 256 with --layers 6 is 3.3M")
+    ap.add_argument("--layers", type=int, default=4, help="model transformer blocks")
+    ap.add_argument("--ff", type=int, default=0, help="model feed-forward width (0: twice the width)")
+    ap.add_argument("--value-weight", type=float, default=None, help="weight of the win BCE in a joint stage (--value-steps 0; train.py's default: 1)")
+    ap.add_argument("--value-trunk-scale", type=float, default=1.0,
+                    help="share of the win loss's gradient that reaches the shared network (1: all; 0: the win head learns on the policy's features)")
+    ap.add_argument("--monitor", choices=("auto", "kl", "bce", "loss"), default="auto",
+                    help="what early stopping and weights_best.pt follow (train.py): loss = the stage's weighted loss")
     ap.add_argument("--alpha", type=float, default=1.0, help="weight of the distillation KL")
     ap.add_argument("--bc-weight", type=float, default=0.0, help="weight of the imitation term on the imitated bots' games")
     ap.add_argument("--bc-players", default="Tauros-v1,Tauros-v2,SmallG1Online-v2,SmallG1Online-v3", help="usernames whose played actions are imitated")

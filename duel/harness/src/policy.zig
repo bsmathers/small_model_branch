@@ -176,7 +176,11 @@ pub const Client = struct {
             if (std.mem.eql(u8, option, reply)) return reply;
         }
         self.fallbacks += 1;
-        if (self.fallbacks <= 3) std.debug.print("policy fallback: reply {s}\n  snapshot {s}\n", .{ reply, snapshot_json[0..@min(snapshot_json.len, 600)] });
+        // (repo copy) a reply that is not a legal option (a server error: "!error ...") stops the run: a random move in its
+        // place made a game the opponent did not play. POLICY_FALLBACK=1: the old random move (counted in fallbacks)
+        std.debug.print("policy failure: reply {s} (not one of the {d} legal options in the snapshot)\n  snapshot {s}\n", .{ reply, legal.len, snapshot_json[0..@min(snapshot_json.len, 2000)] });
+        const fallback = if (std.c.getenv("POLICY_FALLBACK")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        if (!fallback) return error.PolicyFailed;
         return self.allocator.dupe(u8, legal[rand.uintLessThan(usize, legal.len)]);
     }
 };

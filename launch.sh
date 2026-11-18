@@ -122,9 +122,12 @@ fi
 # Each attempt runs in its own process group, and whatever it leaves running (a stuck worker) is killed before the next one.
 # One run per WORK at a time (a lock), so a second start cannot write into the same checkpoints.
 RETRIES="${RETRIES:-3}"
+# LAUNCH_LOCK: another lock file, for runs that share WORK on purpose (recipe.sh trains several models at once, each with its own
+# run folders and logs, on games already built)
+LOCK="${LAUNCH_LOCK:-$WORK/.launch.lock}"
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$WORK/.launch.lock"
-  flock -n 9 || { log "another launch.sh is already running on $WORK (lock $WORK/.launch.lock)"; exit 1; }
+  exec 9>"$LOCK"
+  flock -n 9 || { log "another launch.sh is already running on $WORK (lock $LOCK)"; exit 1; }
 fi
 child=""
 on_signal() {

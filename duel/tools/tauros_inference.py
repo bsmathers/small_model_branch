@@ -246,6 +246,7 @@ class TaurosInference:
         # wrappers graph-break around cache management and are slower than eager.
         self.eager_decorators_unwrapped = use_eager_inference(self.policy)
         self.encoder = SnapshotEncoder(root, factory.observation_space)
+        self.encoder.duel_extras = True  # (repo copy) Toxic and Disable as native metamon shows them
         self.action_count = factory.action_space.gym_space.n
         self.attention_window = None
         if self.attention_backend == "sdpa":
@@ -388,18 +389,34 @@ class TaurosInference:
             state = self.encoder.state(snapshot)
         moves = consistent_move_order(state.player_active_pokemon.moves)
         switches = consistent_pokemon_order(state.available_switches)
+        # (repo copy) as metamon on Showdown (UniversalAction.definitely_valid_actions / action_idx_to_BattleOrder): when the
+        # only move is Struggle, every move index (one per known move, up to 4) is Struggle (Recharge: every index), so the
+        # policy's mass on all of them goes to it (mapping it to index 0 alone moved that mass to the switches); the index sampled is the one
+        # committed as the previous action. "no move" (the pass while the opponent replaces a fainted Pokemon) is index 0.
+        all_moves = list(range(min(4, len(moves)))) or [0]
+        legal = snapshot["legal"]
         result = {}
-        for response in snapshot["legal"]:
+        for response in legal:
             name = response.lower()
             if name.startswith("switch "):
-                index = next((4 + i for i, mon in enumerate(switches) if mon.name == name[7:]), None)
-            elif name in {"no move", "struggle"}:
-                index = 0
+                indices = [next((4 + i for i, mon in enumerate(switches) if mon.name == name[7:]), None)]
+            elif name == "struggle":
+                indices = all_moves
+            elif name == "recharge":
+                # every index is Recharge, the switch ones too (metamon's state lists the bench whether or not it is trapped)
+                indices = all_moves + [4 + i for i in range(len(switches))]
+            elif name == "no move":
+                indices = [0]
             else:
-                index = next((i for i, move in enumerate(moves) if move.name == name), None)
-            if index is None or index in result:
-                raise ValueError(f"cannot uniquely map legal action: {response}")
-            result[index] = response
+                indices = [next((i for i, move in enumerate(moves) if move.name == name), None)]
+                # a locked move (Thrash, Rage, a two-turn move) called by Metronome / Mirror Move is not in the moveset; as the
+                # only option its index does not matter to the outcome
+                if indices == [None] and len(legal) == 1:
+                    indices = [0]
+            for index in indices:
+                if index is None or index in result:
+                    raise ValueError(f"cannot uniquely map legal action: {response}")
+                result[index] = response
         return result
 
 

@@ -454,6 +454,12 @@ def main() -> None:
     ap.add_argument("--keep-value-head", action="store_true", help="(--stage value) keep the win head of --init instead of re-initialising it")
     ap.add_argument("--value-weight", type=float, default=None, help="weight of the win BCE (default: 0 in the policy stage, else 1)")
     ap.add_argument("--anchor-weight", type=float, default=None, help="weight of KL(first-stage policy || current policy) (default: 5 in the value stage, else 0)")
+    ap.add_argument("--width", type=int, default=192, help="a fresh model's width (a multiple of 32; with --init or a resume the weights' size is kept)")
+    ap.add_argument("--layers", type=int, default=4, help="a fresh model's transformer blocks")
+    ap.add_argument("--ff", type=int, default=0, help="a fresh model's feed-forward width (0: twice the width)")
+    ap.add_argument("--value-trunk-scale", type=float, default=1.0,
+                    help="share of the win loss's gradient that reaches the shared network (the win head always gets all of it): 1 = all, "
+                         "0 = the win head learns on the policy's features only")
     ap.add_argument("--target", choices=("mix", "blend", "judge"), default="blend")
     ap.add_argument("--mix", type=float, default=0.5, help="share of the proposer blend in the mixed target")
     ap.add_argument("--val-fraction", type=int, default=20, help="hold out 1 game in N")
@@ -527,7 +533,10 @@ def main() -> None:
     elif args.init:
         model = PolicyValueModel.from_state(torch.load(args.init, map_location="cpu"), **heads)
     else:
-        model = PolicyValueModel(Config(**heads))
+        model = PolicyValueModel(Config.sized(args.width, args.layers, args.ff, **heads))
+    if (resume_state or args.init) and (model.cfg.d, model.cfg.layers) != (args.width, args.layers) and (args.width, args.layers) != (192, 4):
+        raise SystemExit(f"--width {args.width} --layers {args.layers}: the weights being resumed or initialised from are {model.cfg.d} wide with {model.cfg.layers} layers")
+    model.value_grad_scale = args.value_trunk_scale
     model = model.to(device)
     if model.cfg.deep_actor or model.cfg.opponent_head:
         log(f"heads: deep actor {model.cfg.deep_actor}, opponent head {model.cfg.opponent_head}")
@@ -548,7 +557,8 @@ def main() -> None:
         del init
         log(f"anchor: KL to the policy of {args.init}, weight {args.anchor_weight}")
     log(f"stage {args.stage}: alpha {args.alpha} bc {args.bc_weight} value {args.value_weight} anchor {args.anchor_weight}")
-    log(f"model {count_parameters(model):,} parameters")
+    log(f"model {count_parameters(model):,} parameters (width {model.cfg.d}, {model.cfg.layers} layers, {model.cfg.heads} heads, feed-forward {model.cfg.ff})"
+        + (f"; win loss gradient into the shared network x{args.value_trunk_scale}" if args.value_trunk_scale != 1.0 else ""))
     if args.freeze == "trunk":
         for name, param in model.named_parameters():
             param.requires_grad_(name.startswith("win."))

@@ -29,6 +29,7 @@ ID_KEYS = (
 )
 FLOAT_KEYS = ("own", "opp", "last", "field")
 N_TOKENS = 15
+HEAD_WIDTH = 32  # attention head width of every size (the loaders infer the head count as d / 32)
 
 
 @dataclass
@@ -56,6 +57,14 @@ class Config:
     @property
     def n_opponent(self) -> int:
         return self.n_moves + self.n_species
+
+    @classmethod
+    def sized(cls, d: int, layers: int, ff: int = 0, **kw) -> "Config":
+        """A model of width d (a multiple of 32: 32-wide heads), `layers` blocks and feed-forward width ff (default 2 d). The inputs,
+        embeddings and heads keep their sizes. 192 / 4 / 384 is the original 1.31M model; 96 / 2 / 192 has 205,066 parameters, 256 / 6 / 512 3,342,762."""
+        if d % HEAD_WIDTH or d <= 0 or layers <= 0:
+            raise ValueError(f"width {d} must be a positive multiple of {HEAD_WIDTH}, layers positive")
+        return cls(d=d, layers=layers, heads=d // HEAD_WIDTH, ff=ff or 2 * d, **kw)
 
 
 class Block(nn.Module):
@@ -110,20 +119,31 @@ class PolicyValueModel(nn.Module):
         self.final_norm = nn.LayerNorm(cfg.d)
         self.policy = nn.Linear(cfg.d, cfg.n_actions)
         self.win = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, 64), nn.GELU(), nn.Linear(64, 1))
+        # how much of the win loss's gradient reaches the shared network through the state token (training only; the forward
+        # value is unchanged): 1 = all of it, 0 = none (the win head learns on the policy's features)
+        self.value_grad_scale = 1.0
         if cfg.deep_actor:
             self.policy_deep = DeepActor(cfg)
         if cfg.opponent_head:
             self.opponent = nn.Sequential(nn.LayerNorm(cfg.d), nn.Linear(cfg.d, cfg.head_hidden), nn.GELU(), nn.Linear(cfg.head_hidden, cfg.n_opponent))
 
+    @staticmethod
+    def size_of(state: dict) -> dict:
+        """The size of the model these weights are for: width d (state_in), layers (blocks.N), feed-forward width (ff1) and
+        heads (d / 32: every model is built with 32-wide attention heads, see Config.sized)."""
+        d = state["state_in.weight"].shape[0]
+        layers = 1 + max(int(k.split(".")[1]) for k in state if k.startswith("blocks."))
+        return {"d": d, "layers": layers, "ff": state["blocks.0.ff1.weight"].shape[0], "heads": max(1, d // HEAD_WIDTH)}
+
     @classmethod
     def from_state(cls, state: dict, deep_actor: bool = False, opponent_head: bool = False) -> "PolicyValueModel":
-        """A model for these weights (a state dict, or a checkpoint with "model"): the optional heads the weights have, plus
-        the ones asked for, which start fresh (the deep actor's output at zero, so the policy is unchanged). Any other missing or extra
-        key is an error."""
+        """A model for these weights (a state dict, or a checkpoint with "model"), of their size: the optional heads the weights have,
+        plus the ones asked for, which start fresh (the deep actor's output at zero, so the policy is unchanged). Any other missing or
+        extra key is an error."""
         state = state["model"] if "model" in state else state
         has_deep = any(k.startswith("policy_deep.") for k in state)
         has_opp = any(k.startswith("opponent.") for k in state)
-        model = cls(Config(deep_actor=deep_actor or has_deep, opponent_head=opponent_head or has_opp))
+        model = cls(Config(deep_actor=deep_actor or has_deep, opponent_head=opponent_head or has_opp, **cls.size_of(state)))
         missing, unexpected = model.load_state_dict(state, strict=False)
         fresh = ("policy_deep." if not has_deep else "\0", "opponent." if not has_opp else "\0")
         bad = [k for k in missing if not k.startswith(fresh)] + list(unexpected)
@@ -202,7 +222,9 @@ class PolicyValueModel(nn.Module):
         for block in self.blocks:
             x = block(x)
         h = self.final_norm(x[:, 0])
-        return self.policy_logits(h), self.win(h).squeeze(-1), h
+        s = self.value_grad_scale
+        hv = h if s == 1.0 else h * s + h.detach() * (1.0 - s)  # (the same value, a scaled gradient)
+        return self.policy_logits(h), self.win(hv).squeeze(-1), h
 
     def forward(self, ids: dict, floats: dict, h0: torch.Tensor | None = None, burn_in: int = 0, states: bool = False):
         """Runs a sequence. The first `burn_in` steps only build the recurrent state (no gradient, no
