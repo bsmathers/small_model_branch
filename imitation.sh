@@ -11,7 +11,8 @@
 #                                                                                                     -> WORK/run_ft_fullhist_seed1_actor
 #
 # Each prints the usual 100-game tournaments every 5000 steps. Training costs about 1.7x as much per step as with burn-in 32.
-# If the GPU runs out of memory with the longer windows, run again with --batch auto (it resumes).
+# The longer windows do not fit a batch of 256 in GPU memory: each batch goes through the model in two halves whose gradients
+# add up (--accum 2: the same step as one batch of 256). If it still runs out of memory, --accum 4 (it resumes).
 #
 #   ./imitation.sh
 #   ./imitation.sh /path/to/start.pt --ft-actor-steps 15000
@@ -22,6 +23,6 @@ weights="$WORK/run_v3/weights_best.pt"
 if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then weights="$1"; shift; fi
 [ -f "$weights" ] || { echo "imitation.sh: no $weights (give the starting weights as the first argument)"; exit 2; }
 common=(--train-only --finetune-from "$weights" --ft-actor-only --ft-bc-weight 1 --ft-kl-weight 0.25 --ft-actor-anchor 0.25
-        --ft-actor-mix bots=1,human=0,otherbots=0 --ft-actor-steps 10000 --val-every 1000 --patience 3 --burn-in 96)
+        --ft-actor-mix bots=1,human=0,otherbots=0 --ft-actor-steps 10000 --val-every 1000 --patience 3 --burn-in 96 --accum 2)
 ./launch.sh "${common[@]}" --seed 0 --finetune-run run_ft_fullhist "$@"
 ./launch.sh "${common[@]}" --seed 1 --finetune-run run_ft_fullhist_seed1 "$@"

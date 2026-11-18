@@ -965,7 +965,7 @@ class Launcher:
         cmd = [self.py, "-m", "metamon.recurrent.train", out]
         for name, weight in self.mix.items():
             cmd += ["--source", f"{name}={os.path.join(self.work, name, 'built')}:{weight}"]
-        cmd += ["--burn-in", str(a.burn_in), "--seed", str(a.seed)]
+        cmd += ["--burn-in", str(a.burn_in), "--seed", str(a.seed), "--accum", str(a.accum)]
         cmd += ["--steps", str(steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
                 "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--bc-weight", str(a.bc_weight), "--lr", str(a.lr), "--ckpt-every", str(a.ckpt_every),
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
@@ -1152,6 +1152,8 @@ def main() -> None:
                     help="decisions before each training window's scored part that only build the recurrent state (the window is "
                          "burn-in + 64 long; a game shorter than that is trained whole, with its full history)")
     ap.add_argument("--seed", type=int, default=0, help="training seed (window sampling and the random subsets of --rebalance)")
+    ap.add_argument("--accum", type=int, default=1,
+                    help="micro-batches per training step (gradient accumulation): the same batch and results in 1/N of the GPU memory")
     ap.add_argument("--ft-skip-actor", action="store_true",
                     help="(value.sh) skip stage A: --finetune-from is already the fine-tuned actor; stages 1 and 2 start from it")
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)

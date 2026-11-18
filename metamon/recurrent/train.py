@@ -418,6 +418,7 @@ def main() -> None:
     ap.add_argument("--batch", default="128", help="a number, or auto to take the largest that fits in GPU memory")
     ap.add_argument("--chunk", type=int, default=64)
     ap.add_argument("--burn-in", type=int, default=32)
+    ap.add_argument("--accum", type=int, default=1, help="micro-batches per step (gradient accumulation: the same step in less GPU memory)")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--min-lr-ratio", type=float, default=0.05)
     ap.add_argument("--warmup", type=int, default=1000)
@@ -604,39 +605,56 @@ def main() -> None:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             for g in opt.param_groups:
                 g["lr"] = lr_at(step, args)
-            with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
-                out = run_batch(model, batch, args, ref)
-            pol_mask = batch["policy_ok"] & batch["scored"]
-            pol = pol_mask.float()
-            kl_mask = (pol_mask & ~batch["bc_game"]).float() if args.kl_scope == "nonbot" else pol
-            sc = batch["scored"].float()
-            bcm = (batch["bc_ok"] & batch["scored"]).float()
-            kl = masked_mean(out["kl"], kl_mask)
-            bc = masked_mean(out["bc"], bcm)
-            bce = masked_mean(out["bce"], sc)
-            anchor = masked_mean(out["anchor"], sc) if ref is not None else kl.new_zeros(())
-            loss = args.alpha * kl + args.bc_weight * bc + args.anchor_weight * anchor
-            opp = kl.new_zeros(())
-            if "opp" in out:
-                opp = masked_mean(out["opp"], ((batch["opp_action"] >= 0) & batch["scored"]).float())
-                if args.opp_weight > 0:
-                    loss = loss + args.opp_weight * opp
-            if args.value_weight > 0:  # (left out of the graph at 0, so the policy stage never touches the win head, not even to decay it)
-                loss = loss + args.value_weight * bce
+            # (--accum N: the batch goes through the model in N micro-batches whose gradients add up; every term is a sum over the
+            # micro-batch divided by the whole batch's count, so the loss and its gradient are the whole batch's)
+            full_pol = batch["policy_ok"] & batch["scored"]
+            full_kl = (full_pol & ~batch["bc_game"]) if args.kl_scope == "nonbot" else full_pol
+            counts = {
+                "pol": full_pol.float().sum().clamp_min(1),
+                "kl": full_kl.float().sum().clamp_min(1),
+                "sc": batch["scored"].float().sum().clamp_min(1),
+                "bc": (batch["bc_ok"] & batch["scored"]).float().sum().clamp_min(1),
+                "opp": ((batch["opp_action"] >= 0) & batch["scored"]).float().sum().clamp_min(1),
+            }
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            parts = max(1, args.accum)
+            size = batch["scored"].shape[0]
+            bounds = [size * i // parts for i in range(parts + 1)]
+            totals = {k: 0.0 for k in ("loss", "kl", "bc", "bce", "anchor", "opp", "top1")}
+            for i0, i1 in zip(bounds[:-1], bounds[1:]):
+                if i1 <= i0:
+                    continue
+                mb = {k: v[i0:i1] for k, v in batch.items()}
+                with torch.autocast(device.type, dtype=amp_dtype(args), enabled=amp_enabled(args, device)):
+                    out = run_batch(model, mb, args, ref)
+                pol_mask = mb["policy_ok"] & mb["scored"]
+                pol = pol_mask.float()
+                kl_mask = (pol_mask & ~mb["bc_game"]).float() if args.kl_scope == "nonbot" else pol
+                sc = mb["scored"].float()
+                bcm = (mb["bc_ok"] & mb["scored"]).float()
+                kl = (out["kl"] * kl_mask).sum() / counts["kl"]
+                bc = (out["bc"] * bcm).sum() / counts["bc"]
+                bce = (out["bce"] * sc).sum() / counts["sc"]
+                anchor = (out["anchor"] * sc).sum() / counts["sc"] if ref is not None else kl.new_zeros(())
+                loss = args.alpha * kl + args.bc_weight * bc + args.anchor_weight * anchor
+                opp = kl.new_zeros(())
+                if "opp" in out:
+                    opp = (out["opp"] * ((mb["opp_action"] >= 0) & mb["scored"]).float()).sum() / counts["opp"]
+                    if args.opp_weight > 0:
+                        loss = loss + args.opp_weight * opp
+                if args.value_weight > 0:  # (left out of the graph at 0, so the policy stage never touches the win head, not even to decay it)
+                    loss = loss + args.value_weight * bce
+                scaler.scale(loss).backward()
+                for k, v in (("loss", loss), ("kl", kl), ("bc", bc), ("bce", bce), ("anchor", anchor), ("opp", opp)):
+                    totals[k] += v.item()
+                totals["top1"] += ((out["top1"] * pol).sum() / counts["pol"]).item()
             scaler.unscale_(opt)
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             scaler.step(opt)  # skips the update when fp16 gradients overflowed
             scaler.update()
             step += 1
-            running["loss"] += loss.item()
-            running["kl"] += kl.item()
-            running["bc"] += bc.item()
-            running["bce"] += bce.item()
-            running["anchor"] += anchor.item()
-            running["opp"] += opp.item()
-            running["top1"] += masked_mean(out["top1"], pol).item()
+            for k in ("loss", "kl", "bc", "bce", "anchor", "opp", "top1"):
+                running[k] += totals[k]
             running["n"] += 1
             if step % 100 == 0:
                 n = running["n"]
