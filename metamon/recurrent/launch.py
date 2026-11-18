@@ -846,6 +846,9 @@ class Launcher:
                 "--anchor-weight", str(a.ft_actor_anchor), "--lr", str(a.ft_lr), "--monitor", "loss"]
                 + (["--rebalance", a.ft_actor_mix] if a.ft_actor_mix != "none" else []))
             actor = os.path.join(runs[0], "weights_final.pt")
+        if a.ft_actor_only:
+            self.log(f"--ft-actor-only: stopping after the actor stage ({actor})")
+            return
         self.train_stage(runs[1], a.ft_value_head_steps, [
             "--stage", "value", "--init", actor, "--freeze", "trunk", "--anchor-weight", "0", "--lr", str(a.value_lr)])
         head = os.path.join(runs[1], "weights_final.pt")
@@ -962,6 +965,7 @@ class Launcher:
         cmd = [self.py, "-m", "metamon.recurrent.train", out]
         for name, weight in self.mix.items():
             cmd += ["--source", f"{name}={os.path.join(self.work, name, 'built')}:{weight}"]
+        cmd += ["--burn-in", str(a.burn_in), "--seed", str(a.seed)]
         cmd += ["--steps", str(steps), "--batch", str(a.batch), "--workers", str(min(self.cpus, 12)), "--device", self.device,
                 "--precision", self.precision if self.gpus else "fp32", "--target", "blend", "--alpha", str(a.alpha), "--bc-weight", str(a.bc_weight), "--lr", str(a.lr), "--ckpt-every", str(a.ckpt_every),
                 "--val-every", str(a.val_every), "--save-every", str(a.save_every), "--val-fraction", str(a.val_fraction), "--resume"]
@@ -1004,8 +1008,8 @@ class Launcher:
             self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
             return
         out = os.path.join(self.work, a.exp_run or f"exp_{a.experiment}") if a.experiment else \
-            os.path.join(self.work, (f"{a.finetune_run}_joint" if a.ft_joint_steps > 0 else f"{a.finetune_run}_all" if a.ft_all_steps > 0
-                                     else f"{a.finetune_run}_value_head") if a.finetune_from
+            os.path.join(self.work, (f"{a.finetune_run}_actor" if a.ft_actor_only else f"{a.finetune_run}_joint" if a.ft_joint_steps > 0
+                                     else f"{a.finetune_run}_all" if a.ft_all_steps > 0 else f"{a.finetune_run}_value_head") if a.finetune_from
                          else a.value_run if a.value_steps > 0 else a.policy_run)
         weights = sorted((f for f in os.listdir(out) if f.startswith("weights_") and f.split("_")[1].split(".")[0].isdigit()), key=lambda f: int(f.split("_")[1].split(".")[0])) if os.path.isdir(out) else []
         self.log("stage times: " + ", ".join(f"{k} {v:.0f}s" for k, v in self.timings.items()))
@@ -1143,6 +1147,11 @@ def main() -> None:
     ap.add_argument("--ft-all-anchor", type=float, default=1.0, help="(fine-tune 2) weight of KL(stage A policy || current policy)")
     ap.add_argument("--ft-lr", type=float, default=1e-4, help="(fine-tune A and 2) learning rate; stage 1 uses --value-lr")
     ap.add_argument("--ft-actor-steps", type=int, default=20000)
+    ap.add_argument("--ft-actor-only", action="store_true", help="(fine-tune) stop after stage A (no value stages)")
+    ap.add_argument("--burn-in", type=int, default=32,
+                    help="decisions before each training window's scored part that only build the recurrent state (the window is "
+                         "burn-in + 64 long; a game shorter than that is trained whole, with its full history)")
+    ap.add_argument("--seed", type=int, default=0, help="training seed (window sampling and the random subsets of --rebalance)")
     ap.add_argument("--ft-skip-actor", action="store_true",
                     help="(value.sh) skip stage A: --finetune-from is already the fine-tuned actor; stages 1 and 2 start from it")
     ap.add_argument("--ft-value-head-steps", type=int, default=10000)
