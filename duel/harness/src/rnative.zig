@@ -730,6 +730,15 @@ fn counterDamage(tables: *const Tables, g: *const Game, snap: *const Snap, own: 
     const mon = if (player) own else opp;
     if (!tables.has_base[@intFromEnum(mon.species)]) return null;
     const estimate = statOf(tables.base[@intFromEnum(mon.species)][0], true);
+    if (!player) {
+        // (repo copy) damage to the opponent is public only as its HP percentage's drop (Showdown's rounded percentage); the
+        // engine's exact amount, or what a Substitute absorbed, is not: none when its active changed or showed no drop
+        const pn = g.prev_node orelse return null;
+        if (pn.snap.opp_species != snap.opp_species) return null;
+        const drop = pn.snap.opp_hp - snap.opp_hp;
+        if (drop <= 0) return null;
+        return .{ .player = false, .species = mon.species, .pct = 100.0 * drop };
+    }
     return .{ .player = player, .species = mon.species, .pct = 100.0 * @as(f64, @floatFromInt(damage)) / @max(estimate, 1.0) };
 }
 
@@ -1009,6 +1018,14 @@ fn encode(tables: *const Tables, snap: *const Snap, own_active_state: *const UMo
     return n_own;
 }
 
+/// A step's observation without a model (the self-play environment, selfplay/zig): the child of `parent` after its player
+/// chose `sent`, reading `snap` (written into `out`), its model input, and each legal option's policy slot in `slots[i]`
+/// (negative without one). False for a wait state (no decision: the node is complete). Exactly Native.begin.
+pub fn observe(tables: *Tables, parent: ?*const Node, sent: Option, snap: *const Snap, out: *Node, slots: *[pkmn.CHOICES_SIZE]f32, input: *rmodel.Input) !bool {
+    const nat = Native{ .model = undefined, .tables = tables };
+    return nat.begin(parent, sent, snap, out, slots, input);
+}
+
 // ---------------------------------------------------------------- one node
 
 pub const Native = struct {
@@ -1079,6 +1096,8 @@ pub const Native = struct {
         }
         const decision = try self.prepare(&out.game, snap, input, &out.own, &out.opp, logits);
         out.decision = decision;
+        _ = positions.fetchAdd(1, .monotonic);
+        if (decision) _ = model_steps.fetchAdd(1, .monotonic);
         if (!decision) {
             out.win = if (parent) |p| p.win else 0.0;
             if (parent) |p| {
@@ -1220,6 +1239,10 @@ pub const Native = struct {
 };
 
 pub const UNMAPPED: f32 = -1e30;
+
+/// Positions read (nodes made) and model steps run, over the program (for per-decision statistics; atomic: the search's threads).
+pub var positions = std.atomic.Value(u64).init(0);
+pub var model_steps = std.atomic.Value(u64).init(0);
 
 /// The search's native recurrent model, when SEARCH_MODEL=native.
 pub var active: ?*Native = null;

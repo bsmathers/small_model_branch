@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const pkmn = b.dependency("pkmn", .{ .showdown = true, .log = false, .chance = false, .calc = false });
+    const pkmn = b.dependency("pkmn", .{ .optimize = optimize, .target = target, .showdown = true, .log = false, .chance = false, .calc = false });
     exe.root_module.addImport("pkmn", pkmn.module("pkmn"));
     exe.root_module.link_libc = true;
     if (target.result.os.tag == .macos) exe.root_module.linkFramework("Accelerate", .{}); // (elsewhere value_model.zig has its own matrix product)
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const harness_pkmn = b.dependency("pkmn", .{ .showdown = true, .log = true, .chance = false, .calc = false });
+    const harness_pkmn = b.dependency("pkmn", .{ .optimize = optimize, .target = target, .showdown = true, .log = true, .chance = false, .calc = false });
     harness.root_module.addImport("pkmn", harness_pkmn.module("pkmn"));
     b.installArtifact(harness);
     const tests = b.addTest(.{ .root_module = b.createModule(.{
